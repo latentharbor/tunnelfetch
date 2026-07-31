@@ -192,6 +192,173 @@ test('Secure cookies are sent over https only; plain cookies cross the scheme', 
   assert.equal(jar.headerFor('http://e.test/'), 'p=2');
 });
 
+// ---------------------------------------------------------------- name prefixes (RFC 6265bis)
+
+// s5.4 and s5.7 steps 20-21: a __Secure-/__Host- name claims the cookie was set with specific
+// attributes. A Set-Cookie that breaks its own name's claim is ignored WHOLE — nothing stored,
+// nothing overwritten, nothing deleted — and counted in `rejected`.
+
+test('__Secure- without the Secure attribute is refused', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Secure-a=1']);
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 1);
+});
+
+test('__Secure- over plain http is refused with and without the attribute', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('http://e.test/', ['__Secure-a=1; Secure']);
+  jar.setFromResponse('http://e.test/', ['__Secure-b=1']);
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 2);
+});
+
+test('the valid __Secure- cookie stores, may carry Domain, and stays https-only', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Secure-a=1; Secure; Domain=e.test']);
+  assert.equal(jar.rejected, 0);
+  assert.equal(jar.headerFor('https://sub.e.test/'), '__Secure-a=1', 'Domain is allowed here');
+  assert.equal(jar.headerFor('http://e.test/'), null);
+});
+
+test('__Host- with a Domain attribute is refused, even one equal to the host', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-a=1; Secure; Path=/; Domain=e.test']);
+  assert.equal(jar.size, 0, 'refused outright, not stored host-only');
+  assert.equal(jar.headerFor('https://e.test/'), null);
+  assert.equal(jar.headerFor('https://sub.e.test/'), null);
+  assert.equal(jar.rejected, 1);
+});
+
+test('__Host- cannot be planted on a parent domain by its subdomain', () => {
+  // The scope-confusion exposure the prefix exists to close: without the name rules this
+  // Set-Cookie would be stored with hostOnly=false and sent to every *.e.test sibling.
+  const { jar } = makeJar();
+  jar.setFromResponse('https://api.e.test/', ['__Host-sid=evil; Secure; Path=/; Domain=e.test']);
+  assert.equal(jar.headerFor('https://e.test/'), null);
+  assert.equal(jar.headerFor('https://www.e.test/'), null);
+  assert.equal(jar.rejected, 1);
+});
+
+test('__Host- requires the literal attribute Path=/: subpaths, absence, junk all refused', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-a=1; Secure; Path=/sub']);
+  jar.setFromResponse('https://e.test/', ['__Host-b=1; Secure']); // no Path attribute at all
+  // An invalid Path would fall back to a default of "/" here; for a __Host- name that repair
+  // must not count as keeping the promise.
+  jar.setFromResponse('https://e.test/', ['__Host-c=1; Secure; Path=relative']);
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 3);
+});
+
+test('__Host- without Secure, or over plain http, is refused', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-a=1; Path=/']); // attribute missing
+  jar.setFromResponse('http://e.test/', ['__Host-b=1; Secure; Path=/']); // channel wrong
+  jar.setFromResponse('http://e.test/', ['__Host-c=1; Path=/']); // both wrong
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 3);
+});
+
+test('the valid __Host- cookie stores host-only at Path=/', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/deep/page', ['__Host-a=1; Secure; Path=/']);
+  assert.equal(jar.rejected, 0);
+  assert.equal(jar.headerFor('https://e.test/anywhere'), '__Host-a=1');
+  assert.equal(jar.headerFor('https://sub.e.test/'), null, 'host-only: no subdomain leak');
+  assert.equal(jar.headerFor('http://e.test/'), null, 'Secure: never over http');
+  const [c] = jar.entries();
+  assert.equal(c.hostOnly, true);
+  assert.equal(c.domain, 'e.test');
+  assert.equal(c.path, '/');
+  assert.equal(c.secure, true);
+});
+
+// s5.4: "UAs MUST match cookie name prefixes case-insensitively", because servers routinely
+// read names case-insensitively, and to such a server a miscapitalized lookalike IS the
+// protected cookie. So __host- is not an ordinary name: every case variant of a prefix
+// carries the full prefix requirements. (Earlier drafts matched case-sensitively; the
+// examples below are s5.4's own reject and accept lists.)
+test('prefix matching is case-insensitive: case variants carry the same requirements', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__host-a=1; Secure']); // no Path=/
+  jar.setFromResponse('https://e.test/', ['__HOST-b=1; Secure; Domain=e.test; Path=/']);
+  jar.setFromResponse('https://e.test/', ['__SECURE-c=1']);
+  jar.setFromResponse('https://e.test/', ['__sEcUrE-d=1; Domain=e.test']);
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 4);
+  // Variants that DO honour the name's promise are stored like the canonical spelling.
+  jar.setFromResponse('https://e.test/', ['__host-ok=1; Secure; Path=/']);
+  jar.setFromResponse('https://e.test/', ['__secure-ok=1; Secure']);
+  assert.equal(jar.headerFor('https://e.test/'), '__host-ok=1; __secure-ok=1');
+  assert.equal(jar.rejected, 4);
+});
+
+test('differently-cased prefixed names remain distinct cookies (s5.4 note)', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Secure-t=1; Secure', '__secure-t=2; Secure']);
+  assert.equal(jar.size, 2);
+  assert.equal(jar.headerFor('https://e.test/'), '__Secure-t=1; __secure-t=2');
+});
+
+test('near-miss names are ordinary cookies: the prefix must match from the first byte', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['_Host-a=1', 'Host-b=1', 'x__Secure-c=1', '__Hos-d=1']);
+  assert.equal(jar.rejected, 0);
+  assert.equal(jar.size, 4);
+});
+
+test('a refused prefixed Set-Cookie applies nothing: no store, no overwrite, no delete', () => {
+  const { jar, clock } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-sid=good; Secure; Path=/']);
+  // An overwrite attempt that violates the prefix must leave the old value untouched.
+  jar.setFromResponse('https://e.test/', ['__Host-sid=evil; Secure; Path=/; Domain=e.test']);
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-sid=good');
+  // A deletion smuggled inside a violating Set-Cookie is equally refused. This is the http
+  // MITM move the prefix exists to stop: the key is the same domain|/|name triple, so without
+  // the name rules this plain-http response would evict the https session cookie.
+  jar.setFromResponse('http://e.test/', ['__Host-sid=x; Path=/; Max-Age=0']);
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-sid=good');
+  // Nor may the refused cookie's expiry attributes linger anywhere.
+  clock.t += 1_000_000;
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-sid=good');
+  assert.equal(jar.rejected, 2);
+});
+
+test('a prefix-honouring deletion still works: the rules guard, they do not embalm', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-sid=1; Secure; Path=/']);
+  jar.setFromResponse('https://e.test/', ['__Host-sid=x; Secure; Path=/; Max-Age=0']);
+  assert.equal(jar.headerFor('https://e.test/'), null);
+  assert.equal(jar.rejected, 0, 'a valid deletion is not a rejection');
+});
+
+test('prefixed cookies keep ordinary overwrite, expiry, and Max-Age-over-Expires semantics', () => {
+  const { jar, clock } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-a=1; Secure; Path=/']);
+  clock.t += 10;
+  jar.setFromResponse('https://e.test/', ['other=x']);
+  clock.t += 10;
+  // Overwrite by the same (name, domain, path) triple: one cookie, original creation slot.
+  jar.setFromResponse('https://e.test/', ['__Host-a=2; Secure; Path=/']);
+  assert.equal(jar.size, 2);
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-a=2; other=x');
+  // Max-Age beats a far-future Expires for prefixed cookies exactly as for plain ones.
+  jar.setFromResponse('https://e.test/', [
+    '__Secure-b=1; Secure; Expires=Fri, 01 Jan 2100 00:00:00 GMT; Max-Age=5',
+  ]);
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-a=2; other=x; __Secure-b=1');
+  clock.t += 5_001;
+  assert.equal(jar.headerFor('https://e.test/'), '__Host-a=2; other=x', 'Max-Age governed');
+});
+
+test('nameless mimicry of a prefix (s5.7 step 22) is unreachable: nameless pairs never store', () => {
+  const { jar } = makeJar();
+  jar.setFromResponse('https://e.test/', ['__Host-evil', '=__Secure-evil']);
+  assert.equal(jar.size, 0);
+  assert.equal(jar.rejected, 2);
+});
+
 // ---------------------------------------------------------------- expiry and the clock
 
 test('Max-Age drives expiry through the injected clock', () => {

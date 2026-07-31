@@ -263,6 +263,39 @@ export class CookieJar {
     // man-in-the-middle can plant a cookie the application later trusts as Secure.
     if (secure && !requestSecure) return false;
 
+    // ---- cookie name prefixes (RFC 6265bis s5.4; storage model s5.7 steps 20-21)
+    //
+    // A "__Secure-"/"__Host-" name is the server's claim that the cookie was set with specific
+    // attributes, and the receiving server trusts the NAME as proof of them. A Set-Cookie that
+    // breaks its own name's claim is therefore refused whole — storing it "repaired" would
+    // manufacture exactly the proof the server must not get.
+    //
+    // Matching is case-INSENSITIVE (s5.4 "UAs MUST match cookie name prefixes
+    // case-insensitively"): servers routinely compare names case-insensitively, so a
+    // "__SeCuRe-" lookalike must face the same rules as the honest spelling or it can
+    // impersonate the protected cookie. The regexes carry no 'u' flag on purpose: without it,
+    // /i folding can never map a non-ASCII character onto an ASCII one, making the match
+    // exactly ASCII-case-insensitive.
+    //
+    // The mimicry rule for nameless cookies (s5.7 step 22) needs no code: pairs with no '='
+    // or an empty name were refused above, so a value can never pose as a prefixed name.
+    if (/^__secure-/i.test(name)) {
+      // Step 20 requires only the Secure attribute here; being set over a secure channel is
+      // the check directly above. Together: https and Secure, or nothing.
+      if (!secure) return false;
+    } else if (/^__host-/i.test(name)) {
+      // Step 21: Secure, host-only, Path=/. Two clauses are deliberately stricter than the
+      // storage-model letter, matching the server-facing contract (s4.1.3.2: "a Secure
+      // attribute, a Path attribute with a value of /, and no Domain attribute"):
+      //  - the Domain attribute must be ABSENT, not merely resolve to host-only (the no-dot
+      //    and IP-literal branches below keep Domain=<host> host-only, but the name promised
+      //    no Domain at all);
+      //  - the Path attribute's value must literally be "/", not an invalid value that the
+      //    default-path fallback would quietly repair to "/".
+      // Both refuse strictly more than s5.7 asks, never less — fail closed.
+      if (!secure || domainAttr !== null || pathAttr !== '/') return false;
+    }
+
     // ---- domain validation
     let domain = host;
     let hostOnly = true;
