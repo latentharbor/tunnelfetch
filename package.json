@@ -1,0 +1,39 @@
+{
+  "name": "tunnelfetch",
+  "version": "0.0.0",
+  "description": "A fetch-shaped HTTP client that can route through HTTP CONNECT / HTTPS / SOCKS5 proxies on runtimes with only raw TCP, such as Cloudflare Workers. Implements TLS in userland because the runtime cannot verify a tunnelled peer.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./proxy": "./src/proxy/index.js",
+    "./http1": "./src/http1/index.js",
+    "./tls": "./src/tls/index.js",
+    "./trust": "./src/trust/index.js",
+    "./roots": "./src/trust/roots.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
+    "test:live": "node --test --test-reporter=spec \"test/live/**/*.live.js\"",
+    "roots:refresh": "node scripts/refresh-roots.mjs"
+  },
+  "keywords": [
+    "fetch",
+    "proxy",
+    "socks5",
+    "http-connect",
+    "tls",
+    "cloudflare-workers",
+    "workerd",
+    "edge"
+  ]
+}

@@ -1,0 +1,531 @@
+{
+  "probeVersion": 1,
+  "measuredAt": "2026-07-30",
+  "runtime": {
+    "wranglerVersion": "4.115.0",
+    "compatibilityDate": "2026-07-01",
+    "compatibilityFlags": [
+      "nodejs_compat"
+    ],
+    "where": "Cloudflare edge (deployed Worker)"
+  },
+  "caps": {
+    "crypto": {
+      "x25519": {
+        "ok": true,
+        "v": {
+          "rawPubLen": 32,
+          "sharedLen": 32
+        }
+      },
+      "ecdh_P-256": {
+        "ok": true,
+        "v": {
+          "rawPubLen": 65,
+          "uncompressed": true,
+          "sharedLen": 32
+        }
+      },
+      "ecdh_P-384": {
+        "ok": true,
+        "v": {
+          "rawPubLen": 97,
+          "uncompressed": true,
+          "sharedLen": 48
+        }
+      },
+      "ecdh_P-521": {
+        "ok": true,
+        "v": {
+          "rawPubLen": 133,
+          "uncompressed": true,
+          "sharedLen": 66
+        }
+      },
+      "ed25519": {
+        "ok": true,
+        "v": true
+      },
+      "ecdsa_P-256": {
+        "ok": true,
+        "v": true
+      },
+      "ecdsa_P-384": {
+        "ok": true,
+        "v": true
+      },
+      "ecdsa_P-521": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pss_SHA-256": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pss_SHA-384": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pss_SHA-512": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pss_SHA-1": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pkcs1_SHA-256": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pkcs1_SHA-384": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pkcs1_SHA-512": {
+        "ok": true,
+        "v": true
+      },
+      "rsa_pkcs1_SHA-1": {
+        "ok": true,
+        "v": true
+      },
+      "spki_import_ec": {
+        "ok": true,
+        "v": {
+          "spkiLen": 91,
+          "reimported": true
+        }
+      },
+      "spki_import_rsa": {
+        "ok": true,
+        "v": {
+          "spkiLen": 294,
+          "bothAlgos": true
+        }
+      },
+      "hkdf": {
+        "ok": true,
+        "v": 32
+      },
+      "hkdf_zero_salt": {
+        "ok": true,
+        "v": 32
+      },
+      "hmac": {
+        "ok": true,
+        "v": 32
+      },
+      "aes_gcm_128": {
+        "ok": true,
+        "v": true
+      },
+      "aes_gcm_256": {
+        "ok": true,
+        "v": true
+      },
+      "aes_ctr": {
+        "ok": true,
+        "v": true
+      },
+      "aes_cbc": {
+        "ok": true,
+        "v": true
+      },
+      "aes_gcm_tag_mismatch_throws": {
+        "ok": true,
+        "v": "throws"
+      },
+      "chacha20": {
+        "ok": false,
+        "err": "NotSupportedError: Unrecognized key generation algorithm \"ChaCha20-Poly1305\" requested."
+      },
+      "digest_SHA-1": {
+        "ok": true,
+        "v": 20
+      },
+      "digest_SHA-256": {
+        "ok": true,
+        "v": 32
+      },
+      "digest_SHA-384": {
+        "ok": true,
+        "v": 48
+      },
+      "digest_SHA-512": {
+        "ok": true,
+        "v": 64
+      },
+      "digest_MD5": {
+        "ok": true,
+        "v": 16
+      }
+    },
+    "platform": {
+      "decompression": {
+        "gzip": true,
+        "deflate": true,
+        "deflate-raw": true,
+        "br": false,
+        "zstd": false
+      },
+      "text_encodings": {
+        "utf-8": "utf-8",
+        "utf-16le": "utf-16le",
+        "utf-16be": "utf-16be",
+        "windows-1252": "windows-1252",
+        "windows-1251": "windows-1251",
+        "gbk": "gbk",
+        "gb18030": "gb18030",
+        "big5": "big5",
+        "shift_jis": "shift_jis",
+        "euc-jp": "euc-jp",
+        "euc-kr": "euc-kr",
+        "iso-8859-1": "windows-1252",
+        "iso-2022-jp": "iso-2022-jp"
+      },
+      "byte_stream": true,
+      "abort_timeout": true,
+      "node": {
+        "crypto": {
+          "ok": true,
+          "v": {
+            "X509Certificate": "function",
+            "publicEncrypt": "function",
+            "chacha20poly1305": true
+          }
+        },
+        "x509_proto": {
+          "ok": true,
+          "v": [
+            "constructor",
+            "subject",
+            "subjectAltName",
+            "issuer",
+            "issuerCertificate",
+            "infoAccess",
+            "validFrom",
+            "validTo",
+            "fingerprint",
+            "fingerprint256",
+            "fingerprint512",
+            "keyUsage",
+            "serialNumber",
+            "raw",
+            "publicKey",
+            "toString",
+            "toJSON",
+            "ca",
+            "checkHost",
+            "checkEmail",
+            "checkIP",
+            "checkIssued",
+            "checkPrivateKey",
+            "verify",
+            "toLegacyObject"
+          ]
+        }
+      },
+      "socket_proto": {
+        "ok": true,
+        "v": {
+          "proto": [
+            "readable",
+            "writable",
+            "closed",
+            "opened",
+            "upgraded",
+            "secureTransport",
+            "close",
+            "startTls",
+            "constructor"
+          ],
+          "byob": true
+        }
+      }
+    },
+    "timing": {
+      "sync_loop": {
+        "dateDelta": 0,
+        "perfDelta": 0,
+        "acc": 14999995
+      },
+      "afterSleep50": {
+        "dateDelta": 50,
+        "perfDelta": 50
+      }
+    }
+  },
+  "netPolicy": {
+    "www.google.com:443": {
+      "ok": true,
+      "v": {
+        "opened": true,
+        "elapsedMs": 3,
+        "remoteAddress": "www.google.com:443"
+      }
+    },
+    "www.google.com:80": {
+      "ok": true,
+      "v": {
+        "opened": true,
+        "elapsedMs": 4,
+        "remoteAddress": "www.google.com:80"
+      }
+    },
+    "www.wikipedia.org:443": {
+      "ok": true,
+      "v": {
+        "opened": true,
+        "elapsedMs": 28,
+        "remoteAddress": "www.wikipedia.org:443"
+      }
+    },
+    "www.google.com:25": {
+      "ok": false,
+      "err": "Error: Connections to port 25 are prohibited",
+      "elapsedMs": 0
+    },
+    "www.google.com:587": {
+      "ok": false,
+      "err": "Error: timeout after 10000ms: opened www.google.com:587",
+      "elapsedMs": 10000
+    },
+    "www.google.com:8080": {
+      "ok": false,
+      "err": "Error: timeout after 10000ms: opened www.google.com:8080",
+      "elapsedMs": 10000
+    },
+    "1.1.1.1:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 2
+    },
+    "104.16.132.229:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 1
+    },
+    "162.159.61.4:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 0
+    },
+    "example.com:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 6
+    },
+    "127.0.0.1:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 0
+    },
+    "10.0.0.1:443": {
+      "ok": false,
+      "err": "Error: proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead",
+      "elapsedMs": 1
+    }
+  },
+  "startTls": {
+    "c1_no_option": {
+      "connectHost": "www.google.com",
+      "claimHost": null,
+      "requestHost": "www.google.com",
+      "byIp": false,
+      "plainOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "startTlsCall": {
+        "ok": true,
+        "v": {
+          "returnedSocket": true,
+          "secureTransport": "on"
+        }
+      },
+      "tlsOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "wrote": {
+        "ok": true,
+        "v": true
+      },
+      "read": {
+        "ok": true,
+        "v": {
+          "bytes": 4096,
+          "firstLine": "HTTP/1.1 200 OK"
+        }
+      },
+      "closed": {
+        "ok": false,
+        "err": "Error: timeout after 5000ms: closed"
+      },
+      "verdict": "DATA_FLOWED"
+    },
+    "c2_claim_truth": {
+      "connectHost": "www.google.com",
+      "claimHost": "www.google.com",
+      "requestHost": "www.google.com",
+      "byIp": false,
+      "plainOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "startTlsCall": {
+        "ok": true,
+        "v": {
+          "returnedSocket": true,
+          "secureTransport": "on"
+        }
+      },
+      "tlsOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "wrote": {
+        "ok": true,
+        "v": true
+      },
+      "read": {
+        "ok": true,
+        "v": {
+          "bytes": 4096,
+          "firstLine": "HTTP/1.1 200 OK"
+        }
+      },
+      "closed": {
+        "ok": false,
+        "err": "Error: timeout after 5000ms: closed"
+      },
+      "verdict": "DATA_FLOWED"
+    },
+    "c3_claim_lie": {
+      "connectHost": "www.google.com",
+      "claimHost": "www.wikipedia.org",
+      "requestHost": "www.google.com",
+      "byIp": false,
+      "plainOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "startTlsCall": {
+        "ok": true,
+        "v": {
+          "returnedSocket": true,
+          "secureTransport": "on"
+        }
+      },
+      "tlsOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "wrote": {
+        "ok": true,
+        "v": true
+      },
+      "read": {
+        "ok": true,
+        "v": {
+          "bytes": 4096,
+          "firstLine": "HTTP/1.1 200 OK"
+        }
+      },
+      "closed": {
+        "ok": false,
+        "err": "Error: timeout after 5000ms: closed"
+      },
+      "verdict": "DATA_FLOWED"
+    },
+    "c4_claim_bogus": {
+      "connectHost": "www.google.com",
+      "claimHost": "probe.invalid",
+      "requestHost": "www.google.com",
+      "byIp": false,
+      "plainOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "startTlsCall": {
+        "ok": true,
+        "v": {
+          "returnedSocket": true,
+          "secureTransport": "on"
+        }
+      },
+      "tlsOpened": {
+        "ok": true,
+        "v": {
+          "remoteAddress": "www.google.com:443"
+        }
+      },
+      "wrote": {
+        "ok": true,
+        "v": true
+      },
+      "read": {
+        "ok": true,
+        "v": {
+          "bytes": 1427,
+          "firstLine": "HTTP/1.1 200 OK"
+        }
+      },
+      "closed": {
+        "ok": false,
+        "err": "Error: timeout after 5000ms: closed"
+      },
+      "verdict": "DATA_FLOWED"
+    }
+  },
+  "proxyTunnel": {
+    "proxyHost": "<redacted>",
+    "proxyPort": 0,
+    "target": "www.google.com:443",
+    "tunnel": {
+      "ok": true,
+      "v": {
+        "proxyOpened": true,
+        "connectStatusLine": "HTTP/1.0 200 OK",
+        "connectHeaderBytes": 19,
+        "connectVersion": "1.0",
+        "bytesAfterHeaders": 0
+      }
+    },
+    "plainHttp": {
+      "ok": true,
+      "v": {
+        "proxyOpened": true,
+        "connectStatusLine": "HTTP/1.0 200 OK",
+        "connectHeaderBytes": 19,
+        "connectVersion": "1.0",
+        "bytesAfterHeaders": 0,
+        "bytes": 4096,
+        "firstLine": "HTTP/1.1 200 OK"
+      }
+    },
+    "tunnelStartTls": {
+      "ok": false,
+      "err": "Error: TLS Handshake Failed."
+    },
+    "tunnelStartTlsLie": {
+      "ok": false,
+      "err": "Error: TLS Handshake Failed."
+    }
+  }
+}

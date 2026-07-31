@@ -1,0 +1,9 @@
+{
+  "name": "tunnelfetch-probe",
+  "private": true,
+  "type": "module",
+  "description": "Edge capability probe. Not published; results feed the offline test suite.",
+  "devDependencies": {
+    "wrangler": "^4.115.0"
+  }
+}

@@ -1,0 +1,7 @@
+name = "tunnelfetch-live"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+workers_dev = true
+
+# Deliberately NO nodejs_compat: the package must run with nothing but the web platform.
+# If this deploys and works, the zero-node: claim in the README is demonstrated, not asserted.

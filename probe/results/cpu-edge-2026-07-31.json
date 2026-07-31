@@ -1,0 +1,37 @@
+{
+  "measurement": "cpu",
+  "measuredAt": "2026-07-31",
+  "where": "Cloudflare edge, deployed Worker, CPU time read from `wrangler tail --format json`",
+  "method": {
+    "note": "Workers bill CPU, not wall time. `cpuTime` comes from the platform, not from in-Worker instrumentation, which is required here: Date.now() and performance.now() are frozen for the whole of a synchronous slice on this runtime, so a Worker cannot time itself.",
+    "isolate": "warm — a cold isolate was excluded after being measured separately, see firstRequestInFreshIsolate",
+    "statistic": "median of repeated runs; marginal costs are (median(n=N) - median(n=1)) / (N-1)",
+    "target": "a real HTTPS origin through a real HTTP CONNECT proxy",
+    "bundle": { "uploadedKiB": 344, "gzippedKiB": 122 }
+  },
+  "results": {
+    "startupTimeMs": 1,
+    "requestImportingButNotUsingPackageMs": 0,
+    "firstRequestInFreshIsolateMs": [35, 50],
+    "tls13HandshakePlusRequestMs": [9, 13],
+    "marginalPooledRequestNoBodyMs": 1.2,
+    "marginal80KbGzippedBodyMs": 15.8
+  },
+  "raw": {
+    "noop": [0, 0],
+    "handshakes_n1": [12, 13],
+    "handshakes_n1_cold": [46, 49],
+    "reuse_n1": [9],
+    "reuse_n11": [19, 21, 22],
+    "body_n1": [17, 20, 24, 30],
+    "body_n6": [70, 80, 103, 117],
+    "body_n1_largeOrigin": [52, 60, 79],
+    "handshakes_n1_largeOrigin": [12, 12]
+  },
+  "interpretation": [
+    "Importing the package costs nothing measurable: the 121-anchor trust store is base64 strings indexed by subject-DN hash, and only the anchor a chain lands on is ever decoded.",
+    "The first request in a fresh isolate carries a one-time ~35-50ms JIT cost for the TLS code paths; steady state is ~10ms per handshake.",
+    "Connection reuse turns a ~10ms handshake into a ~1.2ms request, which is the whole argument for Client over createFetch.",
+    "Roughly 95% of a request's wall time is spent waiting on the network, and none of that is billed."
+  ]
+}

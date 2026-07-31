@@ -1,0 +1,7 @@
+name = "tunnelfetch-probe"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# PROBE_TOKEN is set with `wrangler secret put PROBE_TOKEN` — never checked in.

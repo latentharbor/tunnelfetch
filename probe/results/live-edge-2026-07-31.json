@@ -1,0 +1,109 @@
+{
+  "rig": "live",
+  "measuredAt": "2026-07-31",
+  "note": "Runs the published package on the Cloudflare edge through third-party proxies. Proxy identities redacted.",
+  "compatibilityFlags": [],
+  "results": {
+    "connectMatrix": [
+      {
+        "label": "https www.google.com",
+        "ok": true,
+        "ms": 811,
+        "status": 200,
+        "httpVersion": "1.1",
+        "framing": "chunked",
+        "proxied": true,
+        "tls": {
+          "version": "0x304",
+          "cipherSuite": "0x1301",
+          "group": "0x1d",
+          "alpn": "http/1.1"
+        },
+        "contentType": "text/html; charset=ISO-8859-1",
+        "contentEncoding": "gzip",
+        "bytes": 80790,
+        "head": "<!doctype html><html itemscope=\"\" itemtype=\"http://schema.org/WebPage\" lang=\"en\""
+      },
+      {
+        "label": "https github.com",
+        "ok": true,
+        "ms": 879,
+        "status": 200,
+        "httpVersion": "1.1",
+        "framing": "chunked",
+        "proxied": true,
+        "tls": {
+          "version": "0x304",
+          "cipherSuite": "0x1301",
+          "group": "0x1d",
+          "alpn": "http/1.1"
+        },
+        "contentType": "text/html; charset=utf-8",
+        "contentEncoding": "gzip",
+        "bytes": 592038,
+        "head": " <!DOCTYPE html> <html lang=\"en\" data-color-mode=\"dark\" data-dark-the"
+      }
+    ],
+    "socks5": [
+      {
+        "label": "https www.wikipedia.org",
+        "ok": true,
+        "ms": 1695,
+        "status": 200,
+        "httpVersion": "1.1",
+        "framing": "content-length",
+        "proxied": true,
+        "tls": {
+          "version": "0x304",
+          "cipherSuite": "0x1301",
+          "group": "0x1d",
+          "alpn": "http/1.1"
+        },
+        "contentType": "text/html",
+        "contentEncoding": "gzip",
+        "bytes": 118282,
+        "head": "<!DOCTYPE html> <html lang=\"en\" class=\"no-js\"> <head> <meta charset=\"utf-8\"> <ti"
+      }
+    ],
+    "keepAliveAndPinning": [
+      {
+        "label": "keepalive www.google.com",
+        "ok": true,
+        "ms": 813,
+        "first": {
+          "status": 200,
+          "ms": 678
+        },
+        "second": {
+          "status": 200,
+          "ms": 135
+        },
+        "poolHits": 1,
+        "poolMisses": 1
+      },
+      {
+        "label": "pin-mismatch github.com",
+        "ok": false,
+        "ms": 246,
+        "code": "CERT_PIN_MISMATCH",
+        "name": "CertificateError",
+        "error": "no certificate in the chain matches any configured pin (observed: sha256/uOmwqBIvMM6bY2khsu8Tmp+ltdXst3nxA6Z3ZuKeAWA=, sha256/ZSagvDzjltLkewXEBuDxIzpW/dpVw1Juvvmd0hhkzdY=, sha256/sLVjNUaFYfW7n6EtgBeEpjOlcnBdNPMrZDRF36iwBdE=)",
+        "detail": {
+          "observed": [
+            "sha256/uOmwqBIvMM6bY2khsu8Tmp+ltdXst3nxA6Z3ZuKeAWA=",
+            "sha256/ZSagvDzjltLkewXEBuDxIzpW/dpVw1Juvvmd0hhkzdY=",
+            "sha256/sLVjNUaFYfW7n6EtgBeEpjOlcnBdNPMrZDRF36iwBdE="
+          ]
+        }
+      },
+      {
+        "label": "plain http www.google.com",
+        "ok": true,
+        "ms": 360,
+        "status": 200,
+        "bytes": 85183,
+        "tls": null
+      }
+    ]
+  }
+}

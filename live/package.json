@@ -1,0 +1,9 @@
+{
+  "name": "tunnelfetch-live",
+  "private": true,
+  "type": "module",
+  "description": "Live interop rig. Runs the package on the edge through a real proxy; not published.",
+  "devDependencies": {
+    "wrangler": "^4.115.0"
+  }
+}
