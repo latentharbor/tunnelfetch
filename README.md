@@ -367,6 +367,39 @@ interpreted. The excess decays over roughly six requests:
 Warming costs 10 ms of startup at one iteration and 22 ms at five, against a 1 s startup budget.
 It does not lower the warm floor — the effect is entirely on the ramp.
 
+### What that costs
+
+Workers Standard bills $5/month, which includes 10 million requests and 30 million CPU
+milliseconds, then $0.30 per additional million requests and $0.02 per additional million CPU
+milliseconds. Applying the measurements above:
+
+| Workload | CPU/request | 10M requests/mo | 1B requests/mo | of which CPU |
+| --- | --- | --- | --- | --- |
+| Platform `fetch` — for reference; it cannot use a proxy | ~1 ms | $5.00 | $321.40 | $19.40 |
+| Pooled connection, 16 KB pages | 3.3 ms | $5.06 | $367.40 | $65.40 |
+| Pooled connection, 1 MB pages | 9.2 ms | $6.24 | $485.40 | $183.40 |
+| New connection per request, 16 KB | 11 ms | $6.60 | $521.40 | $219.40 |
+| New connection per request, 1 MB | 14.5 ms | $7.30 | $591.40 | $289.40 |
+| New connection per request, 4 MB | 30 ms | $10.40 | $901.40 | $599.40 |
+
+Three things fall out of that table.
+
+**At ten million requests a month, none of this matters.** Every row lands between $5 and $11,
+because the included quotas swallow it. The included CPU works out to 3.0 ms per request at that
+volume, so anything that reuses connections is inside the base fee entirely.
+
+**At a billion, $297 of every row is the request charge**, which is identical for all of them and
+which nothing this package does can change. What is left to optimise is the CPU column, and there
+the difference between reusing connections and not is $154/month on 16 KB pages.
+
+**Pooled, the whole userland stack costs about 14% more than the platform's own `fetch`** at a
+billion requests — $367 against $321 — for something the platform's `fetch` cannot do at all.
+
+Cold starts are not in the table because their share depends on how often your traffic lands on a
+fresh isolate. The ramp costs roughly 4.4 ms per request amortised over an isolate's early life, or
+1.1 ms with `warmup({ iterations: 5 })` — about $88 and $22 per month respectively at a billion
+requests.
+
 ### Where the cost is, and is not
 
 Chain validation is signature verification, not parsing. Parsing a whole chain is ~158 µs; a single
