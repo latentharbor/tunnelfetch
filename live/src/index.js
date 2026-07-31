@@ -432,6 +432,54 @@ async function cryptoBench(op, n, extra = null) {
   return { op, error: 'unknown op' };
 }
 
+/**
+ * Does a pooled socket survive from one invocation to the next?
+ *
+ * The pool's own header asserts it cannot — "I/O objects do not cross request contexts" — and the
+ * whole design follows from that: per-Client pools, reuse only within a single invocation. But the
+ * claim is not measured anywhere, and it decides something expensive. If a socket DOES survive,
+ * a Client held at module scope makes every request after the first cost ~0.9 ms instead of the
+ * ~9-12 ms a fresh connection costs, which is a larger win than everything else measured so far.
+ *
+ * So: one Client, built once per isolate, driven by successive HTTP invocations. The pool's own
+ * hit/miss counters say whether the second invocation reused, and reading a real body says whether
+ * the reused socket actually works rather than merely being handed back.
+ */
+let SHARED = null;
+let SHARED_KEY = null;
+let SHARED_SEQ = 0;
+
+async function crossRequestPool({ proxy, url }) {
+  const key = `${proxy.hostname}:${proxy.port}|${url}`;
+  if (SHARED_KEY !== key) {
+    if (SHARED) await SHARED.close().catch(() => {});
+    SHARED = new Client({
+      connect, proxy, forceTunnel: true,
+      timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
+    });
+    SHARED_KEY = key;
+    SHARED_SEQ = 0;
+  }
+  const invocation = ++SHARED_SEQ;
+  const before = { ...SHARED.pool.stats };
+  try {
+    const res = await SHARED.fetch(url);
+    const body = await res.text();
+    return {
+      invocation,
+      status: res.status,
+      bytes: body.length,
+      // A hit here means this invocation reused a socket opened by an EARLIER invocation.
+      hitsThisCall: SHARED.pool.stats.hits - before.hits,
+      missesThisCall: SHARED.pool.stats.misses - before.misses,
+      idleAfter: SHARED.pool.idleCount,
+      reusedAcrossInvocations: invocation > 1 && SHARED.pool.stats.hits > before.hits,
+    };
+  } catch (e) {
+    return { invocation, failed: true, code: e?.code ?? null, error: String(e?.message ?? e) };
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -471,6 +519,41 @@ export default {
     if (url.searchParams.get('pin')) {
       const t = url.searchParams.get('pin');
       results.push(await attempt(`pin-mismatch ${t}`, () => pinMismatch({ proxy, url: `https://${t}/` })));
+    }
+    if (url.searchParams.get('sizes')) {
+      // The cost table. One Client per call so each measurement includes a full connection
+      // (handshake + trust + request + body), which is the honest per-page cost for a crawler
+      // that reaches a new origin; `reuse=N` then measures N pages down ONE connection, which is
+      // what the same crawler pays for pages 2..N of the same host.
+      const spec = url.searchParams.get('sizes');
+      const origin = url.searchParams.get('origin');
+      const reuse = Number(url.searchParams.get('reuse') ?? 1);
+      const enc = url.searchParams.get('enc') ?? '';
+      results.push(await attempt(`sizes ${spec}`, async () => {
+        const client = new Client({
+          connect, proxy, forceTunnel: true, maxBodyBytes: 16 << 20,
+          timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
+        });
+        try {
+          const out = [];
+          for (const n of spec.split(',').map(Number)) {
+            for (let i = 0; i < reuse; i++) {
+              const q = `?n=${n}${enc ? `&enc=${enc}` : ''}&i=${i}`;
+              const res = await client.fetch(`https://${origin}/${q}`);
+              const body = await res.text();
+              out.push({ n, got: body.length, enc: res.headers.get('content-encoding') });
+            }
+          }
+          return { pages: out.length, hits: client.pool.stats.hits, misses: client.pool.stats.misses,
+            sample: out[0] };
+        } finally {
+          await client.close();
+        }
+      }));
+    }
+    if (url.searchParams.get('poolx')) {
+      const t = url.searchParams.get('poolx');
+      results.push(await attempt(`poolx ${t}`, () => crossRequestPool({ proxy, url: `https://${t}/` })));
     }
     if (url.searchParams.get('stream')) {
       const t = url.searchParams.get('stream');
