@@ -399,117 +399,93 @@ grouped per isolate so that a first execution is never averaged together with a 
 bill CPU time, not wall time, and the overwhelming majority of a request here is spent waiting on
 the network, which is not billed.
 
-### What a page costs
+### What a request costs
 
 Fetching a size-controlled origin through a proxy, warm, medians over seven-plus rounds on one
-isolate, gzip on the wire:
+isolate, gzip on the wire. The last column is the same numbers as a rate, which is the form worth
+carrying around:
 
-| Page size | One page, new connection | Each further page, same connection |
-| --- | --- | --- |
-| 1 KB | 11 ms | 2–3 ms |
-| 16 KB | 11 ms | 3 ms |
-| 64 KB | 11 ms | 2–4 ms |
-| 256 KB | 7 ms | 3.4 ms |
-| 1 MB | 11 ms | 6–12 ms |
-| 4 MB | 31 ms | 21–35 ms |
+| | New connection | Each further request, same connection | Marginal rate |
+| --- | --- | --- | --- |
+| 1 KB body | 11 ms | 2–3 ms | — |
+| 16 KB body | 11 ms | 3 ms | — |
+| 64 KB body | 11 ms | 2–4 ms | — |
+| 256 KB body | 7 ms | 3.4 ms | ~13 ms/MB |
+| 1 MB body | 11 ms | 6–12 ms | ~9 ms/MB |
+| 4 MB body | 31 ms | 21–35 ms | ~7 ms/MB |
+| **Same 16 KB page over HTTP/2** | 12 ms | 2.2 ms | — |
+| **First request in a fresh isolate** | 46 ms | — | — |
+| **…after `warmup({ iterations: 5 })`** | 16 ms | — | — |
 
-A simple model fits every row to within the spread:
+One model fits every body-size row to within its spread:
 
 > **≈ 9.5 ms to open a connection + 2 ms per request + 5–8 ms per MB of body**
 
-The ranges are real, not imprecision: absolute CPU on this platform varies by up to ~1.5×
-between isolates and runs (the same sweep repeated lands on faster and slower machines), so the
-row values are medians and the spread is what repeated same-isolate measurement actually shows.
-The per-MB term was ~25 ms/MB before the decode and socket read paths were rebuilt around BYOB
-reads — the old cost was per-chunk stream-boundary crossings, not bytes; see below.
-
-The connection term recovered independently from each row lands between 5 and 11 ms, which agrees
-with the 9–12 ms measured for a new connection by other means. Most of it is the TLS handshake and
+The connection term recovered independently from each row lands between 5 and 11 ms, agreeing with
+the 9–12 ms measured for a new connection by other means. Most of it is the TLS handshake and
 certificate chain validation; almost none of it is parsing (see below).
+
+The ranges are real, not imprecision: absolute CPU on this platform varies by up to ~1.5× between
+isolates and runs — the same sweep repeated lands on faster and slower machines — so the values are
+medians and the spread is what repeated same-isolate measurement actually shows.
 
 **Reuse is the lever.** Thirty 16 KB pages from one host cost about 103 ms down one connection and
 about 300 ms opening thirty. That gap is the entire argument for holding a `Client` rather than
 calling `createFetch` per request, and it widens as pages get smaller.
 
-### HTTP/2 costs more than HTTP/1.1, not less
+**HTTP/2 is more expensive in every cell and cheaper in none** — 12 ms against 8 ms for one page on
+a new connection, 76 ms against 67 ms for thirty pages on one connection, changing only the offered
+ALPN against the same origin and proxy. The overhead is HPACK plus frame and stream bookkeeping,
+concentrated at connection setup: the preface, the `SETTINGS` exchange, and the first header block.
+Multiplexing, the thing HTTP/2 is *for* in a browser, buys latency a one-request-per-handler Worker
+cannot spend. Reach for it when a site refuses HTTP/1.1, and set `http2: false` on paths that do
+not need it. (These two rows came from the Workers GraphQL analytics API rather than `wrangler
+tail`, which would not survive the measurement network here; same edge CPU-time metric, quantiled
+per minute.)
 
-This is the number the [HTTP/2 section](#http2--access-not-speed) promises to state honestly.
-Fetching the *same* 16 KB origin through the *same* proxy, changing only the offered ALPN, measured
-on the edge (per-minute CPU-time p50, h2-only and h1-only runs in separate buckets):
+**The fresh-isolate rows are a ramp, not a step.** V8 tiers up per function per isolate, so the
+first executions run interpreted and the excess decays over roughly six requests: 61 ms of total
+excess above the warm floor without `warmup()`, 15 ms with it at five iterations — about 4.4 ms and
+1.1 ms per request respectively, amortised over an isolate's early life. Warming costs 10 ms of
+startup at one iteration and 22 ms at five, against a 1 s budget, and does not lower the warm floor.
 
-| | HTTP/1.1 | HTTP/2 |
-| --- | --- | --- |
-| One 16 KB page, new connection | ~8 ms | ~12 ms |
-| Thirty 16 KB pages, one connection | ~67 ms | ~76 ms |
+### What that costs in dollars
 
-HTTP/2 was more expensive in every cell and cheaper in none. The overhead is HPACK (header
-compression HTTP/1.1 does not do) plus frame and stream bookkeeping, and it concentrates at
-connection setup — the preface, the `SETTINGS` exchange, and the first header block. Multiplexing,
-the thing HTTP/2 is *for* on a browser, buys latency a one-request-per-handler Worker cannot spend.
-So on a CPU-metered runtime HTTP/2 is a cost you pay for access, not a speed-up: reach for it only
-when a site refuses HTTP/1.1, and leave `http2: false` on the hot paths that do not need it.
+Workers Standard bills $5/month including 10 million requests and 30 million CPU milliseconds, then
+$0.30 per additional million requests and $0.02 per additional million CPU milliseconds. Applying
+the measurements above, with the charge split out so it is clear what is yours to change:
 
-(These were gathered through the Workers GraphQL analytics API rather than `wrangler tail` — the
-tail stream would not survive the measurement network here — but they are the same edge CPU-time
-metric, quantiled over the invocations in each minute.)
+| Workload | CPU/request | At 10M/mo | At 1B/mo | of which requests | of which CPU |
+| --- | --- | --- | --- | --- | --- |
+| Platform `fetch` — reference; it cannot use a proxy | ~1 ms | $5.00 | $321.40 | $297.00 | $19.40 |
+| Pooled connection, 16 KB pages | 3.3 ms | $5.06 | $367.40 | $297.00 | $65.40 |
+| Pooled connection, 1 MB pages | 9.2 ms | $6.24 | $485.40 | $297.00 | $183.40 |
+| New connection per request, 16 KB | 11 ms | $6.60 | $521.40 | $297.00 | $219.40 |
+| New connection per request, 1 MB | 14.5 ms | $7.30 | $591.40 | $297.00 | $289.40 |
+| New connection per request, 4 MB | 30 ms | $10.40 | $901.40 | $297.00 | $599.40 |
+| *Cold-start ramp, added to any row above* | +4.4 ms | +$0 | +$87 | — | +$87 |
+| *…with `warmup()`* | +2.8 ms | +$0 | +$56 | — | +$56 |
+| *…with `warmup({ iterations: 5 })`* | +1.1 ms | +$0 | +$22 | — | +$22 |
 
-### What a fresh isolate costs
+Four things fall out of it.
 
-V8 tiers up per function per isolate, so the first executions of the TLS and HTTP paths run
-interpreted. The excess decays over roughly six requests:
+**At ten million requests a month, none of this matters.** Every row lands between $5 and $11
+because the included quotas swallow it — the included CPU works out to 3.0 ms per request at that
+volume, so anything that reuses connections is inside the base fee entirely, cold starts included.
 
-| | First request | Excess over the warm floor, whole ramp |
-| --- | --- | --- |
-| Without `warmup()` | 46 ms | 61 ms (≈ 4.4 ms/request over an isolate's early life) |
-| `warmup()` once | 22 ms | 40 ms (≈ 2.8 ms/request) |
-| `warmup({ iterations: 5 })` | 16 ms | 15 ms (≈ 1.1 ms/request) |
+**At a billion, $297 of every row is the request charge**, identical across all of them and
+unchangeable by anything this package does. Only the CPU column is left to optimise, and there the
+difference between reusing connections and not is $154/month on 16 KB pages.
 
-Warming costs 10 ms of startup at one iteration and 22 ms at five, against a 1 s startup budget.
-It does not lower the warm floor — the effect is entirely on the ramp.
+**Pooled, the whole userland stack costs about 14% more than the platform's own `fetch`** — $367
+against $321 — for something the platform's `fetch` cannot do at all.
 
-### What that costs
-
-Workers Standard bills $5/month, which includes 10 million requests and 30 million CPU
-milliseconds, then $0.30 per additional million requests and $0.02 per additional million CPU
-milliseconds. Applying the measurements above:
-
-| Workload | CPU/request | 10M requests/mo | 1B requests/mo | of which CPU |
-| --- | --- | --- | --- | --- |
-| Platform `fetch` — for reference; it cannot use a proxy | ~1 ms | $5.00 | $321.40 | $19.40 |
-| Pooled connection, 16 KB pages | 3.3 ms | $5.06 | $367.40 | $65.40 |
-| Pooled connection, 1 MB pages | 9.2 ms | $6.24 | $485.40 | $183.40 |
-| New connection per request, 16 KB | 11 ms | $6.60 | $521.40 | $219.40 |
-| New connection per request, 1 MB | 14.5 ms | $7.30 | $591.40 | $289.40 |
-| New connection per request, 4 MB | 30 ms | $10.40 | $901.40 | $599.40 |
-
-Three things fall out of that table.
-
-**At ten million requests a month, none of this matters.** Every row lands between $5 and $11,
-because the included quotas swallow it. The included CPU works out to 3.0 ms per request at that
-volume, so anything that reuses connections is inside the base fee entirely.
-
-**At a billion, $297 of every row is the request charge**, which is identical for all of them and
-which nothing this package does can change. What is left to optimise is the CPU column, and there
-the difference between reusing connections and not is $154/month on 16 KB pages.
-
-**Pooled, the whole userland stack costs about 14% more than the platform's own `fetch`** at a
-billion requests — $367 against $321 — for something the platform's `fetch` cannot do at all.
-
-Cold starts are not in the table because their share depends on how often your traffic lands on a
-fresh isolate. Measured at ~17.8 requests per isolate, the ramp adds roughly 4.4 ms per request
-amortised over an isolate's early life — about **$87/month** at a billion requests. `warmup()`
-removes most of it:
-
-| | Ramp, amortised | At 1B/mo | `warmup()`'s own cost | Net |
-| --- | --- | --- | --- | --- |
-| No `warmup()` | 4.4 ms/req | $87 | — | — |
-| `warmup()` | 2.8 ms/req | $56 | 10 ms of startup | **saves $31** |
-| `warmup({ iterations: 5 })` | 1.1 ms/req | $22 | 22 ms of startup | **saves $65** |
-
-`warmup()`'s own cost is zero in that table because startup CPU is not billed on Workers Standard.
-Where it is billed, the 22 ms is charged once per isolate and spread over the requests that isolate
-serves — $25/month at a billion requests and 17.8 requests per isolate, against $65 saved, so still
-net positive. Below about 7 requests per isolate it stops paying for itself.
+**`warmup()` is free on Standard and usually worth it elsewhere.** Its own cost is startup CPU,
+which Workers Standard does not bill, so the $65 the five-iteration row saves is a pure saving.
+Where startup CPU *is* billed — dynamic Worker loading, for instance — the 22 ms is charged once
+per isolate and spread across the requests that isolate serves: $25/month at a billion requests and
+the ~17.8 requests per isolate measured here, against $65 saved. It stops paying for itself below
+about 7 requests per isolate.
 
 ### Where the cost is, and is not
 
