@@ -382,7 +382,7 @@ Not implemented, and not planned:
 - **Revocation fetching (CRL downloads, OCSP responder queries).** Both need network round trips
   mid-handshake, through the proxy, and an OCSP query tells the CA which origins you visit.
   Revocation *is* checked from a **stapled** OCSP response when the server sends one (see Trust
-  below); what is not implemented, and not planned, is going to fetch what the server did not
+  above); what is not implemented, and not planned, is going to fetch what the server did not
   staple.
 - **Certificate policy processing** (`policyConstraints`, `inhibitAnyPolicy`). Because they are
   always critical, their presence causes a rejection rather than being mis-validated.
