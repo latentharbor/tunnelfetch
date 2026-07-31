@@ -455,17 +455,20 @@ Workers Standard bills $5/month including 10 million requests and 30 million CPU
 $0.30 per additional million requests and $0.02 per additional million CPU milliseconds. Applying
 the measurements above, with the charge split out so it is clear what is yours to change:
 
-| Workload | CPU/request | At 10M/mo | At 1B/mo | of which requests | of which CPU |
+| Workload | CPU/request | 10M/mo, cold | 10M/mo, warmed | 1B/mo, cold | 1B/mo, warmed |
 | --- | --- | --- | --- | --- | --- |
-| Platform `fetch` — reference; it cannot use a proxy | ~1 ms | $5.00 | $321.40 | $297.00 | $19.40 |
-| Pooled connection, 16 KB pages | 3.3 ms | $5.06 | $367.40 | $297.00 | $65.40 |
-| Pooled connection, 1 MB pages | 9.2 ms | $6.24 | $485.40 | $297.00 | $183.40 |
-| New connection per request, 16 KB | 11 ms | $6.60 | $521.40 | $297.00 | $219.40 |
-| New connection per request, 1 MB | 14.5 ms | $7.30 | $591.40 | $297.00 | $289.40 |
-| New connection per request, 4 MB | 30 ms | $10.40 | $901.40 | $297.00 | $599.40 |
-| *Cold-start ramp, added to any row above* | +4.4 ms | +$0 | +$87 | — | +$87 |
-| *…with `warmup()`* | +2.8 ms | +$0 | +$56 | — | +$56 |
-| *…with `warmup({ iterations: 5 })`* | +1.1 ms | +$0 | +$22 | — | +$22 |
+| Platform `fetch` — reference; it cannot use a proxy | 0.3 ms | $5.00 | $5.00 | $307.40 | $307.40 |
+| Pooled connection, 16 KB pages | 3.3 ms | $5.93 | $5.28 | $454.60 | $389.60 |
+| Pooled connection, 1 MB pages | 9.2 ms | $7.11 | $6.46 | $572.60 | $507.60 |
+| New connection per request, 16 KB | 11 ms | $7.47 | $6.82 | $608.60 | $543.60 |
+| New connection per request, 1 MB | 14.5 ms | $8.17 | $7.52 | $678.60 | $613.60 |
+| New connection per request, 4 MB | 30 ms | $11.27 | $10.62 | $988.60 | $923.60 |
+
+"Cold" carries the measured fresh-isolate ramp of +4.4 ms per request amortised; "warmed" is the
+same workload with `warmup({ iterations: 5 })`, which brings the ramp down to +1.1 ms. The saving is
+$0.65/month at ten million requests and $65/month at a billion, identical across every row because
+the ramp is a property of the isolate rather than of the request. The reference row carries no ramp
+because the platform's own `fetch` has no JavaScript protocol stack to tier up.
 
 Four things fall out of it.
 
@@ -474,14 +477,33 @@ because the included quotas swallow it — the included CPU works out to 3.0 ms 
 volume, so anything that reuses connections is inside the base fee entirely, cold starts included.
 
 **At a billion, $297 of every row is the request charge**, identical across all of them and
-unchangeable by anything this package does. Only the CPU column is left to optimise, and there the
+unchangeable by anything this package does. Only the CPU is left to optimise, and there the
 difference between reusing connections and not is $154/month on 16 KB pages.
 
-**Pooled, the whole userland stack costs about 14% more than the platform's own `fetch`** — $367
-against $321 — for something the platform's `fetch` cannot do at all.
+**Pooled and warmed, the whole userland stack costs about 27% more than the platform's own
+`fetch`** — $390 against $307 — for something the platform's `fetch` cannot do at all.
+
+That reference row is measured, not assumed, and it is not flat. Fetching real pages of different
+sizes from the same Worker, marginal cost per request on a reused connection:
+
+| Page | Size | Platform `fetch` | This package, proxied | Ratio |
+| --- | --- | --- | --- | --- |
+| `example.com` | 0.6 KB | 0.2 ms | 3.8 ms | 12.8× |
+| `news.ycombinator.com` | 35 KB | 0.3 ms | 1.8 ms | 5.5× |
+| `www.wikipedia.org` | 118 KB | 0.5 ms | 1.5 ms | 3.0× |
+| `github.com` | 591 KB | 2.0 ms | 14.0 ms | 7.0× |
+
+The platform's `fetch` scales with body size too — it is not a flat millisecond — because it still
+has to materialise the body as a JS value, which is the one per-byte cost both clients pay. What it
+does not pay for is TLS, HTTP framing and decompression, all of which happen in the runtime and are
+never billed to the caller. These four rows are noisy: CPU time is reported at 1 ms granularity and
+these are small numbers, so the ratios bounce between 3× and 13× and are not monotonic in size (the
+118 KB page measured cheaper than the 35 KB one). The direction is solid; the individual ratios are
+not worth quoting to one decimal place.
 
 **`warmup()` is free on Standard and usually worth it elsewhere.** Its own cost is startup CPU,
-which Workers Standard does not bill, so the $65 the five-iteration row saves is a pure saving.
+which Workers Standard does not bill, so the $65/month the "warmed" columns save at a billion
+requests is a pure saving.
 Where startup CPU *is* billed — dynamic Worker loading, for instance — the 22 ms is charged once
 per isolate and spread across the requests that isolate serves: $25/month at a billion requests and
 the ~17.8 requests per isolate measured here, against $65 saved. It stops paying for itself below
