@@ -215,12 +215,26 @@ export async function verifyChain({ chain, hostname, trust = { mode: 'system' },
       await checkPins(pins, parsed, null);
       return parsed[0];
     }
+    // Even here the leaf must parse, and the reason is not about trust: the handshake authenticates
+    // the key exchange with a signature it checks against the leaf's public key, so a certificate
+    // whose SPKI cannot be read leaves nothing to check the signature against. 'none' switches off
+    // deciding whether to BELIEVE the certificate; it cannot conjure a key out of bytes that are
+    // not a certificate.
+    //
+    // This used to return null and let the drivers refuse a few frames later with CONFIG_INVALID
+    // ("verifyPeer must resolve with the validated leaf"), which blamed the caller's configuration
+    // for the peer's malformed certificate — precisely the sort of error that sends someone
+    // auditing their own code for an hour.
     try {
       return parseCertificate(chain[0]);
-    } catch {
-      // With verification explicitly disabled, an unparseable leaf is not a failure — but it is
-      // also not a certificate we can describe.
-      return null;
+    } catch (cause) {
+      throw new CertificateError(
+        codes.CERT_PARSE,
+        'the peer\'s leaf certificate could not be parsed, so its public key is unavailable and ' +
+          'the handshake signature cannot be checked against anything. Verification is disabled ' +
+          `(trust mode 'none'), which does not help here: ${cause?.message ?? cause}`,
+        { mode: 'none', cause: cause?.message ?? String(cause) },
+      );
     }
   }
 

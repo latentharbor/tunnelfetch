@@ -1,9 +1,29 @@
 {
   "name": "tunnelfetch",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "A fetch-shaped HTTP client that can route through HTTP CONNECT / HTTPS / SOCKS5 proxies on runtimes with only raw TCP, such as Cloudflare Workers. Implements TLS in userland because the runtime cannot verify a tunnelled peer.",
-  "type": "module",
+  "keywords": [
+    "fetch",
+    "proxy",
+    "socks5",
+    "http-connect",
+    "tls",
+    "cloudflare-workers",
+    "workerd",
+    "edge"
+  ],
+  "homepage": "https://github.com/latentharbor/tunnelfetch#readme",
+  "bugs": {
+    "url": "https://github.com/latentharbor/tunnelfetch/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/latentharbor/tunnelfetch.git"
+  },
   "license": "MIT",
+  "author": "latentharbor",
+  "type": "module",
+  "sideEffects": false,
   "engines": {
     "node": ">=20"
   },
@@ -33,6 +53,7 @@
       "default": "./src/trust/roots.js"
     }
   },
+  "types": "./types/index.d.ts",
   "files": [
     "src",
     "types",
@@ -40,7 +61,6 @@
     "README.zh-CN.md",
     "LICENSE"
   ],
-  "sideEffects": false,
   "scripts": {
     "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
     "test:live": "node --test --test-reporter=spec \"test/live/**/*.live.js\"",
@@ -48,17 +68,6 @@
     "types": "tsc -p tsconfig.json",
     "probe:deploy": "node scripts/deploy-probe.mjs"
   },
-  "keywords": [
-    "fetch",
-    "proxy",
-    "socks5",
-    "http-connect",
-    "tls",
-    "cloudflare-workers",
-    "workerd",
-    "edge"
-  ],
-  "types": "./types/index.d.ts",
   "devDependencies": {
     "typescript": "^5.9.0"
   }

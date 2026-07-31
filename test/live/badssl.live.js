@@ -66,7 +66,13 @@ const FAIL_CLOSED = [
   { sub: 'incomplete-chain', codes: ['CERT_CHAIN_INCOMPLETE', 'CERT_UNTRUSTED_ROOT'] },
   // A SHA-1 intermediate signature must be refused as weak, not silently honoured. (badssl's
   // sha1-intermediate host has also been expired at times, hence the wider accepted set.)
-  { sub: 'sha1-intermediate', codes: ['CERT_SIGNATURE_WEAK', 'CERT_EXPIRED', 'CERT_UNTRUSTED_ROOT'] },
+  // CERT_CHAIN_INCOMPLETE belongs here too, and is what this host actually produces today: its
+  // chain roots at AddTrust External CA Root, which expired in 2020 and has since been removed
+  // from the root programmes, so there is legitimately no anchor with that subject. Refusing a
+  // chain that reaches no anchor is the correct fail-closed outcome, and which of these reasons a
+  // deliberately-broken host trips is not ours to pin down.
+  { sub: 'sha1-intermediate',
+    codes: ['CERT_SIGNATURE_WEAK', 'CERT_EXPIRED', 'CERT_UNTRUSTED_ROOT', 'CERT_CHAIN_INCOMPLETE'] },
 ];
 
 for (const c of FAIL_CLOSED) {
@@ -144,11 +150,17 @@ for (const [sub, port] of [['tls-v1-0', ':1010'], ['tls-v1-1', ':1011']]) {
 // ------------------------------------------------------------------ the control: a good certificate
 //
 // Without this, every assertion above could pass simply because the network is broken. sha256 is
-// badssl's ordinary valid host; it MUST validate and speak TLS 1.3, proving the trust layer accepts
-// what it should as surely as it rejects what it should not.
-test(`sha256.${BADSSL} (a valid certificate) is accepted over TLS 1.3 — the control`, async () => {
+// badssl's ordinary valid host: it MUST validate and return a body, which proves the trust layer
+// accepts what it should as surely as it rejects what it should not.
+//
+// It asserts a negotiated version of 1.2 OR 1.3, not 1.3 specifically. Which one a third party
+// offers is not ours to require, and pinning it here once failed the whole suite — reporting a
+// broken network — because the host answered 1.2 after validating perfectly. What matters is that
+// the version is one we deliberately support; anything else would mean a silent downgrade.
+test(`sha256.${BADSSL} (a valid certificate) is accepted — the control`, async () => {
   const r = await attempt(at('sha256'));
   assert.equal(r.ok, true, `the valid control host must validate, got ${r.code} (${r.message})`);
-  assert.equal(r.tls.version, 0x0304, 'the control host should negotiate TLS 1.3');
+  assert.ok([0x0303, 0x0304].includes(r.tls.version),
+    `the control negotiated 0x${r.tls.version.toString(16)}, which is neither TLS 1.2 nor 1.3`);
   assert.ok(r.bodyLen > 0, 'the control host should return a body');
 });

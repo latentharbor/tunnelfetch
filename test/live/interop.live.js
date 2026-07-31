@@ -19,6 +19,40 @@ function client(extra = {}) {
   return new Client({ connect, forceTunnel: true, timeouts, maxBodyBytes: 4 << 20, ...extra });
 }
 
+// Preflight. Every test below dials a third-party host through whichever proxy the operator
+// supplied, and a proxy that refuses one of those hosts makes the whole suite fail in a way that
+// reads like a defect in this package. It is not: proxies routinely block particular destinations.
+// Observed with the proxies used to develop this: CONNECT to www.google.com is reset while
+// github.com succeeds, and `curl -x` through the same proxy at the same moment behaves identically.
+//
+// So find out first, and say so plainly. This does not skip anything — a live suite that skips on
+// failure reports a green tick it has not earned. It fails, with the one sentence that saves an
+// hour of looking in the wrong place.
+test('preflight: the configured proxy can reach every configured target', async () => {
+  const unreachable = [];
+  for (const host of LIVE_TARGETS) {
+    const c = client({ proxy: proxyFromEnv() });
+    try {
+      const res = await c.fetch(`https://${host}/`);
+      await res.text();
+    } catch (e) {
+      if (e?.code === 'PROXY_PROTOCOL' || e?.code === 'PROXY_CONNECT_REFUSED'
+        || e?.code === 'TIMEOUT_CONNECT') {
+        unreachable.push(`${host} (${e.code}: ${e.message})`);
+      } else {
+        throw e; // anything else is this package's problem and must surface as itself
+      }
+    } finally {
+      await c.close().catch(() => {});
+    }
+  }
+  assert.equal(
+    unreachable.length, 0,
+    `the proxy refused these targets, which is about the proxy and not about this package:\n  ${
+      unreachable.join('\n  ')}\nPick reachable hosts with TUNNELFETCH_LIVE_TARGETS=a.example,b.example`,
+  );
+});
+
 for (const host of LIVE_TARGETS) {
   test(`https://${host}/ through an HTTP CONNECT proxy`, async () => {
     const c = client({ proxy: proxyFromEnv() });

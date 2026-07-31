@@ -68,9 +68,14 @@ test('mode none with the flag accepts anything, and still returns the parsed lea
   const expired = makeCert({ subject: { CN: 'expired' }, notBefore: 0, notAfter: 1 });
   const leaf = await verifyChain({ chain: [expired.der], hostname: HOST, trust });
   assert.equal(leaf.subject.text, 'CN=expired');
-  // an unparseable blob is accepted (that is the contract) but cannot be described
-  const blob = await verifyChain({ chain: [Uint8Array.of(1, 2, 3)], hostname: HOST, trust });
-  assert.equal(blob, null);
+  // An unparseable blob is NOT accepted, and the contract changed deliberately. 'none' switches
+  // off deciding whether to believe a certificate; it cannot produce a public key from bytes that
+  // are not one, and the handshake checks its key-exchange signature against exactly that key. The
+  // old behaviour resolved with null, which every driver then rejected as CONFIG_INVALID a few
+  // frames later — blaming the caller's configuration for the peer's malformed certificate.
+  await rejectsWithCode(
+    async () => verifyChain({ chain: [Uint8Array.of(1, 2, 3)], hostname: HOST, trust }),
+    codes.CERT_PARSE);
 });
 
 test('the insecure flag on any verifying mode is a contradiction and refused', async () => {
@@ -182,4 +187,38 @@ test('empty chains are refused in every mode', async () => {
     await rejectsWithCode(async () => verifyChain({ chain: [], hostname: HOST, trust }),
       codes.CERT_CHAIN_INCOMPLETE);
   }
+});
+
+test("mode 'none' still refuses a leaf it cannot parse, and blames the certificate", async () => {
+  // Turning verification off says "do not decide whether to believe this certificate". It cannot
+  // say "produce a public key from bytes that are not a certificate" — and the handshake needs
+  // that key to check the signature over the key exchange, so there is nothing to continue with.
+  //
+  // The refusal is not the interesting part; the identity of the error is. This path used to
+  // resolve with null and let the TLS drivers fail several frames later with CONFIG_INVALID
+  // ("verifyPeer must resolve with the validated leaf"), which points the reader at their own
+  // configuration for something the peer did.
+  const garbage = [Uint8Array.from([0x30, 0x03, 0x02, 0x01, 0x01])]; // well-formed DER, not a cert
+  await rejectsWithCode(
+    async () => verifyChain({
+      chain: garbage,
+      hostname: HOST,
+      trust: { mode: 'none', insecureAcceptAnyCertificate: true },
+    }),
+    codes.CERT_PARSE,
+  );
+});
+
+test("mode 'none' resolves with a leaf carrying the SPKI its callers dereference", async () => {
+  // The documented return type is the parsed leaf, and both TLS drivers immediately read
+  // spki.spkiDer off it to check the handshake signature. A resolve that cannot satisfy that is
+  // not a success, which is why the unparseable case above throws rather than resolving.
+  const cert = makeCert({ subject: { CN: 'anything' } });
+  const got = await verifyChain({
+    chain: [cert.der],
+    hostname: HOST,
+    trust: { mode: 'none', insecureAcceptAnyCertificate: true },
+  });
+  assert.ok(got, 'must resolve with a certificate');
+  assert.ok(got.spki?.spkiDer instanceof Uint8Array, 'the leaf must carry its SPKI');
 });
