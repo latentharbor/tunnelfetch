@@ -9,11 +9,8 @@
  */
 export function hashLength(hash: ScheduleHash): number;
 /**
- * HMAC via WebCrypto. The WebCrypto spec forbids importing a zero-length HMAC key, but
- * HMAC itself zero-pads the key to the block size, so an empty key and a key of HashLen zero
- * bytes produce the identical MAC. RFC 5869 defines the default salt as HashLen zeros for the
- * same reason, so the substitution below is exact, not an approximation.
- *
+ * HMAC-Hash(key, data) for a single message. For repeated MACs under one key, import once with
+ * importHmacKey and call crypto.subtle.sign directly instead.
  * @param {ScheduleHash} hash
  * @param {Uint8Array} keyBytes
  * @param {Uint8Array} data
@@ -111,16 +108,24 @@ export function handshakeTrafficSecrets(hash: ScheduleHash, handshakeSecret: Uin
     server: Uint8Array;
 }>;
 /**
- * {client,server}_application_traffic_secret_0 and exporter_master_secret.
+ * {client,server}_application_traffic_secret_0 and (unless suppressed) exporter_master_secret.
+ *
+ * `exporter` defaults on so the RFC 8448 vectors and any exporter user get the full set, but the
+ * handshake driver passes false: this package exposes no TLS-exporter interface, so deriving
+ * exporter_master_secret on every connection is one HKDF-Expand-Label of provably dead work on
+ * the hot path. Suppressing it there removes that work without changing any observable behaviour.
  * @param {ScheduleHash} hash
  * @param {Uint8Array} masterSecret
  * @param {Uint8Array} transcriptHash
- * @returns {Promise<{ client: Uint8Array, server: Uint8Array, exporterMaster: Uint8Array }>}
+ * @param {{ exporter?: boolean }} [opts]
+ * @returns {Promise<{ client: Uint8Array, server: Uint8Array, exporterMaster?: Uint8Array }>}
  */
-export function applicationTrafficSecrets(hash: ScheduleHash, masterSecret: Uint8Array, transcriptHash: Uint8Array): Promise<{
+export function applicationTrafficSecrets(hash: ScheduleHash, masterSecret: Uint8Array, transcriptHash: Uint8Array, { exporter }?: {
+    exporter?: boolean;
+}): Promise<{
     client: Uint8Array;
     server: Uint8Array;
-    exporterMaster: Uint8Array;
+    exporterMaster?: Uint8Array;
 }>;
 /**
  * resumption_master_secret. Transcript: ClientHello..client Finished.

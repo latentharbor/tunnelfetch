@@ -324,7 +324,9 @@ export async function continueTls13(ctx) {
   // Application secrets are bound to the transcript through the server Finished (RFC 8446 s7.1),
   // so they are derived here, before anything the client sends is folded in.
   const masterSecret = await deriveMasterSecret(hash, handshakeSecret);
-  const appSecrets = await applicationTrafficSecrets(hash, masterSecret, await transcript.hash());
+  // No exporter interface is exposed, so exporter_master_secret would be dead work every handshake.
+  const appSecrets = await applicationTrafficSecrets(hash, masterSecret, await transcript.hash(),
+    { exporter: false });
 
   // --- client flight -------------------------------------------------------------------------
   if (options.compatibilityCcs !== false) await record.writeChangeCipherSpec();
