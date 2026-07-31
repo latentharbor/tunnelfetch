@@ -11,7 +11,9 @@ import {
   decodeText,
 } from '../../src/client/decode.js';
 import { utf8, latin1, concat } from '../../src/util/bytes.js';
-import { readableFrom, collect, rejectsWithCode, fixedChunks } from '../_harness.js';
+import {
+  readableFrom, readableThatErrors, collect, rejectsWithCode, fixedChunks,
+} from '../_harness.js';
 
 const PAYLOAD = utf8('The quick brown fox jumps over the lazy dog. '.repeat(40));
 
@@ -158,6 +160,176 @@ test('truncated gzip data errors rather than yielding a silent partial body', as
     () => collect(decodeBody(readableFrom([truncated]), 'gzip')),
     'HTTP_CONTENT_ENCODING',
   );
+});
+
+// ---------------------------------------------------------------- the BYOB drain path
+//
+// On the target runtime DecompressionStream's readable is a byte stream, and the decode stage
+// drains it with a BYOB reader (one large view per read) instead of a default reader (one
+// 4 KiB chunk per read) — measured at ~35 ms/MB against ~5 ms/MB on the edge. Node's
+// DecompressionStream readable is NOT byte-oriented, so the fallback path is what every other
+// test in this file exercises. These tests force the BYOB branch by wrapping the real
+// decompressor's readable in a `type: 'bytes'` stream, which Node's BYOB reader does accept.
+
+/** Re-expose `readable` as a byte stream so getReader({mode:'byob'}) works on it. */
+function byteStreamOver(readable, flags = {}) {
+  const r = readable.getReader();
+  let leftover = null;
+  return new ReadableStream({
+    type: 'bytes',
+    async pull(c) {
+      let chunk = leftover;
+      leftover = null;
+      if (!chunk) {
+        const { value, done } = await r.read();
+        if (done) {
+          c.close();
+          c.byobRequest?.respond(0);
+          return;
+        }
+        chunk = value;
+      }
+      const req = c.byobRequest;
+      if (req) {
+        flags.sawByobRequest = true;
+        const view = req.view;
+        const n = Math.min(view.byteLength, chunk.byteLength);
+        new Uint8Array(view.buffer, view.byteOffset, n).set(chunk.subarray(0, n));
+        if (n < chunk.byteLength) leftover = chunk.subarray(n);
+        req.respond(n);
+      } else {
+        c.enqueue(chunk);
+      }
+    },
+    cancel(reason) {
+      return r.cancel(reason);
+    },
+  });
+}
+
+/** Run `fn` with DecompressionStream swapped for one whose readable is a byte stream. */
+async function withByobDecompressionStream(flags, fn) {
+  const Real = globalThis.DecompressionStream;
+  globalThis.DecompressionStream = class {
+    constructor(format) {
+      const real = new Real(format);
+      this.writable = real.writable;
+      this.readable = byteStreamOver(real.readable, flags);
+    }
+  };
+  try {
+    return await fn();
+  } finally {
+    globalThis.DecompressionStream = Real;
+  }
+}
+
+test('the BYOB drain is taken when the decompressor exposes a byte stream, and round-trips', async () => {
+  const flags = {};
+  const wire = await compress(PAYLOAD, 'gzip');
+  const out = await withByobDecompressionStream(flags, () =>
+    collect(decodeBody(readableFrom(fixedChunks(wire, 7)), 'gzip')),
+  );
+  assert.deepEqual(out, PAYLOAD);
+  assert.equal(flags.sawByobRequest, true, 'the byte-stream source saw BYOB reads, so the ' +
+    'BYOB branch (not the default-reader fallback) is what this test exercised');
+});
+
+test('the BYOB drain survives byte-by-byte input and both deflate shapes', async () => {
+  for (const format of ['gzip', 'deflate', 'deflate-raw']) {
+    const flags = {};
+    const wire = await compress(PAYLOAD, format);
+    const declared = format === 'gzip' ? 'gzip' : 'deflate';
+    const out = await withByobDecompressionStream(flags, () =>
+      collect(decodeBody(readableFrom(fixedChunks(wire, 1)), declared)),
+    );
+    assert.deepEqual(out, PAYLOAD, format);
+    assert.equal(flags.sawByobRequest, true, format);
+  }
+});
+
+test('corrupt data on the BYOB path still surfaces HTTP_CONTENT_ENCODING', async () => {
+  const flags = {};
+  const err = await withByobDecompressionStream(flags, () =>
+    rejectsWithCode(
+      () => collect(decodeBody(readableFrom([utf8('not gzip at all')]), 'gzip')),
+      'HTTP_CONTENT_ENCODING',
+    ));
+  assert.match(err.message, /gzip/);
+});
+
+test('a source error mid-body is wrapped as HTTP_CONTENT_ENCODING naming the coding', async () => {
+  // The raw body erroring under the decoder (a torn connection, an idle timeout) must surface
+  // on the decoded stream as the decode stage's own typed error, as it always has.
+  const wire = await compress(PAYLOAD, 'gzip');
+  const err = await rejectsWithCode(
+    () => collect(decodeBody(
+      readableThatErrors([wire.subarray(0, 40)], new Error('boom mid-body')), 'gzip')),
+    'HTTP_CONTENT_ENCODING',
+  );
+  assert.match(err.message, /decoding "gzip" failed/);
+  assert.match(err.message, /boom mid-body/);
+});
+
+test('cancelling the decoded stream cancels the raw source (pool-discard prerequisite)', async () => {
+  // A consumer that abandons a compressed body must tear the connection down: the pool only
+  // ever reuses a connection whose body was consumed to its framed end, and the cancel
+  // reaching the raw stream is what lets the client observe the abandonment.
+  const wire = await compress(PAYLOAD, 'gzip');
+  let cancelledWith = null;
+  let fed = false;
+  const source = new ReadableStream({
+    pull(c) {
+      if (!fed) {
+        fed = true;
+        c.enqueue(wire.subarray(0, 64)); // enough for the sniff and a real decompressor
+        return;
+      }
+      return new Promise(() => {}); // then stall forever, like a quiet socket
+    },
+    cancel(reason) {
+      cancelledWith = reason;
+    },
+  });
+  const decoded = decodeBody(source, 'gzip');
+  const reader = decoded.getReader();
+  await reader.cancel('caller lost interest');
+  assert.equal(cancelledWith, 'caller lost interest');
+});
+
+test('zero-length chunks from a decompressor are skipped, not delivered', async () => {
+  // No real decompressor emits them, but the drain loop must not surface one as data or stall.
+  const Real = globalThis.DecompressionStream;
+  globalThis.DecompressionStream = class {
+    constructor(format) {
+      const real = new Real(format);
+      this.writable = real.writable;
+      const r = real.readable.getReader();
+      let sentEmpty = false;
+      this.readable = new ReadableStream({
+        async pull(c) {
+          if (!sentEmpty) {
+            sentEmpty = true;
+            c.enqueue(new Uint8Array(0));
+            return;
+          }
+          const { value, done } = await r.read();
+          if (done) c.close();
+          else c.enqueue(value);
+        },
+        cancel(reason) {
+          return r.cancel(reason);
+        },
+      });
+    }
+  };
+  try {
+    const wire = await compress(PAYLOAD, 'gzip');
+    const out = await collect(decodeBody(readableFrom([wire]), 'gzip'));
+    assert.deepEqual(out, PAYLOAD);
+  } finally {
+    globalThis.DecompressionStream = Real;
+  }
 });
 
 // ---------------------------------------------------------------- charset selection

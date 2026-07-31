@@ -14,6 +14,8 @@ import { RecordLayer } from '../../src/tls/record.js';
 import { decodeChunked } from '../../src/http1/chunked.js';
 import { ByteReader } from '../../src/util/bytes.js';
 import { parseCertificate } from '../../src/trust/x509.js';
+import { decodeBody } from '../../src/client/decode.js';
+import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js';
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
 
 const enc = new TextEncoder();
@@ -247,6 +249,145 @@ const prebuilt = { plain: null, chunked: null };
 /** Per-isolate signature keys; see the keygen note in the sigverify op. */
 const SIGKEYS = new Map();
 
+/**
+ * Body-path fixtures, cached per isolate: `mb` MB of the same highly compressible text the size
+ * origin serves, plus its gzip. Building them costs real CPU (the gzip especially), so the cost
+ * lands on whichever request builds them — `gz-fixture` exists to take that hit deliberately,
+ * and markPath records `fixed` so a contaminated first measurement is visible, not inferred.
+ */
+const BODYFIX = new Map();
+
+async function bodyFixture(mb) {
+  if (BODYFIX.has(mb)) return BODYFIX.get(mb);
+  const line = enc.encode('The quick brown fox jumps over the lazy dog 0123456789 abcdef.\n');
+  const n = Math.round(mb * 1048576);
+  const text = new Uint8Array(n);
+  for (let o = 0; o < n; o += line.length) {
+    text.set(line.subarray(0, Math.min(line.length, n - o)), o);
+  }
+  const gz = new Uint8Array(
+    await new Response(
+      new Response(text).body.pipeThrough(new CompressionStream('gzip')),
+    ).arrayBuffer(),
+  );
+  const fix = { text, gz };
+  BODYFIX.set(mb, fix);
+  return fix;
+}
+
+/** Fail loudly if a decomposition op delivered the wrong byte count: a wrong-size run prices
+ *  a failure path, not the operation, and must never be averaged into anything. */
+function assertBytes(got, want, what) {
+  if (got !== want) throw new Error(`${what}: delivered ${got} bytes, expected ${want}`);
+}
+
+/**
+ * The PREVIOUS decompressionStage (pipeTo -> WritableStream -> TransformStream), gzip-only
+ * copy (sniff and error wrapping dropped; the bench only feeds it valid gzip), kept so old and
+ * new can be A/B-ed inside one isolate — comparing across deploys mixes machine-to-machine
+ * variance (measured ~2x between sweeps) into the difference.
+ */
+function oldDecompressionStage(source, coding) {
+  const { readable, writable } = new TransformStream();
+  (async () => {
+    const reader = source.getReader();
+    const writer = writable.getWriter();
+    try {
+      const head = [];
+      let headLen = 0;
+      while (headLen < 2) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength) {
+          head.push(value);
+          headLen += value.byteLength;
+        }
+      }
+      if (headLen === 0) {
+        await writer.close();
+        return;
+      }
+      const ds = new DecompressionStream(coding);
+      const pump = ds.readable.pipeTo(
+        new WritableStream({ write: (chunk) => writer.write(chunk) }),
+      );
+      pump.catch(() => {});
+      const dsWriter = ds.writable.getWriter();
+      for (const chunk of head) await dsWriter.write(chunk);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength) await dsWriter.write(value);
+      }
+      await dsWriter.close();
+      await pump;
+      await writer.close();
+    } catch (e) {
+      await writer.abort(e).catch(() => {});
+      await reader.cancel(e).catch(() => {});
+    }
+  })();
+  return readable;
+}
+
+/**
+ * Wrap the socket factory so the raw socket's readable is observed (mode 'count') or drained
+ * with large BYOB reads and re-chunked (mode 'byob') before anything in the stack sees it.
+ * The whole real client runs above the wrapper, so the e2e cpuTime difference between modes
+ * prices exactly one thing: how many times the socket boundary is crossed per page.
+ */
+function shapeConnect(realConnect, mode, stats) {
+  return (addr, options) => {
+    const sock = realConnect(addr, options);
+    stats.sockets++;
+    const src = sock.readable;
+    let reader = null;
+    let byob = false;
+    const readable = new ReadableStream({
+      async pull(c) {
+        if (reader === null) {
+          if (mode === 'byob') {
+            try {
+              reader = src.getReader({ mode: 'byob' });
+              byob = true;
+            } catch (e) {
+              stats.byobError = String(e?.message ?? e);
+              reader = src.getReader();
+            }
+          } else {
+            reader = src.getReader();
+          }
+          stats.byob = byob;
+        }
+        const { value, done } = byob
+          ? await reader.read(new Uint8Array(65536))
+          : await reader.read();
+        if (done) {
+          c.close();
+          return;
+        }
+        stats.chunks++;
+        stats.bytes += value.byteLength;
+        if (value.byteLength < stats.min) stats.min = value.byteLength;
+        if (value.byteLength > stats.max) stats.max = value.byteLength;
+        c.enqueue(value);
+      },
+      cancel(reason) {
+        return (reader ?? src.getReader()).cancel(reason);
+      },
+    });
+    // Explicit properties rather than a spread: Socket's close/opened live on the prototype.
+    return {
+      readable,
+      writable: sock.writable,
+      opened: sock.opened,
+      closed: sock.closed,
+      close: () => sock.close(),
+      startTls: sock.startTls ? (...a) => sock.startTls(...a) : undefined,
+    };
+  };
+}
+
 async function prebuild(which, key16, iv) {
   if (prebuilt[which]) return prebuilt[which];
   const payload = new Uint8Array(MAX_RECORDS * 16384);
@@ -285,9 +426,13 @@ async function buildRecords(payload, key16, iv) {
  * `wrangler tail` reports, differenced across two runs with different `n` — that isolates the
  * marginal cost of one operation from the fixed cost of the request.
  */
-async function cryptoBench(op, n, extra = null) {
+async function cryptoBench(op, n, params = null) {
   const key16 = new Uint8Array(16).fill(7);
   const iv = new Uint8Array(12).fill(9);
+  const extra = params?.get?.('alg') ?? null;
+  // Body-path decomposition knobs: size in MB and JS-source chunk size in bytes.
+  const mb = Number(params?.get?.('mb') ?? 4);
+  const ck = Number(params?.get?.('ck') ?? 16384);
   let sink = 0;
 
   if (op === 'aead-records') {
@@ -449,6 +594,193 @@ async function cryptoBench(op, n, extra = null) {
     return { op, n, bytes: sink };
   }
 
+  // ------------------------------------------------------------------ body-path decomposition
+  // Where do ~25 ms per MB of body go? Each op below prices ONE slice of the decompressed-side
+  // pipeline over identical bytes, so differences between ops attribute cost to a specific layer.
+  // Every op asserts the byte count it delivered; a wrong count throws and the run is discarded.
+
+  if (op === 'gz-fixture') {
+    // Build (or confirm) the fixture so its cost never lands inside a measured op.
+    const fix = await bodyFixture(mb);
+    return { op, mb, textBytes: fix.text.byteLength, gzBytes: fix.gz.byteLength };
+  }
+
+  if (op === 'native-collect') {
+    // Floor: materialise mb MB from a native body with no stream of ours anywhere.
+    const fix = await bodyFixture(mb);
+    const buf = await new Response(fix.text).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, bytes: buf.byteLength };
+  }
+
+  if (op === 'js-collect') {
+    // A JS-backed ReadableStream of `ck`-byte subarray chunks, collected natively by Response.
+    // Differenced against native-collect this prices the per-chunk JS<->runtime boundary.
+    const fix = await bodyFixture(mb);
+    const buf = await new Response(fixedSource(fix.text, ck)).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, ck, chunks: Math.ceil(fix.text.byteLength / ck), bytes: buf.byteLength };
+  }
+
+  if (op === 'idle-wrap') {
+    // Same JS source, wrapped the way the client wraps every raw body. Differenced against
+    // js-collect this prices withIdleDeadline: one race()d read, one touch() per chunk.
+    const fix = await bodyFixture(mb);
+    const dl = new DeadlineController({ idleMs: 60000 }, {});
+    const buf = await new Response(withIdleDeadline(fixedSource(fix.text, ck), dl)).arrayBuffer();
+    dl.dispose();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, ck, chunks: Math.ceil(fix.text.byteLength / ck), bytes: buf.byteLength };
+  }
+
+  if (op === 'gz-native') {
+    // Inflate floor: native body -> native DecompressionStream -> native collection.
+    const fix = await bodyFixture(mb);
+    const buf = await new Response(
+      new Response(fix.gz).body.pipeThrough(new DecompressionStream('gzip')),
+    ).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, gzBytes: fix.gz.byteLength, bytes: buf.byteLength };
+  }
+
+  if (op === 'gz-jsread') {
+    // Same inflate, but the decompressed side is drained by a JS reader loop. The report also
+    // says how the decompressor chunks its output, which sets the N in every per-chunk cost.
+    const fix = await bodyFixture(mb);
+    const ds = new DecompressionStream('gzip');
+    const pump = new Response(fix.gz).body.pipeTo(ds.writable);
+    pump.catch(() => {});
+    const r = ds.readable.getReader();
+    let bytes = 0;
+    let chunks = 0;
+    let min = Infinity;
+    let max = 0;
+    const first = [];
+    for (;;) {
+      const { value, done } = await r.read();
+      if (done) break;
+      chunks++;
+      bytes += value.byteLength;
+      if (value.byteLength < min) min = value.byteLength;
+      if (value.byteLength > max) max = value.byteLength;
+      if (first.length < 6) first.push(value.byteLength);
+    }
+    await pump;
+    assertBytes(bytes, fix.text.byteLength, op);
+    return { op, mb, chunks, min, max, first, bytes };
+  }
+
+  if (op === 'gz-byob') {
+    // Can the decompressed side be drained in LARGE reads? A BYOB read returns as soon as at
+    // least one byte is available, so this cannot add latency — the question is whether the
+    // runtime supports it on a DecompressionStream readable, and what it does to chunk count.
+    const fix = await bodyFixture(mb);
+    const ds = new DecompressionStream('gzip');
+    const pump = new Response(fix.gz).body.pipeTo(ds.writable);
+    pump.catch(() => {});
+    let r;
+    try {
+      r = ds.readable.getReader({ mode: 'byob' });
+    } catch (e) {
+      return { op, mb, byob: false, error: String(e?.message ?? e) };
+    }
+    let bytes = 0;
+    let reads = 0;
+    let buf = new ArrayBuffer(ck);
+    for (;;) {
+      const { value, done } = await r.read(new Uint8Array(buf));
+      if (done) break;
+      reads++;
+      bytes += value.byteLength;
+      buf = value.buffer;
+    }
+    await pump;
+    assertBytes(bytes, fix.text.byteLength, op);
+    return { op, mb, ck, byob: true, reads, bytes };
+  }
+
+  if (op === 'gz-byob-partial') {
+    // The property a BYOB drain must have before it can sit on a streaming path: a read into a
+    // large view must resolve with a PARTIAL fill when the decompressor has some output but the
+    // input has stalled — a reader that held out for a full view would add unbounded latency to
+    // SSE-shaped bodies. No clocks: the proof is that the read resolves while the tail of the
+    // gzip stream is provably unwritten, racing a generous timer only so a failure reports
+    // 'stalled' instead of hanging the request.
+    const fix = await bodyFixture(mb);
+    const gz = fix.gz;
+    // A short prefix of the compressed stream, chosen so the decodable output it carries is far
+    // smaller than the `ck`-byte view — a full view therefore PROVES the read waited for more
+    // input, and a partial one proves it did not. (256 compressed bytes of this fixture decode
+    // to at most a few hundred KB; run with ck well above that.)
+    const half = gz.subarray(0, Math.min(Number(params?.get?.('hb') ?? 256), gz.byteLength - 8));
+    const ds = new DecompressionStream('gzip');
+    const w = ds.writable.getWriter();
+    let r;
+    try {
+      r = ds.readable.getReader({ mode: 'byob' });
+    } catch (e) {
+      return { op, mb, byob: false, error: String(e?.message ?? e) };
+    }
+    await w.write(half.slice());
+    let tailWritten = false;
+    const read = r.read(new Uint8Array(ck)).then((res) => ({ kind: 'read', res, tailWritten }));
+    const timer = new Promise((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), 3000));
+    const firstEvent = await Promise.race([read, timer]);
+    if (firstEvent.kind === 'timeout') {
+      // Reads block until the view fills: BYOB is NOT streaming-safe on this runtime.
+      tailWritten = true;
+      await w.write(gz.subarray(half.byteLength).slice());
+      await w.close();
+      const settled = await read;
+      return { op, mb, ck, partial: false, filledOnlyAfterTail: true,
+        firstRead: settled.res.value?.byteLength ?? null };
+    }
+    const firstLen = firstEvent.res.value?.byteLength ?? 0;
+    tailWritten = true;
+    await w.write(gz.subarray(half.byteLength).slice());
+    await w.close();
+    let bytes = firstLen;
+    let buf = new ArrayBuffer(ck);
+    for (;;) {
+      const { value, done } = await r.read(new Uint8Array(buf));
+      if (done) break;
+      bytes += value.byteLength;
+      buf = value.buffer;
+    }
+    assertBytes(bytes, fix.text.byteLength, op);
+    return { op, mb, ck, partial: firstLen > 0 && firstLen < ck,
+      firstRead: firstLen, viewBytes: ck, tailWasUnwrittenAtFirstRead: !firstEvent.tailWritten,
+      bytes };
+  }
+
+  if (op === 'gz-stage-old' || op === 'gz-stage-old-text') {
+    const fix = await bodyFixture(mb);
+    const out = oldDecompressionStage(new Response(fix.gz).body, 'gzip');
+    if (op === 'gz-stage-old-text') {
+      const s = await new Response(out).text();
+      assertBytes(s.length, fix.text.byteLength, op);
+      return { op, mb, bytes: s.length };
+    }
+    const buf = await new Response(out).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, bytes: buf.byteLength };
+  }
+
+  if (op === 'gz-stage' || op === 'gz-stage-text') {
+    // The package's actual decode stage (decodeBody -> decompressionStage), fed and collected
+    // exactly the way client.js feeds and Response collects it. gz-stage-text adds .text().
+    const fix = await bodyFixture(mb);
+    const out = decodeBody(new Response(fix.gz).body, 'gzip');
+    if (op === 'gz-stage-text') {
+      const s = await new Response(out).text();
+      assertBytes(s.length, fix.text.byteLength, op); // ASCII: one code unit per byte
+      return { op, mb, bytes: s.length };
+    }
+    const buf = await new Response(out).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, bytes: buf.byteLength };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };
@@ -514,10 +846,15 @@ export default {
       }
       const op = url.searchParams.get('op') ?? 'noop';
       const n = Number(url.searchParams.get('n') ?? 1);
-      // `prebuilt` is per-isolate, so whether this request paid for the fixture matters to the
-      // reading and must be recorded before the work, not inferred after it.
-      markPath(op, { prebuilt: Boolean(prebuilt.plain || prebuilt.chunked) });
-      return Response.json(await cryptoBench(op, n, url.searchParams.get('alg')));
+      // `prebuilt`/`fixed` are per-isolate, so whether this request paid for a fixture matters
+      // to the reading and must be recorded before the work, not inferred after it.
+      markPath(op, {
+        prebuilt: Boolean(prebuilt.plain || prebuilt.chunked),
+        fixed: [...BODYFIX.keys()].join('+') || null,
+        mb: url.searchParams.get('mb') ?? null,
+        ck: url.searchParams.get('ck') ?? null,
+      });
+      return Response.json(await cryptoBench(op, n, url.searchParams));
     }
     if (!env.PROBE_TOKEN || request.headers.get('x-probe-token') !== env.PROBE_TOKEN) {
       return new Response('forbidden', { status: 403 });
@@ -551,9 +888,18 @@ export default {
       const origin = url.searchParams.get('origin');
       const reuse = Number(url.searchParams.get('reuse') ?? 1);
       const enc = url.searchParams.get('enc') ?? '';
+      // dc=0 turns content decoding off; ae=gzip still asks the wire for gzip, so the pair
+      // separates "receive compressed bytes" from "decompress them" in the end-to-end number.
+      const dc = url.searchParams.get('dc') !== '0';
+      const ae = url.searchParams.get('ae') ?? '';
+      // sockshape=count observes how the raw socket chunks its delivery; sockshape=byob
+      // re-chunks it through 64 KiB BYOB reads. The difference prices socket boundary crossings.
+      const sockshape = url.searchParams.get('sockshape') ?? '';
+      const sockStats = { sockets: 0, chunks: 0, bytes: 0, min: Infinity, max: 0, byob: null };
+      const connectFn = sockshape ? shapeConnect(connect, sockshape, sockStats) : connect;
       results.push(await attempt(`sizes ${spec}`, async () => {
         const client = new Client({
-          connect, proxy, forceTunnel: true, maxBodyBytes: 16 << 20,
+          connect: connectFn, proxy, forceTunnel: true, maxBodyBytes: 16 << 20, decompress: dc,
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
         });
         try {
@@ -561,13 +907,23 @@ export default {
           for (const n of spec.split(',').map(Number)) {
             for (let i = 0; i < reuse; i++) {
               const q = `?n=${n}${enc ? `&enc=${enc}` : ''}&i=${i}`;
-              const res = await client.fetch(`https://${origin}/${q}`);
+              const res = await client.fetch(`https://${origin}/${q}`, {
+                headers: ae ? { 'accept-encoding': ae } : {},
+              });
               const body = await res.text();
-              out.push({ n, got: body.length, enc: res.headers.get('content-encoding') });
+              out.push({ n, got: body.length, status: res.status,
+                enc: res.headers.get('content-encoding'),
+                framing: res.tunnelfetch?.framing });
             }
           }
-          return { pages: out.length, hits: client.pool.stats.hits, misses: client.pool.stats.misses,
-            sample: out[0] };
+          // With decoding on and no wire compression trickery, every page must deliver exactly
+          // n bytes of 200 body — a short or non-200 page prices a failure, not a fetch.
+          const okPages = out.filter((p) => p.status === 200 && (dc ? p.got === p.n : p.got > 0)).length;
+          return { pages: out.length, okPages,
+            hits: client.pool.stats.hits, misses: client.pool.stats.misses,
+            sample: out[0],
+            ...(sockshape ? { sock: { ...sockStats,
+              min: Number.isFinite(sockStats.min) ? sockStats.min : null } } : {}) };
         } finally {
           await client.close();
         }

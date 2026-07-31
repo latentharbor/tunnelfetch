@@ -17,6 +17,13 @@ export const ACCEPT_ENCODING = 'gzip, deflate';
 const KNOWN_UNSUPPORTED = new Set(['br', 'zstd', 'compress', 'x-compress']);
 
 /**
+ * How much decompressed output one BYOB read may deliver. A BYOB read resolves as soon as at
+ * least one byte is available — it never waits for the view to fill — so a large view cannot
+ * add latency; it only lets a fast decompressor hand over more per boundary crossing.
+ */
+const DECOMPRESS_READ_BYTES = 65536;
+
+/**
  * One decompression stage. `sniffDeflate` handles the deflate ambiguity:
  *
  * RFC 9110 says Content-Encoding: deflate means ZLIB-WRAPPED deflate (RFC 1950), but a large
@@ -25,75 +32,152 @@ const KNOWN_UNSUPPORTED = new Set(['br', 'zstd', 'compress', 'x-compress']);
  * where (b0 & 0x0f) === 8 (CM = deflate) and ((b0 << 8) | b1) % 31 === 0 (the FCHECK checksum,
  * designed for exactly this kind of validation). Raw deflate data cannot systematically fake
  * both, so the check is reliable in practice.
+ *
+ * The output side is pull-driven and drains the decompressor with a BYOB reader when the
+ * runtime supports one (a large view per read), falling back to a default reader elsewhere.
+ * This shape is measured, not aesthetic: the target runtime's DecompressionStream emits
+ * 4096-byte chunks, and the previous wiring (pipeTo → WritableStream → TransformStream)
+ * crossed the JS/runtime boundary several times per chunk — measured on the edge at
+ * ~28 ms of CPU per MB of decompressed output for this stage alone, against ~2 ms/MB for
+ * the inflate itself. Draining with one 64 KiB read per crossing brings the stage to
+ * ~6 ms/MB (A/B-ed old-vs-new inside one isolate: 110 ms vs 23 ms for a 4 MB body).
+ * A BYOB read resolves with a partial fill the moment any output exists — verified on the
+ * edge with a stalled input, 58 KB arrived into a 1 MB view — so streaming latency is
+ * unchanged. Input is still pumped by an independent task: a decompressor legitimately
+ * consumes many input chunks before producing output, so tying input progress to output
+ * pulls would deadlock.
  */
 function decompressionStage(source, coding) {
-  const { readable, writable } = new TransformStream();
-  (async () => {
-    const reader = source.getReader();
-    const writer = writable.getWriter();
-    try {
-      // Buffer up to 2 bytes so the deflate sniff (and the empty-body check) can see them.
-      const head = [];
-      let headLen = 0;
-      while (headLen < 2) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value && value.byteLength) {
-          head.push(value);
-          headLen += value.byteLength;
-        }
+  const srcReader = source.getReader();
+  /** Rejections here surface through the output stream; pre-observed like chunked.js does. */
+  let pumpDone = null;
+  // The returned stream must exist synchronously, but the format is only known after the
+  // 2-byte sniff. `ready` settles with the DecompressionStream once the sniff has run, or
+  // with null for a zero-byte body.
+  const ready = (async () => {
+    // Buffer up to 2 bytes so the deflate sniff (and the empty-body check) can see them.
+    const head = [];
+    let headLen = 0;
+    while (headLen < 2) {
+      const { value, done } = await srcReader.read();
+      if (done) break;
+      if (value && value.byteLength) {
+        head.push(value);
+        headLen += value.byteLength;
       }
-      if (headLen === 0) {
-        // A zero-byte body under a Content-Encoding header is not a valid compressed stream,
-        // but CDNs emit it constantly (204-shaped responses, HEAD-derived bodies). Zero bytes
-        // in, zero bytes out is the only non-destructive reading, and it is what browsers do.
-        await writer.close();
-        return;
-      }
-      let format = coding;
-      if (coding === 'deflate') {
-        const b0 = headLen >= 1 ? firstBytes(head, 0) : -1;
-        const b1 = headLen >= 2 ? firstBytes(head, 1) : -1;
-        const isZlib = b1 >= 0 && (b0 & 0x0f) === 8 && ((b0 << 8) | b1) % 31 === 0;
-        format = isZlib ? 'deflate' : 'deflate-raw';
-      }
-      const ds = new DecompressionStream(format);
-      const pump = ds.readable.pipeTo(
-        new WritableStream({
-          write: (chunk) => writer.write(chunk),
-        }),
-      );
-      // If corrupt input errors the decompressor while we are still writing into it, the write
-      // below rejects first and control jumps to the catch — leaving `pump` rejected with no
-      // listener. Pre-attach a no-op handler so that cannot surface as an unhandled rejection;
-      // `await pump` on the success path still observes the real rejection.
-      pump.catch(() => {});
-      const dsWriter = ds.writable.getWriter();
-      for (const chunk of head) await dsWriter.write(chunk);
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value && value.byteLength) await dsWriter.write(value);
-      }
-      await dsWriter.close();
-      await pump;
-      await writer.close();
-    } catch (e) {
-      // Corrupt compressed data surfaces to the consumer as a stream error, wrapped so the
-      // caller sees which coding failed rather than a bare zlib message.
-      const err =
-        e instanceof HttpError
-          ? e
-          : new HttpError(
-              codes.HTTP_CONTENT_ENCODING,
-              `decoding "${coding}" failed: ${e?.message ?? e}`,
-              { coding },
-            );
-      await writer.abort(err).catch(() => {});
-      await reader.cancel(err).catch(() => {});
     }
+    if (headLen === 0) {
+      // A zero-byte body under a Content-Encoding header is not a valid compressed stream,
+      // but CDNs emit it constantly (204-shaped responses, HEAD-derived bodies). Zero bytes
+      // in, zero bytes out is the only non-destructive reading, and it is what browsers do.
+      return null;
+    }
+    let format = coding;
+    if (coding === 'deflate') {
+      const b0 = headLen >= 1 ? firstBytes(head, 0) : -1;
+      const b1 = headLen >= 2 ? firstBytes(head, 1) : -1;
+      const isZlib = b1 >= 0 && (b0 & 0x0f) === 8 && ((b0 << 8) | b1) % 31 === 0;
+      format = isZlib ? 'deflate' : 'deflate-raw';
+    }
+    const ds = new DecompressionStream(format);
+    const dsWriter = ds.writable.getWriter();
+    pumpDone = (async () => {
+      try {
+        for (const chunk of head) await dsWriter.write(chunk);
+        for (;;) {
+          const { value, done } = await srcReader.read();
+          if (done) break;
+          if (value && value.byteLength) await dsWriter.write(value);
+        }
+        await dsWriter.close();
+      } catch (e) {
+        // Either the source failed (its error must reach the consumer, so error the
+        // decompressor's output with it) or the decompressor rejected its input (already
+        // errored; the abort is a no-op). Both tear the source down.
+        await dsWriter.abort(e).catch(() => {});
+        await srcReader.cancel(e).catch(() => {});
+        throw e;
+      }
+    })();
+    pumpDone.catch(() => {});
+    return ds;
   })();
-  return readable;
+  ready.catch(() => {});
+
+  /** @type {ReadableStreamBYOBReader | ReadableStreamDefaultReader<Uint8Array> | null} */
+  let out = null;
+  let byob = false;
+  const wrap = (e) =>
+    e instanceof HttpError
+      ? e
+      : new HttpError(
+          codes.HTTP_CONTENT_ENCODING,
+          `decoding "${coding}" failed: ${e?.message ?? e}`,
+          { coding },
+        );
+
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        const ds = await ready;
+        if (ds === null) {
+          c.close();
+          return;
+        }
+        if (out === null) {
+          try {
+            out = ds.readable.getReader({ mode: 'byob' });
+            byob = true;
+          } catch {
+            // The runtime's DecompressionStream readable is not a byte stream (Node's is
+            // not); a default reader delivers the same bytes in the decompressor's own
+            // chunking.
+            out = ds.readable.getReader();
+          }
+        }
+        for (;;) {
+          const { value, done } = byob
+            ? await /** @type {ReadableStreamBYOBReader} */ (out)
+                .read(new Uint8Array(DECOMPRESS_READ_BYTES))
+            : await /** @type {ReadableStreamDefaultReader<Uint8Array>} */ (out).read();
+          if (done) {
+            // Clean output EOF implies the input pump already closed the decompressor
+            // successfully; awaiting it here surfaces any failure that raced the close.
+            if (pumpDone) await pumpDone;
+            c.close();
+            return;
+          }
+          if (value.byteLength === 0) continue; // legal, carries nothing; keep reading
+          c.enqueue(value);
+          return;
+        }
+      } catch (e) {
+        // Corrupt compressed data surfaces to the consumer as a stream error, wrapped so the
+        // caller sees which coding failed rather than a bare zlib message.
+        const err = wrap(e);
+        await srcReader.cancel(err).catch(() => {});
+        c.error(err);
+      }
+    },
+    async cancel(reason) {
+      // The consumer abandoned the decoded body: cancel the source and release the
+      // decompressor, exactly as the failure path does — an abandoned stream must still tear
+      // the connection down (the pool only reuses a connection whose body reached its framed
+      // end). The source goes FIRST: the sniff may still be awaiting it, and `ready` cannot
+      // settle until that read resolves.
+      await srcReader.cancel(reason).catch(() => {});
+      try {
+        if (out) {
+          await out.cancel(reason);
+        } else {
+          const ds = await ready.catch(() => null);
+          if (ds) await ds.readable.cancel(reason);
+        }
+      } catch {
+        /* the decompressor may already be errored */
+      }
+    },
+  });
 }
 
 /** Byte at logical offset `i` across the buffered head chunks. */

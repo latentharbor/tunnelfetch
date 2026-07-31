@@ -323,21 +323,27 @@ the network, which is not billed.
 
 ### What a page costs
 
-Fetching a size-controlled origin through a proxy, warm, medians over seven rounds, gzip on the
-wire:
+Fetching a size-controlled origin through a proxy, warm, medians over seven-plus rounds on one
+isolate, gzip on the wire:
 
 | Page size | One page, new connection | Each further page, same connection |
 | --- | --- | --- |
-| 1 KB | 11 ms | 1.8 ms |
-| 16 KB | 10 ms | 3.2 ms |
-| 64 KB | 13 ms | 3.6 ms |
-| 256 KB | 15 ms | 9.8 ms |
-| 1 MB | 37 ms | 26.3 ms |
-| 4 MB | 102 ms | 97 ms |
+| 1 KB | 11 ms | 2–3 ms |
+| 16 KB | 11 ms | 3 ms |
+| 64 KB | 11 ms | 2–4 ms |
+| 256 KB | 7 ms | 3.4 ms |
+| 1 MB | 11 ms | 6–12 ms |
+| 4 MB | 31 ms | 21–35 ms |
 
 A simple model fits every row to within the spread:
 
-> **≈ 9.5 ms to open a connection + 2 ms per request + 25 ms per MB of body**
+> **≈ 9.5 ms to open a connection + 2 ms per request + 5–8 ms per MB of body**
+
+The ranges are real, not imprecision: absolute CPU on this platform varies by up to ~1.5×
+between isolates and runs (the same sweep repeated lands on faster and slower machines), so the
+row values are medians and the spread is what repeated same-isolate measurement actually shows.
+The per-MB term was ~25 ms/MB before the decode and socket read paths were rebuilt around BYOB
+reads — the old cost was per-chunk stream-boundary crossings, not bytes; see below.
 
 The connection term recovered independently from each row lands between 5 and 11 ms, which agrees
 with the 9–12 ms measured for a new connection by other means. Most of it is the TLS handshake and
@@ -368,8 +374,19 @@ ECDSA P-384 verify is 665–816 µs, about 12× a P-256 verify and 27× an RSA-2
 EC chain carries two P-384 links, so **an all-ECDSA chain validates in ~3.5 ms against ~0.8 ms for
 an RSA one**. If you control the origin, its certificate's key type is worth a thought.
 
-Response decoding is dominated by constructing the `DecompressionStream`, not by the bytes: it cost
-~2 ms for a 559-byte body. For small JSON responses, `decompress: false` can be cheaper than gzip.
+For small responses, decoding is dominated by constructing the `DecompressionStream`, not by the
+bytes: ~2 ms for a 559-byte body, so for small JSON `decompress: false` can be cheaper than gzip.
+
+For large bodies the per-byte cost is not really per byte — it is per stream-boundary crossing.
+The runtime's `DecompressionStream` emits 4096-byte chunks and its sockets deliver reads of at
+most 4096 bytes, and every chunk that crosses between the runtime and JS costs tens of
+microseconds regardless of size. Both hot paths therefore drain their sources with BYOB reads
+into 64 KiB views (a BYOB read hands over everything already buffered in one crossing, and
+resolves partially filled the moment any byte exists, so streaming latency is unchanged). That
+rebuild took the decode stage from ~28 ms to ~6 ms per MB of decompressed output — measured by
+A/B-ing both implementations inside one isolate: 110 ms against 23 ms for the same 4 MB body.
+What remains is close to floor: inflate itself (~2 ms/MB) plus materialising the body into a JS
+string (~1.7 ms/MB), and that last term is the one cost the platform's own `fetch` also bills.
 
 Importing the package is free. The 121 bundled anchors are base64 strings indexed by a hash of the
 subject DN, and only the one anchor a chain lands on is ever decoded, so startup stays at ~2 ms for

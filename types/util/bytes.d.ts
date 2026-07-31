@@ -69,13 +69,25 @@ export class UnexpectedEofError extends TunnelFetchError {
 /**
  * Buffered reader over a ReadableStream<Uint8Array>.
  *
- * Returned slices may alias the stream's own chunks; they are never written to by this class and
- * must not be retained beyond the caller's immediate use if memory matters.
+ * Returned slices may alias the stream's own chunks (or, on the BYOB path, buffers this class
+ * allocated and will never touch again); they are never written to by this class and must not
+ * be retained beyond the caller's immediate use if memory matters.
+ *
+ * When the source is a byte stream — on the target runtime, a socket's readable is one — the
+ * reader pulls with BYOB reads into large fresh views instead of taking the source's own
+ * chunking. This is measured, not stylistic: the runtime delivers socket data in chunks of at
+ * most 4096 bytes, ~1200 of them for a 4 MB body, and every chunk is a runtime/JS boundary
+ * crossing; a BYOB read hands over everything the transport has buffered (up to the view size)
+ * in one crossing, and resolves with a partial fill the instant anything at all is available,
+ * so delivery latency is unchanged. Sources that are not byte streams (every in-process
+ * ReadableStream in this package and its tests) take the default-reader path unchanged.
  */
 export class ByteReader {
     /** @param {ReadableStream<Uint8Array>} readable */
     constructor(readable: ReadableStream<Uint8Array>);
-    _reader: ReadableStreamDefaultReader<Uint8Array<ArrayBufferLike>>;
+    /** @type {ReadableStreamBYOBReader | null} */
+    _byob: ReadableStreamBYOBReader | null;
+    _reader: ReadableStreamBYOBReader | ReadableStreamDefaultReader<Uint8Array<ArrayBufferLike>> | null;
     /** @type {Uint8Array[]} */
     _chunks: Uint8Array[];
     _head: number;
@@ -91,6 +103,8 @@ export class ByteReader {
     unshift(bytes: Uint8Array): void;
     /**
      * Pull one more chunk from the source. Returns false at EOF.
+     * The BYOB view is freshly allocated per read and never reused: _take hands out subarrays of
+     * buffered chunks, so recycling a view would rewrite bytes a parser already holds.
      * @returns {Promise<boolean>} annotated because the tail-recursive skip of empty chunks
      *   defeats return-type inference
      */

@@ -259,6 +259,111 @@ test('randomChunks is deterministic for a given seed', () => {
   );
 });
 
+// ---------------------------------------------------------------- the BYOB pull path
+//
+// On the target runtime a socket's readable is a byte stream, and ByteReader pulls from byte
+// streams with BYOB reads (one large view per crossing) instead of taking the source's own
+// chunking — measured on the edge, the socket otherwise delivers ≤4096-byte chunks and every
+// one is a boundary crossing. Every other test in this file feeds plain streams and covers the
+// default-reader path; these feed `type: 'bytes'` sources, which is what Node's BYOB reader
+// accepts, including the partial-fill and EOF shapes the runtime was observed to produce.
+
+/**
+ * A byte stream serving `chunks` in order. Each BYOB request is filled with at most
+ * `maxPerRespond` bytes, so one logical chunk can take several partial fills — the shape a
+ * socket produces when data trickles in.
+ */
+function byteSourceFrom(chunks, { maxPerRespond = Infinity, flags = {} } = {}) {
+  let i = 0;
+  let offset = 0;
+  return new ReadableStream({
+    type: 'bytes',
+    pull(c) {
+      while (i < chunks.length && chunks[i].byteLength - offset === 0) {
+        i++; // a zero-length chunk carries nothing, and respond(0) is only legal at close
+        offset = 0;
+      }
+      if (i >= chunks.length) {
+        c.close();
+        c.byobRequest?.respond(0);
+        return;
+      }
+      const chunk = chunks[i];
+      const req = c.byobRequest;
+      if (req) {
+        flags.sawByobRequest = true;
+        const view = req.view;
+        const n = Math.min(view.byteLength, chunk.byteLength - offset, maxPerRespond);
+        new Uint8Array(view.buffer, view.byteOffset, n).set(chunk.subarray(offset, offset + n));
+        offset += n;
+        if (offset === chunk.byteLength) {
+          i++;
+          offset = 0;
+        }
+        req.respond(n);
+      } else {
+        c.enqueue(chunk.slice(offset));
+        i++;
+        offset = 0;
+      }
+    },
+  });
+}
+
+test('ByteReader takes the BYOB path on a byte stream and reassembles identically', async () => {
+  const src = new Uint8Array(300);
+  for (let i = 0; i < src.byteLength; i++) src[i] = i & 0xff;
+  for (const [name, chunks] of chunkings(src)) {
+    const flags = {};
+    const r = new ByteReader(byteSourceFrom(chunks, { flags }));
+    const a = await r.readExactly(7, 'head');
+    const b = await r.readExactly(200, 'middle');
+    const c = await r.readToEnd();
+    assert.equal(toHex(concat([a, b, c])), toHex(src), name);
+    assert.equal(r.atEof, true, name);
+    assert.equal(flags.sawByobRequest, true,
+      `${name}: the source saw BYOB requests, so the BYOB branch is what ran`);
+  }
+});
+
+test('BYOB partial fills (a trickling socket) change nothing about what is read', async () => {
+  const src = utf8('status: ok\r\ncontent: delimited\r\n\r\ntail bytes');
+  for (const maxPerRespond of [1, 3, 7]) {
+    const r = new ByteReader(byteSourceFrom([src], { maxPerRespond }));
+    const line = await r.readUntil(CRLFCRLF, 1024, 'head');
+    assert.equal(latin1(line), 'status: ok\r\ncontent: delimited\r\n\r\n', String(maxPerRespond));
+    assert.equal(latin1(await r.readToEnd()), 'tail bytes');
+  }
+});
+
+test('BYOB path: unshift and buffered interact exactly as on the default path', async () => {
+  const r = new ByteReader(byteSourceFrom([utf8('abcdef')]));
+  const first = await r.readExactly(4, 'first');
+  assert.equal(latin1(first), 'abcd');
+  r.unshift(first.subarray(2)); // push "cd" back
+  assert.equal(r.buffered >= 2, true);
+  assert.equal(latin1(await r.readToEnd()), 'cdef');
+});
+
+test('BYOB path: EOF mid-structure still reports UnexpectedEof with honest counts', async () => {
+  const r = new ByteReader(byteSourceFrom([utf8('abc')]));
+  const err = await assert.rejects(async () => r.readExactly(10, 'frame'))
+    .then(() => null, (e) => e);
+  await assert.rejects(
+    () => new ByteReader(byteSourceFrom([utf8('abc')])).readExactly(10, 'frame'),
+    (e) => e instanceof UnexpectedEofError && e.detail.wanted === 10 && e.detail.got === 3,
+  );
+  assert.equal(err, null); // first form resolved via assert.rejects; the second carries the checks
+});
+
+test('BYOB path: cancel releases the source', async () => {
+  const r = new ByteReader(byteSourceFrom([utf8('abcdef'), utf8('ghijkl')]));
+  assert.equal(latin1(await r.readExactly(2, 'x')), 'ab');
+  await r.cancel(new Error('done with it'));
+  // A cancelled reader reports EOF-shaped behaviour rather than hanging.
+  await assert.rejects(() => r.readExactly(64, 'more'), UnexpectedEofError);
+});
+
 test('underAllChunkings surfaces a parser that depends on chunk boundaries', async () => {
   const bytes = utf8('abcdef');
   // A deliberately broken parser: it only looks at the first chunk.
