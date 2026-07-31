@@ -99,8 +99,8 @@ const client = new Anthropic({
 `client.fetch` is bound in the constructor precisely so it can be handed to an SDK by reference.
 Prefer it over `createFetch` here: `createFetch` opens and closes a connection per call, which on a
 CPU-metered runtime costs a full TLS handshake every time — measured at roughly 10 ms against
-1.2 ms for a pooled request. `createFetch` is for one-off calls, matching httpx's module-level
-helpers.
+0.9 ms for a request on an already-open connection. `createFetch` is for one-off calls, matching
+httpx's module-level helpers.
 
 ### With connection reuse and a cookie jar
 
@@ -132,6 +132,31 @@ try { await thirdPartyLibrary(); } finally { uninstall(); }
 
 This never happens on import. Silently replacing a global makes every unrelated failure in the
 process look like a bug in this package.
+
+### Warming a fresh isolate
+
+V8 compiles and optimises per function per isolate, so the first request through a fresh isolate
+runs the TLS and HTTP paths interpreted — 46 ms against a warm floor of about 10 ms, with the
+excess decaying over roughly six requests. `warmup()` replays a recorded handshake through the real
+drivers at module scope, so the first real request meets code the engine has already tiered.
+
+```js
+import { warmup } from 'tunnelfetch';
+
+await warmup();                       // module scope, once per isolate
+export default { async fetch(req, env) { /* ... */ } };
+```
+
+It is opt-in and nothing in this package ever calls it, because the trade is not the same for
+everyone. Standard Workers do not bill startup CPU, so this converts billed request milliseconds
+into unbilled startup ones; deployment modes that *do* bill startup — Cloudflare's dynamic Worker
+loading, for instance — pay for the same work twice over, plus the wall time. A library should not
+make that choice for its consumer.
+
+It caches nothing and holds no state: the replay validates its own synthetic chain against its own
+baked root through an explicit anchors-mode configuration, never consulting the bundled store, and
+not calling `warmup()` leaves behaviour byte-identical, only slower at first. A Worker that imports
+but never calls it is measurably unaffected. See the cost table for what each iteration count buys.
 
 ### Server-sent events
 
@@ -291,35 +316,80 @@ A crawler wanting more parallelism must pipeline within that limit.
 
 ## Cost on a live Worker
 
-Measured on the edge with `wrangler tail`, warm isolate, medians over repeated runs, through a
-real proxy. Workers bill CPU time, not wall time, and roughly 95% of a request here is spent
-waiting on the network.
+Every number here was measured on the Cloudflare edge with `wrangler tail`, through a real proxy,
+grouped per isolate so that a first execution is never averaged together with a warm one. Workers
+bill CPU time, not wall time, and the overwhelming majority of a request here is spent waiting on
+the network, which is not billed.
 
-| | CPU |
-| --- | --- |
-| Startup (script upload analysis) | **1 ms** for the 344 KB bundle / 122 KB gzipped |
-| Request that imports the package but does not use it | **0 ms** |
-| First request in a fresh isolate | **~35–50 ms** — one-time JIT of the TLS paths |
-| TLS 1.3 handshake + request thereafter | **~9–13 ms** |
-| Additional request on a pooled connection (no body) | **~1.2 ms** |
-| Additional 80 KB gzipped body, decompressed and decoded | **~16 ms** |
+### What a page costs
 
-Two consequences worth planning around:
+Fetching a size-controlled origin through a proxy, warm, medians over seven rounds, gzip on the
+wire:
 
-- **Importing the package is free.** The 121-anchor trust store is stored as base64 strings indexed
-  by a hash of the subject DN, and only the one anchor a chain actually lands on is ever decoded.
-  Nothing is parsed at import, which is why startup stays at 1 ms.
-- **The handshake is the thing to amortise.** Reusing a connection turns a ~10 ms cost into a
-  ~1 ms one, which is the entire argument for using a `Client` rather than `createFetch` when a
-  request handler makes more than one call. Measured wall-clock on the edge: 185 ms for the first
-  request to an origin, 72 ms for the second.
+| Page size | One page, new connection | Each further page, same connection |
+| --- | --- | --- |
+| 1 KB | 11 ms | 1.8 ms |
+| 16 KB | 10 ms | 3.2 ms |
+| 64 KB | 13 ms | 3.6 ms |
+| 256 KB | 15 ms | 9.8 ms |
+| 1 MB | 37 ms | 26.3 ms |
+| 4 MB | 102 ms | 97 ms |
 
-Against the paid plan's 30 s default CPU limit that is roughly 2 000 handshakes, or about 150 MB
-of decompressed body, in a single invocation — in practice the six-concurrent-connections limit
-binds long before CPU does.
+A simple model fits every row to within the spread:
 
-**The free plan is not viable**: it allows 10 ms of CPU per request, and a single handshake does
-not fit. Use a paid plan (30 s default, 5 min maximum).
+> **≈ 9.5 ms to open a connection + 2 ms per request + 25 ms per MB of body**
+
+The connection term recovered independently from each row lands between 5 and 11 ms, which agrees
+with the 9–12 ms measured for a new connection by other means. Most of it is the TLS handshake and
+certificate chain validation; almost none of it is parsing (see below).
+
+**Reuse is the lever.** Thirty 16 KB pages from one host cost about 103 ms down one connection and
+about 300 ms opening thirty. That gap is the entire argument for holding a `Client` rather than
+calling `createFetch` per request, and it widens as pages get smaller.
+
+### What a fresh isolate costs
+
+V8 tiers up per function per isolate, so the first executions of the TLS and HTTP paths run
+interpreted. The excess decays over roughly six requests:
+
+| | First request | Excess over the warm floor, whole ramp |
+| --- | --- | --- |
+| Without `warmup()` | 46 ms | 61 ms (≈ 4.4 ms/request over an isolate's early life) |
+| `warmup()` once | 22 ms | 40 ms (≈ 2.8 ms/request) |
+| `warmup({ iterations: 5 })` | 16 ms | 15 ms (≈ 1.1 ms/request) |
+
+Warming costs 10 ms of startup at one iteration and 22 ms at five, against a 1 s startup budget.
+It does not lower the warm floor — the effect is entirely on the ramp.
+
+### Where the cost is, and is not
+
+Chain validation is signature verification, not parsing. Parsing a whole chain is ~158 µs; a single
+ECDSA P-384 verify is 665–816 µs, about 12× a P-256 verify and 27× an RSA-2048 verify. A typical
+EC chain carries two P-384 links, so **an all-ECDSA chain validates in ~3.5 ms against ~0.8 ms for
+an RSA one**. If you control the origin, its certificate's key type is worth a thought.
+
+Response decoding is dominated by constructing the `DecompressionStream`, not by the bytes: it cost
+~2 ms for a 559-byte body. For small JSON responses, `decompress: false` can be cheaper than gzip.
+
+Importing the package is free. The 121 bundled anchors are base64 strings indexed by a hash of the
+subject DN, and only the one anchor a chain lands on is ever decoded, so startup stays at ~2 ms for
+the 380 KB bundle (133 KB gzipped) and a request that imports but does not use the package costs
+0 ms.
+
+### Plan limits
+
+On the paid plan the 30 s default CPU limit is not the binding constraint — that is roughly 3 000
+connections or 1 GB of body in one invocation, and the limit of six connections simultaneously
+awaiting response headers binds long before CPU does.
+
+The free plan documents 10 ms of CPU per invocation, which a new connection (10–15 ms) sits at or
+above and a pooled request (2–4 ms) fits inside comfortably. In practice the runtime tolerates
+occasional overage and carries unused budget forward, so single requests well past 10 ms do
+complete — measured, several hundred milliseconds completed and the runtime terminated a request
+around 2 s with `exceededCpu`. **That is not the same as showing sustained use above 10 ms is
+viable**, because those probes were low-rate and bursty, exactly the shape such an allowance
+forgives. If you intend to run this on the free plan, reuse connections and measure your own
+sustained average rather than trusting either the documented number or the burst behaviour.
 
 ## Runtime requirements
 
