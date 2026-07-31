@@ -548,8 +548,10 @@ test('no fallback: a mid-flight 1.3 failure rejects; the socket factory ran exac
   // fallback logic retried on.
   const identity = testIdentity('ecdsa-p256');
   const cases = [
-    ['corrupt server Finished', { corruptFinished: true }, codes.TLS_HANDSHAKE, /verify_data does not match/],
-    ['fatal handshake_failure alert', { alertAfter: 'encryptedExtensions', alertDesc: 40 }, codes.TLS_ALERT, /handshake_failure/],
+    ['corrupt server Finished', { corruptFinished: true },
+      codes.TLS_HANDSHAKE, /verify_data does not match/],
+    ['fatal handshake_failure alert', { alertAfter: 'encryptedExtensions', alertDesc: 40 },
+      codes.TLS_ALERT, /handshake_failure/],
   ];
   for (const [name, serverOpts, code, msgMatch] of cases) {
     let dials = 0;
@@ -558,7 +560,10 @@ test('no fallback: a mid-flight 1.3 failure rejects; the socket factory ran exac
       dials += 1;
       const { a, b } = duplexPair();
       servers.push(startServer(b, identity, serverOpts));
-      return { readable: a.readable, writable: a.writable, opened: Promise.resolve({}), close: async () => {} };
+      return {
+        readable: a.readable, writable: a.writable,
+        opened: Promise.resolve({}), close: async () => {},
+      };
     };
     await rejectsWithCode(
       () => openConnection({
