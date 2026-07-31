@@ -46,6 +46,9 @@ export function targetFromUrl(input: string | URL): TransportTarget;
  * @property {DeadlineController} [deadlines] borrow the request's controller; omitting it makes
  *   this call own (and dispose) a fresh one
  * @property {import('./tls/connect.js').TlsOptions} [tls] handshake options
+ * @property {string[]} [alpn] the ALPN protocol list to offer, newest/most-preferred first.
+ *   Kept separate from `tls` so offering `h2` does not read as a user-supplied TLS option (which
+ *   would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
  * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness/keygen for
  *   reproducible handshakes
  * @property {AbortSignal} [signal]
@@ -59,7 +62,7 @@ export function targetFromUrl(input: string | URL): TransportTarget;
  * @param {OpenConnectionOptions} args
  * @returns {Promise<Connection>}
  */
-export function openConnection({ url, connect, proxy, trust, deadlines, tls, deps, signal, limits, now, }: OpenConnectionOptions): Promise<Connection>;
+export function openConnection({ url, connect, proxy, trust, deadlines, tls, alpn, deps, signal, limits, now, }: OpenConnectionOptions): Promise<Connection>;
 /**
  * The delegation decision, with the disqualifying reason spelled out so a caller's error can
  * quote it. Discriminated on `ok` so `reason` is a string exactly when there is one.
@@ -162,6 +165,12 @@ export type OpenConnectionOptions = {
      * handshake options
      */
     tls?: import("./tls/connect.js").TlsOptions | undefined;
+    /**
+     * the ALPN protocol list to offer, newest/most-preferred first.
+     * Kept separate from `tls` so offering `h2` does not read as a user-supplied TLS option (which
+     * would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
+     */
+    alpn?: string[] | undefined;
     /**
      * injectable randomness/keygen for
      * reproducible handshakes

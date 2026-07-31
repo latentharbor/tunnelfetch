@@ -25,6 +25,7 @@ export {
   HttpError,
   TlsError,
   TlsUnsupportedError,
+  Http2Error,
   CertificateError,
   TimeoutError,
   LimitError,

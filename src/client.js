@@ -21,6 +21,8 @@ import { ConnectionPool, poolKey } from './pool.js';
 import { DeadlineController, withIdleDeadline } from './util/deadline.js';
 import { nativeFetchCanServe, openConnection, targetFromUrl } from './transport.js';
 import { parseProxy } from './proxy/index.js';
+import { Http2Connection, Http2Retryable } from './http2/connection.js';
+import { ALPN_H2, ALPN_HTTP11 } from './http2/constants.js';
 
 /** Status codes whose Response may not carry a body, per the Response constructor. */
 const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
@@ -39,8 +41,9 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  * @property {boolean} proxied
  * @property {string | null} proxy the proxy actually used, credentials omitted
  * @property {import('./tls/connect.js').TlsSessionInfo | null} tls null for cleartext
- * @property {'1.0' | '1.1'} httpVersion
- * @property {'none' | 'content-length' | 'chunked' | 'until-close'} framing
+ * @property {'1.0' | '1.1' | '2'} httpVersion '2' when ALPN negotiated HTTP/2
+ * @property {'none' | 'content-length' | 'chunked' | 'until-close' | 'h2'} framing 'h2' when the
+ *   body was delimited by an HTTP/2 END_STREAM rather than by any HTTP/1.1 framing rule
  */
 
 /**
@@ -70,6 +73,10 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  * @property {boolean} [decompress] gzip/deflate. Default true. Never `br`; the runtime cannot
  *   decompress it, so it is never advertised either.
  * @property {boolean} [keepAlive] default true.
+ * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
+ *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
+ *   on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
+ *   `http/1.1`. There is no fallback-and-retry either way: the server's ALPN pick is followed.
  * @property {boolean} [forceTunnel] never delegate to the platform's fetch, even when it could
  *   serve the request. Mainly for exercising this stack against origins that do not need it.
  * @property {FetchLike} [nativeFetch] delegation target; defaults to `globalThis.fetch`.
@@ -87,6 +94,18 @@ export class Client {
   constructor(options = {}) {
     this.options = { ...options };
     this.pool = new ConnectionPool(options.pool);
+    // HTTP/2 connections are NOT pooled the way h1 is: one connection multiplexes many concurrent
+    // streams, so it is not checked out per request. It lives here, keyed exactly like the h1 pool,
+    // and is shared until it goes away. See http2/connection.js for why the exclusive-checkout
+    // model does not apply. `Map<poolKey, Http2Connection>`.
+    /** @type {Map<string, import('./http2/connection.js').Http2Connection>} */
+    this._h2 = new Map();
+    // Every live h2 connection, keyed map or not. The map holds the one CURRENTLY dispatchable
+    // connection per key; if two first-requests to a new key race, the loser is orphaned from the
+    // map but is still open and serving its stream, so it must be tracked here or close() would
+    // leak it. Entries remove themselves on death.
+    /** @type {Set<import('./http2/connection.js').Http2Connection>} */
+    this._h2conns = new Set();
     this.jar = options.cookies ? (options.jar ?? new CookieJar()) : (options.jar ?? null);
     this._closed = false;
     // Bound so a Client can be handed straight to an SDK expecting a bare function.
@@ -105,10 +124,14 @@ export class Client {
     return performFetch(this, input, init);
   }
 
-  /** Release every pooled socket. A Client that is finished must be closed or sockets leak. */
+  /** Release every pooled socket and shared HTTP/2 connection. A Client that is finished must be
+   *  closed or sockets leak for the isolate's lifetime. */
   async close() {
     this._closed = true;
-    await this.pool.closeAll();
+    const h2 = [...this._h2conns]; // the set, not the map: it also holds race-orphaned connections
+    this._h2.clear();
+    this._h2conns.clear();
+    await Promise.all([this.pool.closeAll(), ...h2.map((c) => c.close().catch(() => {}))]);
   }
 }
 
@@ -248,29 +271,94 @@ async function exchange(client, current, { hop }) {
     tls,
   });
 
-  const deadlines = new DeadlineController(o.timeouts ?? {}, { signal: o.signal });
-  let conn = client.pool.take(key);
-  let reused = conn !== null;
-  try {
-    if (!conn) {
-      conn = await openConnection({
-        url: current.url,
-        connect: o.connect,
-        proxy,
-        trust,
-        tls,
-        deps: o.deps,
-        deadlines,
-        limits: o.limits ?? {},
-        now: o.now,
-      });
+  // 1. An existing shared HTTP/2 connection for this key multiplexes this request as a new stream.
+  const shared = client._h2.get(key);
+  if (shared && shared.canDispatch()) {
+    const deadlines = new DeadlineController(o.timeouts ?? {}, { signal: o.signal });
+    try {
+      return await sendAndReceiveH2(client, shared, current, { deadlines });
+    } catch (err) {
+      deadlines.dispose();
+      // A provably-unprocessed stream (GOAWAY past it, REFUSED_STREAM) is the h2 analogue of h1's
+      // "server never saw it": safe to re-send on a fresh connection. Anything else propagates.
+      if (!(err instanceof Http2Retryable)) throw err;
     }
-    return await sendAndReceive(client, conn, current, { key, deadlines, reused, hop });
+  }
+
+  // 2. A pooled HTTP/1.1 connection, taken exclusively for this one request.
+  const pooled = client.pool.take(key);
+  if (pooled) {
+    const deadlines = new DeadlineController(o.timeouts ?? {}, { signal: o.signal });
+    try {
+      return await sendAndReceive(client, pooled, current, { key, deadlines, reused: true, hop });
+    } catch (err) {
+      deadlines.dispose();
+      await client.pool.discard(pooled);
+      throw err;
+    }
+  }
+
+  // 3. A fresh connection. Its negotiated ALPN — not a guess, not a retry — decides h2 or h1.
+  return openFreshAndSend(client, current, { hop, key, proxy, trust, tls });
+}
+
+/**
+ * Open a new connection for `key` and dispatch the request over whichever protocol ALPN selected.
+ * There is no reconnect-and-retry-lower anywhere: the server picked, and we speak that.
+ */
+async function openFreshAndSend(client, current, { hop, key, proxy, trust, tls }) {
+  const o = client.options;
+  const deadlines = new DeadlineController(o.timeouts ?? {}, { signal: o.signal });
+  // Offer h2 unless the caller disabled it or pinned their own ALPN list. Newest first: ALPN is a
+  // client preference list and the server chooses from it.
+  const alpn = tls.alpn ?? (o.http2 === false ? [ALPN_HTTP11] : [ALPN_H2, ALPN_HTTP11]);
+  let conn;
+  let isH2 = false;
+  try {
+    conn = await openConnection({
+      url: current.url,
+      connect: o.connect,
+      proxy,
+      trust,
+      tls,
+      alpn,
+      deps: o.deps,
+      deadlines,
+      limits: o.limits ?? {},
+      now: o.now,
+    });
+    if (conn.info.tls?.alpnProtocol === ALPN_H2) {
+      isH2 = true;
+      const h2 = registerHttp2(client, key, conn);
+      return await sendAndReceiveH2(client, h2, current, { deadlines });
+    }
+    return await sendAndReceive(client, conn, current, { key, deadlines, reused: false, hop });
   } catch (err) {
     deadlines.dispose();
-    if (conn) await client.pool.discard(conn);
+    // An h2 connection owns its own duplex and deregisters itself on death (registerHttp2's
+    // onClose); a stream-level failure leaves it healthy and registered for reuse, so it must not
+    // be discarded here. Only the h1 socket is the pool's to throw away.
+    if (conn && !isH2) await client.pool.discard(conn);
     throw err;
   }
+}
+
+/** Wrap a freshly negotiated h2 connection, register it for reuse, and arrange its own removal. */
+function registerHttp2(client, key, conn) {
+  const h2 = new Http2Connection(
+    { readable: conn.readable, writable: conn.writable, close: conn.close },
+    {
+      info: conn.info,
+      onClose: () => {
+        client._h2conns.delete(h2);
+        // Only drop the keyed entry if it is still this connection; a newer one may have replaced it.
+        if (client._h2.get(key) === h2) client._h2.delete(key);
+      },
+    },
+  );
+  client._h2conns.add(h2);
+  client._h2.set(key, h2);
+  return h2;
 }
 
 /**
@@ -379,6 +467,102 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
   const guarded = framing.kind === 'none' ? raw : withIdleDeadline(raw, deadlines);
   const decoded = decodeResponseBody(guarded, headInfo.headers, o);
   return buildResponse(headInfo, decoded, framing, conn);
+}
+
+// ------------------------------------------------------------------ one request/response over h2
+
+/**
+ * The HTTP/2 counterpart of sendAndReceive. The connection is shared, so nothing here checks it
+ * out or returns it — the stream id keeps this response's bytes separate from every other stream's.
+ * The two load-bearing invariants from the h1 path are preserved deliberately: the idle deadline
+ * wraps the RAW body before any content decoding, and the completion of the body disposes the
+ * per-request deadline (it just never releases a connection, because the connection is not ours to
+ * release).
+ */
+async function sendAndReceiveH2(client, h2, current, { deadlines }) {
+  const o = client.options;
+  const target = targetFromUrl(current.url);
+  const { authority, headers } = buildH2Request(client, current, target);
+
+  deadlines.beginPhase('headers');
+  let head;
+  try {
+    head = await deadlines.race(
+      h2.request({
+        method: current.method,
+        scheme: current.url.protocol === 'https:' ? 'https' : 'http',
+        authority,
+        path: requestTarget(current.url) || '/',
+        headers,
+        body: current.body ?? null,
+        // The deadline's signal reaches into the connection so a headers/idle timeout resets
+        // exactly this one stream (RST_STREAM), never the shared connection or its other streams.
+        signal: deadlines.signal,
+      }),
+    );
+  } finally {
+    deadlines.endPhase();
+  }
+
+  if (client.jar && head.setCookie?.length) {
+    client.jar.setFromResponse(current.url, head.setCookie);
+  }
+
+  const raw = head.body;
+  // Dispose the per-request deadline once the body is done, however it ends. Unlike h1 there is no
+  // pool.release: the connection stays shared and alive for the next stream.
+  raw.completed.then(
+    () => deadlines.dispose(),
+    () => deadlines.dispose(),
+  );
+
+  // Same invariant as h1: the idle deadline wraps the RAW body, before content decoding, so
+  // liveness is judged by bytes arriving from the peer rather than by decompressed output.
+  deadlines.beginIdle();
+  const guarded = withIdleDeadline(raw, deadlines);
+  const decoded = decodeResponseBody(guarded, head.headers, o);
+  const framing = { kind: 'h2', keepAliveEligible: false };
+  return buildResponse(head, decoded, framing, h2);
+}
+
+/**
+ * Build the HTTP/2 request: the :authority value, and the ordered regular header fields with the
+ * pseudo-headers and every connection-specific field removed (RFC 9113 s8.2.2). Framing is the
+ * client's to declare here just as in h1 — Transfer-Encoding has no meaning in h2 and is dropped,
+ * and Content-Length is set for a body so it matches what curl sends.
+ */
+function buildH2Request(client, current, target) {
+  const o = client.options;
+  const headers = new Headers(current.headers);
+  const defaultPort = current.url.protocol === 'https:' ? 443 : 80;
+  const authority =
+    target.port === defaultPort ? current.url.hostname : `${current.url.hostname}:${target.port}`;
+
+  if (!headers.has('accept')) headers.set('accept', '*/*');
+  if (!headers.has('accept-encoding') && o.decompress !== false) {
+    headers.set('accept-encoding', ACCEPT_ENCODING);
+  }
+  if (client.jar) {
+    const cookie = client.jar.headerFor(current.url);
+    if (cookie) {
+      const existing = headers.get('cookie');
+      headers.set('cookie', existing ? `${existing}; ${cookie}` : cookie);
+    }
+  }
+  // Connection-specific header fields are forbidden in HTTP/2 and are the sender's to strip.
+  for (const name of ['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'host']) {
+    headers.delete(name);
+  }
+  if (current.body) headers.set('content-length', String(current.body.byteLength));
+  else if (['POST', 'PUT', 'PATCH'].includes(current.method)) headers.set('content-length', '0');
+  else headers.delete('content-length');
+
+  // Headers iterates lowercased (RFC 9113 s8.2.1 requires lowercase names on the wire) — which is
+  // also why h1 loses caller order; h2 is no different here. Pseudo-header ORDER, the part a
+  // fingerprinter reads, is fixed in http2/connection.js buildRequestFields, not here.
+  const out = [];
+  for (const [k, v] of headers) out.push([k, v]);
+  return { authority, headers: out };
 }
 
 function wantsKeepAlive(headInfo) {

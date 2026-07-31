@@ -62,7 +62,7 @@ test('preflight: a proxied HTTPS request completes from the edge', async () => {
   assert.ok(r.bytes > 0, 'a body should have arrived');
 });
 
-test('the userland stack negotiates TLS 1.3 with an AEAD suite and http/1.1', async () => {
+test('the userland stack negotiates TLS 1.3 with an AEAD suite and an offered ALPN protocol', async () => {
   const r = await rig(`targets=${TARGET}`);
   assert.equal(r.ok, true, `${r.code}: ${r.error}`);
   // Pinned rather than merely recorded: a silent fallback to something weaker is exactly the
@@ -70,7 +70,11 @@ test('the userland stack negotiates TLS 1.3 with an AEAD suite and http/1.1', as
   assert.equal(r.tls.version, '0x304', 'must be TLS 1.3');
   assert.equal(r.tls.cipherSuite, '0x1301', 'must be TLS_AES_128_GCM_SHA256');
   assert.equal(r.tls.group, '0x1d', 'must be X25519');
-  assert.equal(r.tls.alpn, 'http/1.1', 'ALPN must be negotiated, not assumed');
+  // The client offers h2 and http/1.1; the server's pick must be one of exactly those, and the
+  // reported protocol must agree with it — a fabricated ALPN or a fallback we did not offer both
+  // fail here. An h2 origin (most CF-fronted ones) will show 'h2'.
+  assert.ok(['h2', 'http/1.1'].includes(r.tls.alpn), `ALPN must be negotiated, got ${r.tls.alpn}`);
+  assert.equal(r.httpVersion, r.tls.alpn === 'h2' ? '2' : '1.1', 'the spoken protocol matches ALPN');
   assert.equal(r.proxied, true, 'this must not have been served by the platform fetch');
 });
 

@@ -39,6 +39,15 @@ export class HttpError extends TunnelFetchError {}
 export class TlsError extends TunnelFetchError {}
 
 /**
+ * HTTP/2 framing, streams, flow control, HPACK, or a peer GOAWAY/RST_STREAM. Separate from
+ * HttpError because the wire format and its failure modes are entirely different: an HTTP/1.1
+ * message is text framed by lengths and CRLFs, an HTTP/2 stream is a state machine over binary
+ * frames sharing one connection, and a caller distinguishing "the /1.1 parser choked" from "an
+ * h2 stream was reset" wants two codes, not one.
+ */
+export class Http2Error extends TunnelFetchError {}
+
+/**
  * The peer offered something we deliberately do not implement.
  * Separate from TlsError so "we cannot talk to this server" is distinguishable from
  * "the connection broke", which is the difference between a feature request and a bug report.
@@ -89,6 +98,21 @@ export const codes = /** @type {const} */ ({
   TLS_SIGALG_UNSUPPORTED: 'TLS_SIGALG_UNSUPPORTED',
   TLS_EXTENSION_UNSUPPORTED: 'TLS_EXTENSION_UNSUPPORTED',
   TLS_ALPN: 'TLS_ALPN',
+
+  // http/2 (RFC 9113) and HPACK (RFC 7541). Every one names the concrete wire value that
+  // triggered it — a frame type, a stream id, a table index — because "h2 error" alone decides
+  // nothing about whether a peer is broken, hostile, or speaking a feature we declined.
+  HTTP2_PROTOCOL: 'HTTP2_PROTOCOL', // generic connection PROTOCOL_ERROR: preface, frame on wrong stream, ...
+  HTTP2_FRAME_SIZE: 'HTTP2_FRAME_SIZE', // a frame length the type or our SETTINGS forbids
+  HTTP2_SETTINGS: 'HTTP2_SETTINGS', // malformed SETTINGS, or a value out of its legal range
+  HTTP2_FLOW_CONTROL: 'HTTP2_FLOW_CONTROL', // a window overflowed 2^31-1, or the peer overran ours
+  HTTP2_STREAM_STATE: 'HTTP2_STREAM_STATE', // a frame illegal for the stream's current state
+  HTTP2_STREAM_CLOSED: 'HTTP2_STREAM_CLOSED', // the peer RST_STREAM'd, or closed a stream we were using
+  HTTP2_GOAWAY: 'HTTP2_GOAWAY', // the peer is going away and did not (or will not) serve this stream
+  HTTP2_COMPRESSION: 'HTTP2_COMPRESSION', // HPACK: bad index, bad integer, invalid Huffman padding, ...
+  HTTP2_HEADER: 'HTTP2_HEADER', // a decoded header list that h2 forbids (uppercase, bad pseudo-header)
+  HTTP2_PUSH_UNEXPECTED: 'HTTP2_PUSH_UNEXPECTED', // PUSH_PROMISE despite our SETTINGS_ENABLE_PUSH = 0
+  HTTP2_TRAILER: 'HTTP2_TRAILER', // a trailing header block that is malformed or carries pseudo-headers
 
   // trust
   CERT_PARSE: 'CERT_PARSE',

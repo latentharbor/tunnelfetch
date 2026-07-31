@@ -14,4 +14,4 @@ export { ConnectionPool, poolKey } from "./pool.js";
 export { openConnection, targetFromUrl, nativeFetchCanServe } from "./transport.js";
 export { openTunnel, parseProxy } from "./proxy/index.js";
 export { verifyChain, rootStoreProvenance } from "./trust/index.js";
-export { TunnelFetchError, ProxyError, HttpError, TlsError, TlsUnsupportedError, CertificateError, TimeoutError, LimitError, ConfigError, codes } from "./errors.js";
+export { TunnelFetchError, ProxyError, HttpError, TlsError, TlsUnsupportedError, Http2Error, CertificateError, TimeoutError, LimitError, ConfigError, codes } from "./errors.js";

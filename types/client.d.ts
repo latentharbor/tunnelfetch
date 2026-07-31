@@ -27,8 +27,9 @@ export function install(options?: ClientOptions): () => void;
  * @property {boolean} proxied
  * @property {string | null} proxy the proxy actually used, credentials omitted
  * @property {import('./tls/connect.js').TlsSessionInfo | null} tls null for cleartext
- * @property {'1.0' | '1.1'} httpVersion
- * @property {'none' | 'content-length' | 'chunked' | 'until-close'} framing
+ * @property {'1.0' | '1.1' | '2'} httpVersion '2' when ALPN negotiated HTTP/2
+ * @property {'none' | 'content-length' | 'chunked' | 'until-close' | 'h2'} framing 'h2' when the
+ *   body was delimited by an HTTP/2 END_STREAM rather than by any HTTP/1.1 framing rule
  */
 /**
  * Limits on what a peer may make us buffer. Each is a fail-closed cap, not a hint.
@@ -56,6 +57,10 @@ export function install(options?: ClientOptions): () => void;
  * @property {boolean} [decompress] gzip/deflate. Default true. Never `br`; the runtime cannot
  *   decompress it, so it is never advertised either.
  * @property {boolean} [keepAlive] default true.
+ * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
+ *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
+ *   on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
+ *   `http/1.1`. There is no fallback-and-retry either way: the server's ALPN pick is followed.
  * @property {boolean} [forceTunnel] never delegate to the platform's fetch, even when it could
  *   serve the request. Mainly for exercising this stack against origins that do not need it.
  * @property {FetchLike} [nativeFetch] delegation target; defaults to `globalThis.fetch`.
@@ -123,6 +128,13 @@ export class Client {
          */
         keepAlive?: boolean | undefined;
         /**
+         * offer HTTP/2 via ALPN and speak it when the server selects it.
+         * Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
+         * on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
+         * `http/1.1`. There is no fallback-and-retry either way: the server's ALPN pick is followed.
+         */
+        http2?: boolean | undefined;
+        /**
          * never delegate to the platform's fetch, even when it could
          * serve the request. Mainly for exercising this stack against origins that do not need it.
          */
@@ -153,6 +165,10 @@ export class Client {
         now?: number | undefined;
     };
     pool: ConnectionPool;
+    /** @type {Map<string, import('./http2/connection.js').Http2Connection>} */
+    _h2: Map<string, import("./http2/connection.js").Http2Connection>;
+    /** @type {Set<import('./http2/connection.js').Http2Connection>} */
+    _h2conns: Set<import("./http2/connection.js").Http2Connection>;
     jar: CookieJar | null;
     _closed: boolean;
     /**
@@ -163,7 +179,8 @@ export class Client {
     fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response & {
         tunnelfetch?: ResponseDetail;
     }>;
-    /** Release every pooled socket. A Client that is finished must be closed or sockets leak. */
+    /** Release every pooled socket and shared HTTP/2 connection. A Client that is finished must be
+     *  closed or sockets leak for the isolate's lifetime. */
     close(): Promise<void>;
 }
 /**
@@ -186,8 +203,15 @@ export type ResponseDetail = {
      * null for cleartext
      */
     tls: import("./tls/connect.js").TlsSessionInfo | null;
-    httpVersion: "1.0" | "1.1";
-    framing: "none" | "content-length" | "chunked" | "until-close";
+    /**
+     * '2' when ALPN negotiated HTTP/2
+     */
+    httpVersion: "1.0" | "1.1" | "2";
+    /**
+     * 'h2' when the
+     * body was delimited by an HTTP/2 END_STREAM rather than by any HTTP/1.1 framing rule
+     */
+    framing: "none" | "content-length" | "chunked" | "until-close" | "h2";
 };
 /**
  * Limits on what a peer may make us buffer. Each is a fail-closed cap, not a hint.
@@ -254,6 +278,13 @@ export type ClientOptions = {
      * default true.
      */
     keepAlive?: boolean | undefined;
+    /**
+     * offer HTTP/2 via ALPN and speak it when the server selects it.
+     * Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
+     * on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
+     * `http/1.1`. There is no fallback-and-retry either way: the server's ALPN pick is followed.
+     */
+    http2?: boolean | undefined;
     /**
      * never delegate to the platform's fetch, even when it could
      * serve the request. Mainly for exercising this stack against origins that do not need it.

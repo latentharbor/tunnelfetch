@@ -66,7 +66,11 @@ for (const host of LIVE_TARGETS) {
       assert.equal(res.tunnelfetch.proxied, true);
       assert.equal(tls.version, 0x0304, 'TLS 1.3 is what the offer list asks for');
       assert.ok([0x1301, 0x1302].includes(tls.cipherSuite), `unexpected suite ${tls.cipherSuite}`);
-      assert.equal(tls.alpnProtocol ?? 'http/1.1', 'http/1.1');
+      // The client offers h2 and http/1.1; the server picks one of exactly those (default is to
+      // offer both), and the spoken protocol must agree with the pick.
+      const alpn = tls.alpnProtocol ?? 'http/1.1';
+      assert.ok([tls.alpnProtocol, 'h2', 'http/1.1'].includes(alpn), `unexpected ALPN ${alpn}`);
+      assert.equal(res.tunnelfetch.httpVersion, alpn === 'h2' ? '2' : '1.1');
     } finally {
       await c.close();
     }

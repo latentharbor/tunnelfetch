@@ -929,11 +929,16 @@ export default {
       // sockshape=count observes how the raw socket chunks its delivery; sockshape=byob
       // re-chunks it through 64 KiB BYOB reads. The difference prices socket boundary crossings.
       const sockshape = url.searchParams.get('sockshape') ?? '';
+      // h1=1 forces the client to offer only http/1.1, so the SAME origin can be measured over
+      // both protocols and the cpuTime difference is attributable to h2's extra work (HPACK,
+      // framing) rather than to any change in origin or bytes.
+      const h2 = !url.searchParams.get('h1');
       const sockStats = { sockets: 0, chunks: 0, bytes: 0, min: Infinity, max: 0, byob: null };
       const connectFn = sockshape ? shapeConnect(connect, sockshape, sockStats) : connect;
       results.push(await attempt(`sizes ${spec}`, async () => {
         const client = new Client({
           connect: connectFn, proxy, forceTunnel: true, maxBodyBytes: 16 << 20, decompress: dc,
+          http2: h2,
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
         });
         try {
@@ -947,13 +952,14 @@ export default {
               const body = await res.text();
               out.push({ n, got: body.length, status: res.status,
                 enc: res.headers.get('content-encoding'),
+                proto: res.tunnelfetch?.httpVersion,
                 framing: res.tunnelfetch?.framing });
             }
           }
           // With decoding on and no wire compression trickery, every page must deliver exactly
           // n bytes of 200 body — a short or non-200 page prices a failure, not a fetch.
           const okPages = out.filter((p) => p.status === 200 && (dc ? p.got === p.n : p.got > 0)).length;
-          return { pages: out.length, okPages,
+          return { pages: out.length, okPages, proto: out[0]?.proto,
             hits: client.pool.stats.hits, misses: client.pool.stats.misses,
             sample: out[0],
             ...(sockshape ? { sock: { ...sockStats,
@@ -1015,9 +1021,12 @@ export default {
       // the body distinguishes "refused us" from "served us fine" from "the proxy could not get
       // there at all", which are three different answers.
       const hosts = url.searchParams.get('reach').split(',').filter(Boolean);
+      // h1=1 offers only http/1.1, so the SAME site can be probed on both protocols to see whether
+      // h2 changes the outcome — the whole empirical question behind implementing it.
+      const reachH2 = !url.searchParams.get('h1');
       results.push(await attempt(`reach ${hosts.length} hosts`, async () => {
         const client = new Client({
-          connect, proxy, forceTunnel: true, maxBodyBytes: 512 * 1024,
+          connect, proxy, forceTunnel: true, maxBodyBytes: 512 * 1024, http2: reachH2,
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
         });
         const out = [];
@@ -1044,6 +1053,7 @@ export default {
                 challenge: /just a moment|checking your browser|captcha|cf-chl|attention required/i
                   .test(body.slice(0, 4000)),
                 alpn: res.tunnelfetch?.tls?.alpnProtocol ?? null,
+                proto: res.tunnelfetch?.httpVersion ?? null,
               });
             } catch (e) {
               out.push({ host: h, failed: true, code: e?.code ?? null,

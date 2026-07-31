@@ -86,6 +86,9 @@ export function targetFromUrl(input) {
  * @property {DeadlineController} [deadlines] borrow the request's controller; omitting it makes
  *   this call own (and dispose) a fresh one
  * @property {import('./tls/connect.js').TlsOptions} [tls] handshake options
+ * @property {string[]} [alpn] the ALPN protocol list to offer, newest/most-preferred first.
+ *   Kept separate from `tls` so offering `h2` does not read as a user-supplied TLS option (which
+ *   would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
  * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness/keygen for
  *   reproducible handshakes
  * @property {AbortSignal} [signal]
@@ -107,6 +110,7 @@ export async function openConnection({
   trust = { mode: 'system' },
   deadlines,
   tls = {},
+  alpn,
   deps = {},
   signal,
   limits = {},
@@ -163,7 +167,9 @@ export async function openConnection({
           // one; it is judged inside verifyChain under this same trust config.
           verifyPeer: (chain, hostname, details) =>
             verifyChain({ chain, hostname, trust, now, ocspResponse: details?.ocspResponse ?? null }),
-          options: tls,
+          // `alpn` is offered here rather than folded into `tls` so that the ALPN offer never
+          // counts as a user TLS option; `tls.alpn` still overrides it when explicitly set.
+          options: alpn && !tls.alpn ? { ...tls, alpn } : tls,
           deps,
         }),
       );

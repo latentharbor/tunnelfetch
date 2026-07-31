@@ -51,8 +51,9 @@ So the only way to make a proxied HTTPS request from a Worker, and the only way 
 httpx-style `verify=` at all, is to implement TLS in userland. That is what this package does.
 
 **Verified end to end on the Cloudflare edge**, through five different third-party proxies:
-TLS 1.3 (`0x0304`), `TLS_AES_128_GCM_SHA256`, X25519, ALPN `http/1.1`, chunked and
-content-length framing, gzip decoded, chains validated against 121 bundled CCADB roots.
+TLS 1.3 (`0x0304`), `TLS_AES_128_GCM_SHA256`, X25519, ALPN negotiating `h2` or `http/1.1`, HTTP/2
+and chunked and content-length framing, gzip decoded, chains validated against 121 bundled CCADB
+roots.
 
 ## Install
 
@@ -186,6 +187,57 @@ duration — raise it above your feed's heartbeat interval, or a quiet-but-alive
 Abandoning a stream part-way never returns the connection to the pool: its position is unknown,
 and reusing it would splice the remains of one response onto the next request.
 
+### HTTP/2 — access, not speed
+
+The client offers `h2` and `http/1.1` in ALPN by default and speaks whichever the server selects.
+There is no separate API: a request that lands on an `h2` connection just reports `httpVersion: '2'`
+in its `tunnelfetch` detail. Set `http2: false` to offer only `http/1.1`.
+
+**The reason to implement HTTP/2 here is access, not performance, and on this runtime it costs
+_more_ CPU than HTTP/1.1, not less.** Two things make that true. HPACK is header compression work
+that HTTP/1.1 simply does not do; and multiplexing buys latency a Worker handler — which usually
+issues one request and awaits it — cannot spend. So if you are reaching for HTTP/2 expecting a
+speed-up on a CPU-metered platform, it is the wrong lever. What it buys is reaching sites that treat
+HTTP/1.1 as a bot signal. That was measured, not assumed — one proxy, one browser `User-Agent`, one
+set of headers, changing only the protocol:
+
+```
+stackoverflow.com  --http1.1 -> 403 "Just a moment..."  (Cloudflare challenge, cf-mitigated: challenge)
+                   --http2   -> 200, 291 KB of real content
+```
+
+Across a ten-site sample HTTP/2 changed the outcome on exactly one: four sites were blocked
+identically on both protocols and five were fine either way. So the honest expectation is "unlocks
+roughly one site in ten", not "solves bot detection".
+
+**And that expectation has a shelf life.** Re-measured the same day this landed, from the same
+proxies, that site now challenges HTTP/2 as well — `curl --http2` is refused there exactly as this
+package is, while the same proxies still fetch other sites normally. So the capability is real and
+correct (ALPN negotiates `h2`, and this client is treated identically to curl's), but the specific
+access it was built to win did not survive a day. Bot detection is adversarial and moves; a
+protocol is a window, not a property. Do not adopt HTTP/2 here on the strength of one site's
+behaviour — measure your own targets, and expect the answer to change. Our TLS fingerprint and curl's produced
+identical outcomes on every reachable host in that sample, so JA3-style TLS shaping is not what
+gates access here — but curl's **HTTP/2** fingerprint passes where HTTP/1.1 is challenged. So the
+`SETTINGS` frame values, the initial window sizes, the connection `WINDOW_UPDATE`, and the
+pseudo-header order are matched byte-for-byte to curl (8.7.1 / nghttp2), captured off the wire.
+This is empirical: a naïve h2 fingerprint can fail exactly where curl's succeeds, which would waste
+the whole exercise.
+
+Everything an HTTP/1.1 body has, an HTTP/2 body keeps: streaming (SSE works unchanged), trailers,
+gzip decoding, and the idle deadline wrapping the raw body before any decode. The one thing that is
+structurally different is under the hood — a single h2 connection multiplexes every concurrent
+request to an origin rather than being checked out one request at a time. `install()`, redirects,
+cookies, and `verify=` all behave identically.
+
+```js
+const client = new Client({ connect, proxy: env.PROXY_URL });
+const res = await client.fetch('https://example.org/', {
+  headers: { 'user-agent': 'Mozilla/5.0 (…) Chrome/140.0.0.0 Safari/537.36' },
+});
+res.tunnelfetch.httpVersion; // '2' if the server chose h2, '1.1' otherwise
+```
+
 ## API
 
 ### `new Client(options)`
@@ -202,6 +254,7 @@ and reusing it would splice the remains of one response onto the next request.
 | `maxBodyBytes` | `Infinity` | Enforced from `Content-Length` before a byte is read. |
 | `decompress` | `true` | gzip/deflate. Never `br` — see limits. |
 | `keepAlive` | `true` | |
+| `http2` | `true` | Offer `h2` in ALPN and speak it if the server selects it. See [HTTP/2](#http2--access-not-speed). |
 | `forceTunnel` | `false` | Never delegate to the platform's `fetch`. |
 | `nativeFetch` | `globalThis.fetch` | Delegation target. |
 
@@ -325,8 +378,13 @@ Not implemented, and not planned:
 - **`br` and `zstd` content encodings.** The runtime has `DecompressionStream` for gzip, deflate
   and deflate-raw only. The client therefore never advertises `br` — asking for it would return
   bytes that cannot be decoded.
-- **HTTP/2 and HTTP/3.** ALPN offers exactly `http/1.1`; a server selecting anything else fails
-  closed.
+- **HTTP/3.** ALPN offers `h2` and `http/1.1` (see [HTTP/2](#http2--access-not-speed)); it does
+  not offer `h3`, which is QUIC over UDP and unreachable from a runtime that exposes only raw TCP.
+  A server selecting anything the client did not offer fails closed — there is no fallback-and-retry
+  at any layer.
+- **Server push, HTTP/2 priority, and h2c.** Push is disabled in our SETTINGS and a `PUSH_PROMISE`
+  is a connection error; the RFC 9113 priority scheme is deprecated and PRIORITY frames are ignored;
+  and h2 runs only over ALPN-negotiated TLS, never cleartext with prior knowledge.
 
 **Sockets cannot cross request contexts.** The pool is per-`Client` and per-invocation by design;
 there is no cross-request connection cache, because the runtime does not permit one.
@@ -372,6 +430,28 @@ certificate chain validation; almost none of it is parsing (see below).
 **Reuse is the lever.** Thirty 16 KB pages from one host cost about 103 ms down one connection and
 about 300 ms opening thirty. That gap is the entire argument for holding a `Client` rather than
 calling `createFetch` per request, and it widens as pages get smaller.
+
+### HTTP/2 costs more than HTTP/1.1, not less
+
+This is the number the [HTTP/2 section](#http2--access-not-speed) promises to state honestly.
+Fetching the *same* 16 KB origin through the *same* proxy, changing only the offered ALPN, measured
+on the edge (per-minute CPU-time p50, h2-only and h1-only runs in separate buckets):
+
+| | HTTP/1.1 | HTTP/2 |
+| --- | --- | --- |
+| One 16 KB page, new connection | ~8 ms | ~12 ms |
+| Thirty 16 KB pages, one connection | ~67 ms | ~76 ms |
+
+HTTP/2 was more expensive in every cell and cheaper in none. The overhead is HPACK (header
+compression HTTP/1.1 does not do) plus frame and stream bookkeeping, and it concentrates at
+connection setup — the preface, the `SETTINGS` exchange, and the first header block. Multiplexing,
+the thing HTTP/2 is *for* on a browser, buys latency a one-request-per-handler Worker cannot spend.
+So on a CPU-metered runtime HTTP/2 is a cost you pay for access, not a speed-up: reach for it only
+when a site refuses HTTP/1.1, and leave `http2: false` on the hot paths that do not need it.
+
+(These were gathered through the Workers GraphQL analytics API rather than `wrangler tail` — the
+tail stream would not survive the measurement network here — but they are the same edge CPU-time
+metric, quantiled over the invocations in each minute.)
 
 ### What a fresh isolate costs
 
@@ -482,7 +562,7 @@ and Bun. The only runtime-specific piece is the `connect` function you supply.
 ## Testing
 
 ```bash
-npm test          # 984 offline tests, hermetic, no network
+npm test          # offline, hermetic, no network
 npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 ```
 

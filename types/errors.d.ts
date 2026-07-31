@@ -27,6 +27,15 @@ export class HttpError extends TunnelFetchError {
 export class TlsError extends TunnelFetchError {
 }
 /**
+ * HTTP/2 framing, streams, flow control, HPACK, or a peer GOAWAY/RST_STREAM. Separate from
+ * HttpError because the wire format and its failure modes are entirely different: an HTTP/1.1
+ * message is text framed by lengths and CRLFs, an HTTP/2 stream is a state machine over binary
+ * frames sharing one connection, and a caller distinguishing "the /1.1 parser choked" from "an
+ * h2 stream was reset" wants two codes, not one.
+ */
+export class Http2Error extends TunnelFetchError {
+}
+/**
  * The peer offered something we deliberately do not implement.
  * Separate from TlsError so "we cannot talk to this server" is distinguishable from
  * "the connection broke", which is the difference between a feature request and a bug report.
@@ -72,6 +81,17 @@ export namespace codes {
     let TLS_SIGALG_UNSUPPORTED: "TLS_SIGALG_UNSUPPORTED";
     let TLS_EXTENSION_UNSUPPORTED: "TLS_EXTENSION_UNSUPPORTED";
     let TLS_ALPN: "TLS_ALPN";
+    let HTTP2_PROTOCOL: "HTTP2_PROTOCOL";
+    let HTTP2_FRAME_SIZE: "HTTP2_FRAME_SIZE";
+    let HTTP2_SETTINGS: "HTTP2_SETTINGS";
+    let HTTP2_FLOW_CONTROL: "HTTP2_FLOW_CONTROL";
+    let HTTP2_STREAM_STATE: "HTTP2_STREAM_STATE";
+    let HTTP2_STREAM_CLOSED: "HTTP2_STREAM_CLOSED";
+    let HTTP2_GOAWAY: "HTTP2_GOAWAY";
+    let HTTP2_COMPRESSION: "HTTP2_COMPRESSION";
+    let HTTP2_HEADER: "HTTP2_HEADER";
+    let HTTP2_PUSH_UNEXPECTED: "HTTP2_PUSH_UNEXPECTED";
+    let HTTP2_TRAILER: "HTTP2_TRAILER";
     let CERT_PARSE: "CERT_PARSE";
     let CERT_CHAIN_INCOMPLETE: "CERT_CHAIN_INCOMPLETE";
     let CERT_UNTRUSTED_ROOT: "CERT_UNTRUSTED_ROOT";
