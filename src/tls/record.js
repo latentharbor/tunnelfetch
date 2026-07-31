@@ -42,6 +42,33 @@ const KEY_UPDATE_REQUESTED = Uint8Array.from([HANDSHAKE_TYPE.key_update, 0, 0, 1
 const typeName = (t) =>
   Object.entries(RECORD_TYPE).find(([, v]) => v === t)?.[0] ?? hex8(t);
 
+/**
+ * Await `promise`, but give up after `ms` and resolve anyway.
+ *
+ * Used only for shutdown courtesies, where abandoning the wait is strictly better than blocking:
+ * the peer either received the alert or has stopped reading, and no third outcome is worth waiting
+ * on. The timer is always cleared, so a fast path leaves nothing pending.
+ */
+async function withGrace(promise, ms) {
+  if (!(ms > 0)) {
+    promise.catch(() => {});
+    return;
+  }
+  let timer;
+  try {
+    await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } catch {
+    /* the transport is already unusable; there is nothing further to attempt */
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export class RecordLayer {
   /**
    * @param {{ readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array> }} duplex
@@ -58,6 +85,8 @@ export class RecordLayer {
     this._w = new ByteWriter(writable);
     this._maxHandshakeMessage = opts.maxHandshakeMessage ?? 1 << 17;
     this._maxKeyUpdates = opts.maxKeyUpdates ?? 32;
+    // How long a courtesy close_notify or fatal alert may block shutdown. See _shutdown().
+    this._shutdownGraceMs = opts.shutdownGraceMs ?? 2000;
     this._padding = opts.padding ?? null;
     this._onPostHandshake = opts.onPostHandshake ?? null;
 
@@ -553,17 +582,35 @@ export class RecordLayer {
 
   /** Clean shutdown: close_notify, then close the transport write side. */
   async close() {
-    if (!this._closedLocally) {
-      this._closedLocally = true;
-      try {
-        await this._enqueueWrite(() => this._emit(RECORD_TYPE.alert,
-          Uint8Array.from([ALERT_LEVEL.warning, ALERT.close_notify])));
-      } catch {
-        /* peer may already be gone; close_notify is best-effort by nature */
+    await this._shutdown(ALERT_LEVEL.warning, ALERT.close_notify);
+  }
+
+  /**
+   * Shutdown, bounded.
+   *
+   * The alert is a courtesy: a peer that has stopped reading will never see it, and its write can
+   * therefore never complete once the transport's buffer fills. Awaiting that without a bound
+   * hangs close() forever on the ordinary path, and hangs abort() on the failure path — where it
+   * also swallows the error the caller was about to be given, turning a diagnosable failure into a
+   * request that simply never returns. So the courtesy gets a deadline and is then abandoned.
+   *
+   * Alert and FIN are one chained task so a single deadline covers both; queueing them separately
+   * would let a stalled alert consume one budget and the FIN another.
+   */
+  async _shutdown(level, desc) {
+    const sendAlert = !this._closedLocally;
+    this._closedLocally = true;
+    const task = this._enqueueWrite(async () => {
+      if (sendAlert) {
+        try {
+          await this._emit(RECORD_TYPE.alert, Uint8Array.from([level & 0xff, desc & 0xff]));
+        } catch {
+          /* peer may already be gone; the alert is best-effort by nature */
+        }
       }
-    }
-    // Through the chain, so a pending best-effort alert still beats the FIN.
-    await this._enqueueWrite(() => this._w.close());
+      await this._w.close();
+    });
+    await withGrace(task, this._shutdownGraceMs);
   }
 
   /**
@@ -571,16 +618,7 @@ export class RecordLayer {
    * connection is an interop bug of ours, not a neutral choice.
    */
   async abort(desc = ALERT.internal_error) {
-    if (!this._closedLocally) {
-      this._closedLocally = true;
-      try {
-        await this._enqueueWrite(() => this._emit(RECORD_TYPE.alert,
-          Uint8Array.from([ALERT_LEVEL.fatal, desc & 0xff])));
-      } catch {
-        /* transport may be gone */
-      }
-    }
-    await this._enqueueWrite(() => this._w.close());
+    await this._shutdown(ALERT_LEVEL.fatal, desc);
   }
 
   /**
