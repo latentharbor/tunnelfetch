@@ -11,8 +11,8 @@ import * as proxyIndex from '../../src/proxy/index.js';
 import { parseProxy, openTunnel, closeQuietly } from '../../src/proxy/index.js';
 import { openDirect } from '../../src/proxy/direct.js';
 import { codes } from '../../src/errors.js';
-import { latin1, utf8 } from '../../src/util/bytes.js';
-import { collect, rejectsWithCode } from '../_harness.js';
+import { ByteReader, latin1, utf8 } from '../../src/util/bytes.js';
+import { collect, duplexPair, rejectsWithCode } from '../_harness.js';
 import { fakeProxy } from './_fakeproxy.js';
 
 const TARGET = Object.freeze({ hostname: 'example.com', port: 443 });
@@ -335,4 +335,45 @@ test('proxy index exports exactly the documented surface', () => {
     'openTunnel',
     'parseProxy',
   ]);
+});
+
+test('a direct connection survives a socket whose streams live on the prototype', async () => {
+  // The target runtime's Socket exposes `readable` and `writable` as prototype accessors, not own
+  // properties. openTunnel used to spread the socket into its result, and spread copies own
+  // enumerable properties only — so the duplex came back with neither stream and the first read
+  // failed with "Cannot read properties of undefined (reading 'getReader')" from inside the TLS
+  // layer, a long way from the cause. Every fake socket in this suite is a plain object, which is
+  // exactly why nothing caught it; this one imitates the real shape.
+  class PrototypeSocket {
+    constructor(readable, writable) {
+      this._r = readable;
+      this._w = writable;
+      this.opened = Promise.resolve({ remoteAddress: '203.0.113.9:443', localAddress: null });
+    }
+    get readable() { return this._r; }
+    get writable() { return this._w; }
+    async close() { this.closed = true; }
+  }
+
+  const { a, b } = duplexPair();
+  const connect = () => new PrototypeSocket(a.readable, a.writable);
+
+  const tunnel = await openTunnel({
+    proxy: null,
+    target: { hostname: 'origin.example', port: 443 },
+    connect,
+  });
+
+  assert.ok(tunnel.readable, 'the tunnel must carry the socket\'s readable');
+  assert.ok(tunnel.writable, 'the tunnel must carry the socket\'s writable');
+  assert.equal(tunnel.proxied, false);
+
+  // And it must actually carry bytes, not merely be shaped correctly. The read is started before
+  // the write is awaited: a TransformStream applies backpressure, so awaiting the write first
+  // deadlocks against a reader that has not begun.
+  const pending = new ByteReader(tunnel.readable).readExactly(5, 'greeting');
+  const w = b.writable.getWriter();
+  await w.write(utf8('hello'));
+  w.releaseLock();
+  assert.equal(latin1(await pending), 'hello');
 });

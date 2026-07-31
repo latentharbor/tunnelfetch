@@ -135,7 +135,24 @@ export async function openTunnel({ proxy, target, connect, signal, limits = {} }
   validateTarget(target);
   const cfg = typeof proxy === 'string' || (proxy && !Object.isFrozen(proxy)) ? parseProxy(proxy) : proxy ?? null;
 
-  if (!cfg) return { ...(await openDirect({ target, connect, signal })), proxied: false };
+  if (!cfg) {
+    // Read the duplex off the socket explicitly rather than spreading it. Object spread copies own
+    // enumerable properties only, and on the target runtime a socket's `readable` and `writable`
+    // are accessors on the prototype — so `{ ...socket }` yields an object with neither, and the
+    // first read fails with "Cannot read properties of undefined (reading 'getReader')" from deep
+    // inside the TLS layer. The proxy branches below are unaffected because they return plain
+    // objects they built themselves; only this one handed a host object to the spread. The offline
+    // suite cannot catch it either, since its fake sockets are plain objects with own properties.
+    const socket = await openDirect({ target, connect, signal });
+    return {
+      readable: socket.readable,
+      writable: socket.writable,
+      opened: socket.opened,
+      close: () => socket.close?.(),
+      socket,
+      proxied: false,
+    };
+  }
   if (cfg.protocol === 'http' || cfg.protocol === 'https') {
     return { ...(await openHttpConnect({ proxy: cfg, target, connect, signal, limits })), proxied: true };
   }

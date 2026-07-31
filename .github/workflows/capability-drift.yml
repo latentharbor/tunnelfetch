@@ -24,7 +24,12 @@ name: Capability drift
 # Secrets required:
 #   CLOUDFLARE_API_TOKEN   scoped to Workers Scripts: Edit — nothing else
 #   CLOUDFLARE_ACCOUNT_ID
-#   TUNNELFETCH_PROXY      host:port:user:pass of a proxy you control
+#   TUNNELFETCH_PROXY      host:port:user:pass of a proxy you control. Needed ONLY by the edge job,
+#                          and only by the parts of it that exercise CONNECT and SOCKS5 tunnelling:
+#                          those require a proxy the Cloudflare edge can reach, and a runner has no
+#                          inbound public address, so CI cannot stand one up for itself. The
+#                          trust-layer job needs no secret at all — it dials the misconfigured hosts
+#                          directly through this package's own TLS stack.
 # The rigs' own shared secret is generated per run rather than stored: it guards a Worker that
 # exists for a few minutes, so a long-lived secret would be a worse trade.
 
@@ -103,9 +108,10 @@ jobs:
       # untrusted root, incomplete chain. Every one must fail closed with its specific error code.
       # The suite includes a control that must SUCCEED, so a dead network fails the job instead of
       # quietly passing it.
+      # No proxy and no secret: this dials the misconfigured hosts directly over node:net through
+      # this package's own TLS stack, which is the thing under test. Setting TUNNELFETCH_PROXY would
+      # tunnel instead, and is available locally for anyone whose network blocks the direct route.
       - name: certificate validation still fails closed against real bad servers
-        env:
-          PROXY_1: ${{ secrets.TUNNELFETCH_PROXY }}
         run: node --test --test-reporter=spec "test/live/badssl.live.js"
 
       # Dates advance whether or not anyone commits, so the staleness assertion needs a trigger

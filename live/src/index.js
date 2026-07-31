@@ -600,6 +600,22 @@ export default {
         return { pages: out.length, sample: out[0] };
       }));
     }
+    if (url.searchParams.get('direct')) {
+      // No proxy at all: our own TLS stack straight down a socket the Worker opened itself. If this
+      // works, most interop properties can be checked on the edge without any proxy credential —
+      // only the CONNECT and SOCKS5 tunnelling tests actually need one.
+      const t = url.searchParams.get('direct');
+      results.push(await attempt(`direct ${t}`, async () => {
+        const client = new Client({ connect, forceTunnel: true, maxBodyBytes: 1 << 20,
+          timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000 } });
+        try {
+          const res = await client.fetch(`https://${t}/`);
+          const body = await res.text();
+          return { status: res.status, bytes: body.length, proxied: res.tunnelfetch?.proxied,
+            tls: res.tunnelfetch?.tls ? { version: `0x${res.tunnelfetch.tls.version.toString(16)}` } : null };
+        } finally { await client.close(); }
+      }));
+    }
     if (url.searchParams.get('poolx')) {
       const t = url.searchParams.get('poolx');
       results.push(await attempt(`poolx ${t}`, () => crossRequestPool({ proxy, url: `https://${t}/` })));
