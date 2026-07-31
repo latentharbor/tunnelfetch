@@ -10,6 +10,10 @@ export { handshakeTls12 } from './handshake12.js';
 export { RecordLayer } from './record.js';
 export { Transcript } from './transcript.js';
 export { createAead, buildNonce } from './aead.js';
+// Session resumption: the per-client ticket store, exported so a direct connectTls consumer can
+// wire options.psk / options.onSessionTicket with the same lifetime and single-use policy the
+// Client uses. Keying discipline is the caller's burden and is documented on the class.
+export { TicketStore } from './tickets.js';
 
 export {
   ALPN_HTTP11,

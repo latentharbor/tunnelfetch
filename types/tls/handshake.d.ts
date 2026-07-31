@@ -71,5 +71,20 @@ export type HandshakeContext = {
         offerGroups: number[];
         alpn: string[];
         keyShares: import("./handshake-messages.js").KeyShare[];
+        psk: OfferedPsk | null;
     };
+};
+/**
+ * The resumption PSK as prepared by connect.js: the caller's offer plus the secrets derived
+ * from it once (Early Secret, binder key) so neither hello build nor acceptance re-derives.
+ */
+export type OfferedPsk = {
+    identity: Uint8Array;
+    psk: Uint8Array;
+    hash: import("./keyschedule.js").ScheduleHash;
+    obfuscatedTicketAge: () => number;
+    peer: object | null;
+    earlySecret: Uint8Array;
+    binderKey: Uint8Array;
+    binderLen: number;
 };

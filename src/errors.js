@@ -98,6 +98,12 @@ export const codes = /** @type {const} */ ({
   TLS_SIGALG_UNSUPPORTED: 'TLS_SIGALG_UNSUPPORTED',
   TLS_EXTENSION_UNSUPPORTED: 'TLS_EXTENSION_UNSUPPORTED',
   TLS_ALPN: 'TLS_ALPN',
+  // Session resumption. TLS_PSK is a pre_shared_key negotiation violation (a selected identity
+  // that was not offered, a suite whose hash disagrees with the PSK, a selection with no offer);
+  // TLS_TICKET is an unusable NewSessionTicket or resumption ticket. Split because the first
+  // means the server broke the protocol mid-handshake and the second means a credential was bad.
+  TLS_PSK: 'TLS_PSK',
+  TLS_TICKET: 'TLS_TICKET',
 
   // http/2 (RFC 9113) and HPACK (RFC 7541). Every one names the concrete wire value that
   // triggered it — a frame type, a stream id, a table index — because "h2 error" alone decides

@@ -58,10 +58,58 @@ export function encodeKeyShareHrr(group: number): Uint8Array;
  */
 export function encodeAlpn(protocols: string[]): Uint8Array;
 /**
- * psk_key_exchange_modes is mandatory for a 1.3 ClientHello that might resume. We never resume,
- * but some middleboxes and servers reject its absence, and sending it costs 6 bytes.
+ * psk_key_exchange_modes (RFC 8446 s4.2.9), mandatory in any ClientHello that offers (or might
+ * later offer) pre_shared_key, and sent in every 1.3 hello regardless because some middleboxes
+ * reject its absence and it costs 6 bytes.
+ *
+ * Only psk_dhe_ke(1) is offered, ever. psk_ke would let a resumed connection run with no fresh
+ * (EC)DHE at all, so compromise of one ticket's PSK would decrypt every session resumed from it
+ * — the forward-secrecy property the rest of this package refuses to trade away (no RSA key
+ * transport for the same reason). A server honouring psk_dhe_ke must still send key_share, and
+ * selectServerKeyShare fails closed if it does not.
  */
 export function encodePskKeyExchangeModes(): Uint8Array<ArrayBufferLike>;
+/**
+ * pre_shared_key for a ClientHello (RFC 8446 s4.2.11): one PskIdentity (the ticket plus its
+ * obfuscated age) and one PskBinderEntry. The binder cannot be known while the hello is being
+ * encoded — it is an HMAC over a transcript of the very hello it sits in, truncated just before
+ * the binders list — so it is emitted here as `binderLen` ZERO bytes, at the exact length the
+ * real binder will have, and the builder patches the real value in afterwards. RFC 8446
+ * s4.2.11.2 requires exactly this shape: every length field is computed as if the true binder
+ * were present, and only then is the binder derived and substituted.
+ *
+ * Exactly one identity is offered by design. The wire format allows a list, but this client
+ * only ever holds resumption PSKs and offers the newest usable ticket; a multi-PSK offer would
+ * multiply binder computations for a case that cannot arise here.
+ *
+ * @param {object} psk
+ * @param {Uint8Array} psk.identity the ticket, opaque, 1..2^16-1 bytes
+ * @param {number} psk.obfuscatedTicketAge uint32, already obfuscated per s4.2.11.1
+ * @param {number} psk.binderLen digest length of the PSK's hash
+ * @returns {Uint8Array}
+ */
+export function encodePreSharedKey({ identity, obfuscatedTicketAge, binderLen }: {
+    identity: Uint8Array;
+    obfuscatedTicketAge: number;
+    binderLen: number;
+}): Uint8Array;
+/**
+ * The number of trailing ClientHello bytes occupied by the binders list this client emits: the
+ * 2-byte list length, the 1-byte entry length, and the binder itself. This is the truncation
+ * arithmetic of RFC 8446 s4.2.11.2 — the binder transcript covers the hello up to and including
+ * the identities, i.e. everything except these bytes — kept next to the encoder above so the
+ * two cannot drift apart. pre_shared_key being the LAST extension (enforced by the builder) is
+ * what makes "trailing bytes of the message" and "the binders list" the same thing.
+ * @param {number} binderLen
+ * @returns {number}
+ */
+export function pskBinderTrailerLength(binderLen: number): number;
+/**
+ * pre_shared_key in a ServerHello is a bare uint16 selected_identity (RFC 8446 s4.2.11).
+ * @param {Uint8Array} data
+ * @returns {number}
+ */
+export function decodeServerPreSharedKey(data: Uint8Array): number;
 /** RFC 7627. Requesting extended master secret closes the triple-handshake hole in TLS 1.2. */
 export function encodeExtendedMasterSecret(): Uint8Array<ArrayBufferLike>;
 /**

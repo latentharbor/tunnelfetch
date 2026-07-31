@@ -93,6 +93,16 @@ export class RecordLayer {
     /** The handshake driver calls this after the Finished exchange. Gates CCS and KeyUpdate. */
     markHandshakeComplete(): void;
     /**
+     * Install (or replace) the NewSessionTicket consumer after construction. Exists because the
+     * consumer needs secrets that do not exist when the record layer is built — the resumption
+     * master secret is derived from the transcript through the client Finished — so the driver
+     * wires it in at handshake completion. An exception it throws surfaces on the read path and
+     * fails the connection, which is the correct fate for a peer whose post-handshake messages do
+     * not parse.
+     * @param {null | ((msg: HandshakeMessage) => void | Promise<void>)} fn
+     */
+    setPostHandshake(fn: null | ((msg: HandshakeMessage) => void | Promise<void>)): void;
+    /**
      * Install send-direction protection. Pass `secret` (a TLS 1.3 traffic secret; key and IV are
      * derived per RFC 8446 s7.3, and KeyUpdate rotation becomes possible) or raw `key`+`iv`
      * (TLS 1.2 key_block slices, which have no forward rotation). Sequence numbers reset.

@@ -296,6 +296,21 @@ export async function resumptionPsk(hash, resumptionMaster, ticketNonce) {
 }
 
 /**
+ * binder_key = Derive-Secret(Early Secret, "res binder", "") — RFC 8446 s7.1, the resumption
+ * variant. The "ext binder" sibling for externally provisioned PSKs is deliberately absent:
+ * this package mints PSKs only from NewSessionTicket, so an external-PSK binder key would be
+ * dead code with a security label on it. The binder value itself is finishedVerifyData over
+ * this key (RFC 8446 s4.2.11.2: "the PskBinderEntry is computed in the same way as the
+ * Finished message but with the BaseKey being the binder_key").
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} early the Early Secret extracted from the PSK being offered
+ * @returns {Promise<Uint8Array>}
+ */
+export async function resumptionBinderKey(hash, early) {
+  return deriveSecret(hash, early, 'res binder', await emptyHash(hash));
+}
+
+/**
  * finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length). RFC 8446 s4.4.4.
  * @param {ScheduleHash} hash
  * @param {Uint8Array} trafficSecret

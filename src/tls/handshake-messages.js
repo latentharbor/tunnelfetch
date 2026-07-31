@@ -46,6 +46,7 @@ import {
   encodeExtendedMasterSecret,
   encodeExtensionBlock,
   encodeKeyShare,
+  encodePreSharedKey,
   encodePskKeyExchangeModes,
   encodeRenegotiationInfo,
   encodeServerName,
@@ -53,6 +54,7 @@ import {
   encodeStatusRequest,
   encodeSupportedGroups,
   encodeSupportedVersions,
+  pskBinderTrailerLength,
   rejectUnofferedExtensions,
   requireSupportedGroup,
 } from './extensions.js';
@@ -175,6 +177,11 @@ export async function deriveSharedSecret(group, privateKey, peerKey) {
  * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
  * @property {number[]} [versions] default [TLS13, TLS12]
  * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
+ * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
+ *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
+ *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
+ *   `binderOffset` before the hello touches the wire — a zero binder on the wire is a hello
+ *   every honest server must reject.
  * @property {(n: number) => Uint8Array} [randomBytes] injectable randomness
  */
 
@@ -191,6 +198,9 @@ export async function deriveSharedSecret(group, privateKey, peerKey) {
  * @property {number[]} offeredSigSchemes
  * @property {Set<number>} offeredExtensions extension types present in the hello
  * @property {string[]} offeredAlpn
+ * @property {number} [binderOffset] psk only: where the binder's bytes sit in `message`
+ * @property {number} [truncatedLength] psk only: how many leading bytes of `message` the binder
+ *   transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
  */
 
 /**
@@ -211,6 +221,7 @@ export function buildClientHello({
   alpn = [ALPN_HTTP11],
   versions = [TLS13, TLS12],
   extraExtensions = [],
+  psk = null,
   randomBytes = defaultRandom,
 }) {
   const clientRandom = random ?? randomBytes(32);
@@ -234,6 +245,14 @@ export function buildClientHello({
   const suiteBytes = new Builder();
   for (const s of suites) suiteBytes.u16(s);
 
+  if (psk && !offersTls13) {
+    // A pre_shared_key of this kind exists only in TLS 1.3 (RFC 5077 tickets are a different,
+    // unimplemented mechanism), so offering one from a hello that cannot negotiate 1.3 is a
+    // wiring bug that must not pass silently as "the server just declined".
+    throw new TlsError(codes.CONFIG_INVALID,
+      'a resumption PSK was supplied but TLS 1.3 is not among the offered versions');
+  }
+
   const extensionParts = [
     encodeServerName(hostname),
     // Always offered, for either version: without it a server may not staple (RFC 6066 s8), and
@@ -250,6 +269,10 @@ export function buildClientHello({
     offersTls12 ? encodeRenegotiationInfo() : null,
     // A HelloRetryRequest cookie arrives here, already encoded, and must go out verbatim.
     ...extraExtensions,
+    // pre_shared_key MUST be the last extension in the hello (RFC 8446 s4.2.11) — the binder
+    // transcript is "the hello truncated just before the binders", which only names a
+    // well-defined byte range if nothing follows them. Servers are required to check.
+    psk ? encodePreSharedKey(psk) : null,
   ];
   const offered = new Set();
   for (const part of extensionParts) {
@@ -265,8 +288,9 @@ export function buildClientHello({
     .push(encodeExtensionBlock(extensionParts))
     .build();
 
-  return {
-    message: handshakeMessage(HANDSHAKE_TYPE.client_hello, body),
+  const message = handshakeMessage(HANDSHAKE_TYPE.client_hello, body);
+  const out = {
+    message,
     clientRandom,
     legacySessionId: sessionId,
     offeredCiphers: suites,
@@ -275,6 +299,32 @@ export function buildClientHello({
     offeredExtensions: offered,
     offeredAlpn: alpn,
   };
+  if (psk) {
+    // The two numbers that make the binder computable — and the two easiest to get wrong.
+    // Derived from the one formula in pskBinderTrailerLength, against the FINAL framed message,
+    // so "hello minus binders list" cannot drift from what was actually encoded.
+    out.binderOffset = message.byteLength - psk.binderLen;
+    out.truncatedLength = message.byteLength - pskBinderTrailerLength(psk.binderLen);
+  }
+  return out;
+}
+
+/**
+ * Patch the real binder over the placeholder `buildClientHello` emitted. Separate from the
+ * builder because the binder is derived FROM the built message (truncated), so there is no
+ * ordering in which one function could do both.
+ * @param {ClientHello} hello a hello built with a psk offer
+ * @param {Uint8Array} binder
+ */
+export function setPskBinder(hello, binder) {
+  if (hello.binderOffset === undefined ||
+      hello.binderOffset + binder.byteLength !== hello.message.byteLength) {
+    throw new TlsError(codes.CONFIG_INVALID,
+      `cannot patch a ${binder.byteLength}-byte PSK binder: the hello reserved ` +
+      `${hello.binderOffset === undefined ? 'no placeholder'
+        : `${hello.message.byteLength - hello.binderOffset} bytes`}`);
+  }
+  hello.message.set(binder, hello.binderOffset);
 }
 
 // ------------------------------------------------------------------ ServerHello
@@ -497,6 +547,53 @@ export function parseHelloRetryRequest(serverHello, { offeredGroups }) {
   requireSupportedGroup(group, 'HelloRetryRequest');
   const cookie = serverHello.extensions.get(EXTENSION.cookie) ?? null;
   return { group, cookie };
+}
+
+// ------------------------------------------------------------------ NewSessionTicket
+
+/**
+ * NewSessionTicket (RFC 8446 s4.6.1), the post-handshake message a resumption PSK is minted
+ * from. Strict on structure — a truncated field, trailing bytes, or a zero-length ticket ends
+ * the connection, because a peer whose post-handshake messages do not parse cannot be trusted
+ * to frame the application data either — but faithful to s4.6.1 on extensions: early_data is
+ * validated in shape and its value RECORDED but never acted on (0-RTT is deliberately not
+ * implemented; see the driver), and unrecognized extensions are ignored, which s4.6.1 makes
+ * mandatory ("Clients MUST ignore unrecognized extensions").
+ *
+ * Lifetime semantics (zero means discard, 604800 s is the cap a client may honour) are POLICY,
+ * applied by the ticket store; this function reports what the wire said.
+ *
+ * @param {Uint8Array} body
+ * @returns {{ lifetimeSec: number, ageAdd: number, nonce: Uint8Array, ticket: Uint8Array,
+ *   maxEarlyDataSize: number | null }}
+ */
+export function parseNewSessionTicket(body) {
+  const c = new Cursor(body, 'NewSessionTicket');
+  const lifetimeSec = c.u32('ticket_lifetime');
+  const ageAdd = c.u32('ticket_age_add');
+  const nonce = c.vector(1, 'ticket_nonce');
+  const ticket = c.vector(2, 'ticket');
+  const exts = decodeExtensionBlock(c.vector(2, 'extensions'), 'NewSessionTicket');
+  c.end('NewSessionTicket');
+  if (ticket.byteLength === 0) {
+    // opaque ticket<1..2^16-1>: zero is outside the vector's floor, and an empty identity could
+    // never be offered back (encodePreSharedKey refuses it), so it is dead on arrival.
+    throw new TlsError(codes.TLS_TICKET, 'NewSessionTicket carries a zero-length ticket');
+  }
+  let maxEarlyDataSize = null;
+  for (const [type, data] of exts) {
+    if (type === EXTENSION.early_data) {
+      if (data.byteLength !== 4) {
+        throw new TlsError(codes.TLS_TICKET,
+          `NewSessionTicket early_data extension is ${data.byteLength} bytes; ` +
+          'max_early_data_size is a uint32 (RFC 8446 s4.2.10)',
+        { length: data.byteLength });
+      }
+      maxEarlyDataSize = new Cursor(data, 'early_data').u32('max_early_data_size');
+    }
+    // Anything else: ignored by requirement of s4.6.1. Duplicates were already fatal above.
+  }
+  return { lifetimeSec, ageAdd, nonce, ticket, maxEarlyDataSize };
 }
 
 // ------------------------------------------------------------------ Certificate

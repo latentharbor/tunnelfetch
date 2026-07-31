@@ -180,6 +180,19 @@ export class RecordLayer {
     this._handshakeComplete = true;
   }
 
+  /**
+   * Install (or replace) the NewSessionTicket consumer after construction. Exists because the
+   * consumer needs secrets that do not exist when the record layer is built — the resumption
+   * master secret is derived from the transcript through the client Finished — so the driver
+   * wires it in at handshake completion. An exception it throws surfaces on the read path and
+   * fails the connection, which is the correct fate for a peer whose post-handshake messages do
+   * not parse.
+   * @param {null | ((msg: HandshakeMessage) => void | Promise<void>)} fn
+   */
+  setPostHandshake(fn) {
+    this._onPostHandshake = fn;
+  }
+
   // ------------------------------------------------------------------ key management
 
   /**

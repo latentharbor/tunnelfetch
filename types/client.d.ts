@@ -170,6 +170,7 @@ export class Client {
     /** @type {Set<import('./http2/connection.js').Http2Connection>} */
     _h2conns: Set<import("./http2/connection.js").Http2Connection>;
     jar: CookieJar | null;
+    tickets: TicketStore;
     _closed: boolean;
     /**
      * @param {RequestInfo | URL} input
@@ -317,5 +318,6 @@ export type ClientOptions = {
 };
 import { CookieJar } from './client/cookies.js';
 import { ConnectionPool } from './pool.js';
+import { TicketStore } from './tls/tickets.js';
 import { utf8 } from './util/bytes.js';
 export { CookieJar, ConnectionPool, utf8 };

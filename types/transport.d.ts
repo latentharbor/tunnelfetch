@@ -49,6 +49,11 @@ export function targetFromUrl(input: string | URL): TransportTarget;
  * @property {string[]} [alpn] the ALPN protocol list to offer, newest/most-preferred first.
  *   Kept separate from `tls` so offering `h2` does not read as a user-supplied TLS option (which
  *   would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
+ * @property {{ offer?: import('./tls/connect.js').ResumptionOffer | null,
+ *   onTicket?: (t: import('./tls/connect.js').CapturedTicket) => void }} [resumption]
+ *   session-resumption wiring, injected per connection by the Client. Separate from `tls` for
+ *   the same reason `alpn` is: it must neither disable native-fetch delegation nor enter the
+ *   pool key — it is not caller configuration, it is state the Client derived FROM the pool key.
  * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness/keygen for
  *   reproducible handshakes
  * @property {AbortSignal} [signal]
@@ -62,7 +67,7 @@ export function targetFromUrl(input: string | URL): TransportTarget;
  * @param {OpenConnectionOptions} args
  * @returns {Promise<Connection>}
  */
-export function openConnection({ url, connect, proxy, trust, deadlines, tls, alpn, deps, signal, limits, now, }: OpenConnectionOptions): Promise<Connection>;
+export function openConnection({ url, connect, proxy, trust, deadlines, tls, alpn, resumption, deps, signal, limits, now, }: OpenConnectionOptions): Promise<Connection>;
 /**
  * The delegation decision, with the disqualifying reason spelled out so a caller's error can
  * quote it. Discriminated on `ok` so `reason` is a string exactly when there is one.
@@ -171,6 +176,15 @@ export type OpenConnectionOptions = {
      * would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
      */
     alpn?: string[] | undefined;
+    /**
+     * session-resumption wiring, injected per connection by the Client. Separate from `tls` for
+     * the same reason `alpn` is: it must neither disable native-fetch delegation nor enter the
+     * pool key — it is not caller configuration, it is state the Client derived FROM the pool key.
+     */
+    resumption?: {
+        offer?: import("./tls/connect.js").ResumptionOffer | null;
+        onTicket?: (t: import("./tls/connect.js").CapturedTicket) => void;
+    } | undefined;
     /**
      * injectable randomness/keygen for
      * reproducible handshakes

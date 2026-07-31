@@ -30,6 +30,9 @@ import {
   earlySecret,
   finishedVerifyData,
   handshakeTrafficSecrets,
+  resumptionBinderKey,
+  resumptionMasterSecret,
+  resumptionPsk,
 } from '../../src/tls/keyschedule.js';
 import { Builder, Cursor, handshakeMessage, vector } from '../../src/tls/wire.js';
 import {
@@ -42,7 +45,7 @@ import {
   TLS13,
   TLS13_CIPHERS,
 } from '../../src/tls/constants.js';
-import { concat, timingSafeEqual, u16 } from '../../src/util/bytes.js';
+import { concat, timingSafeEqual, toHex, u8, u16, u24, u32 } from '../../src/util/bytes.js';
 
 const EMPTY = new Uint8Array(0);
 
@@ -124,10 +127,70 @@ function parseClientHello(body) {
   // verbatim against what the HelloRetryRequest carried.
   const cookie = extensions.get(EXTENSION.cookie)?.slice() ?? null;
 
+  // pre_shared_key, decoded the way a real server must: identities, binders, and — because the
+  // binder transcript is "the hello truncated just before the binders list" — the exact number
+  // of trailing bytes that list occupies, computed HERE from the decoded entry lengths rather
+  // than imported from the client's builder. If the client's truncation arithmetic is wrong,
+  // this server's independent arithmetic disagrees and the binder check fails, which is the
+  // entire reason this code does not share that helper.
+  let psk = null;
+  const pk = extensions.get(EXTENSION.psk_key_exchange_modes);
+  const pskModes = [];
+  if (pk) {
+    const mc = new Cursor(pk, 'psk_key_exchange_modes');
+    const list = mc.sub(1, 'ke_modes');
+    while (!list.done) pskModes.push(list.u8('ke_mode'));
+    mc.end('psk_key_exchange_modes');
+  }
+  const pskExt = extensions.get(EXTENSION.pre_shared_key);
+  if (pskExt) {
+    const pc = new Cursor(pskExt, 'pre_shared_key');
+    const identities = [];
+    const ids = pc.sub(2, 'identities');
+    while (!ids.done) {
+      const identity = ids.vector(2, 'identity').slice();
+      const obfuscatedAge = ids.u32('obfuscated_ticket_age');
+      identities.push({ identity, obfuscatedAge });
+    }
+    const binders = [];
+    let bindersListLength = 2; // the binders list's own u16 length prefix
+    const bs = pc.sub(2, 'binders');
+    while (!bs.done) {
+      const b = bs.vector(1, 'binder').slice();
+      binders.push(b);
+      bindersListLength += 1 + b.byteLength;
+    }
+    pc.end('pre_shared_key');
+    psk = {
+      identities,
+      binders,
+      bindersListLength,
+      // RFC 8446 s4.2.11 obliges a server to CHECK that pre_shared_key came last; recording
+      // the actual last type lets tests assert the client keeps that promise.
+      isLastExtension: [...extensions.keys()].pop() === EXTENSION.pre_shared_key,
+    };
+  }
+
   return {
     legacyVersion, random, sessionId, cipherSuites, extensions,
-    keyShares, versions, alpn, serverName, cookie,
+    keyShares, versions, alpn, serverName, cookie, psk, pskModes,
   };
+}
+
+/**
+ * The server's own binder computation, from first principles: hash the transcript prefix pieces
+ * plus the ClientHello truncated at the offset ITS OWN parse derived, then run the RFC 8446
+ * s4.2.11.2 HMAC. The key-derivation helpers are shared with the client (their byte behaviour
+ * is pinned against the RFC 8448 section 4 trace elsewhere); the truncation — the part a client
+ * and server can only get "accidentally compatible" by sharing code — is not.
+ */
+async function computeBinder(chRaw, chPsk, psk, hash, prefixPieces) {
+  const truncated = chRaw.subarray(0, chRaw.byteLength - chPsk.bindersListLength);
+  const transcriptHash = new Uint8Array(
+    await crypto.subtle.digest(hash, concat([...prefixPieces, truncated])),
+  );
+  const binderKey = await resumptionBinderKey(hash, await earlySecret(hash, psk));
+  return finishedVerifyData(hash, binderKey, transcriptHash);
 }
 
 /** ServerHello/HelloRetryRequest share one wire shape; only the random distinguishes them. */
@@ -247,6 +310,26 @@ function killableTransport({ readable, writable }) {
  *                           (0.5-RTT), before the client Finished has arrived
  *   hrr                     { group, cookie?, cipher?, cipherAfter?, second? } force a
  *                           HelloRetryRequest demanding `group` first
+ *
+ * Resumption (RFC 8446 s2.2, s4.2.11, s4.6.1):
+ *   tickets                 [{ ticket, lifetime?, ageAdd?, nonce?, extensions?, rawBody? }]
+ *                           NewSessionTickets to issue once the handshake completes. Each
+ *                           derived PSK is recorded in `sessionCache` so a LATER startServer
+ *                           sharing the cache can accept it. rawBody sends those exact bytes
+ *                           instead (for malformed-NST tests) and caches nothing.
+ *   sessionCache            Map, shared across startServer calls: toHex(ticket) -> {psk, hash}.
+ *                           Required for issuing or accepting tickets.
+ *   declinePsk              ignore a pre_shared_key offer; full handshake on the same connection
+ *   resumeCipher            accept the PSK but negotiate THIS suite even if its hash disagrees
+ *                           with the PSK's (the client must refuse the mismatch)
+ *   pskSelectedIdentity     selected_identity value to send instead of 0
+ *   pskSelectUnoffered      send pre_shared_key in ServerHello although none was offered
+ *   resumeSendCertificate   accept the PSK but still send the Certificate flight (forbidden)
+ *
+ * A hello offering a known ticket has its binder VERIFIED here, against a truncation offset
+ * this file derives from its own parse of the wire bytes — deliberately not shared with the
+ * client's builder, so a truncation bug cannot cancel itself out. A bad binder aborts with
+ * decrypt_error, exactly as s4.2.11.2 demands of a real server.
  */
 export function startServer(transport, identity, opts = {}) {
   let t = transport;
@@ -261,7 +344,8 @@ export function startServer(transport, identity, opts = {}) {
     transcriptHashAfterCh2: null,
     flightLengths: null, // [ee, certificate, certificateVerify, finished] message byte lengths
     finishedVerified: false, // set ONLY after the client Finished MAC checked out
-    negotiated: null,
+    binderVerified: null, // null: no known PSK offered; true/false: the binder's verdict
+    negotiated: null, // includes `resumed` once the handshake settles
     stopped: null, // scripted early stops ('alert', 'closed', ...) so tests can tell why
   };
   const done = drive(record, identity, opts, state, kill).then(() => state);
@@ -278,7 +362,54 @@ async function drive(record, identity, opts, state, kill) {
   ch.raw = ch1Msg.raw.slice();
   state.clientHellos.push(ch);
 
-  let suite = opts.cipher ?? TLS13_CIPHERS.find((c) => ch.cipherSuites.includes(c));
+  /**
+   * Judge a hello's pre_shared_key against the session cache. Returns null to decline (full
+   * handshake — never a connection error), `{ badBinder: true }` when the binder fails (the
+   * one outcome RFC 8446 s4.2.11.2 makes fatal), or `{ psk, hash }` to resume with. Structural
+   * promises the client is required to keep (extension last, psk_dhe_ke offered) throw: a test
+   * client breaking those is a bug to surface, not a preference to accommodate.
+   */
+  const evaluatePsk = async (hello, prefixPieces, pinnedSuite) => {
+    if (!hello.psk || opts.declinePsk || opts.pskSelectUnoffered) return null;
+    if (!hello.psk.isLastExtension) {
+      throw new Error('test server: pre_shared_key is not the last ClientHello extension');
+    }
+    if (!hello.pskModes.includes(1)) {
+      throw new Error('test server: pre_shared_key offered without psk_dhe_ke');
+    }
+    const known = opts.sessionCache?.get(toHex(hello.psk.identities[0].identity));
+    if (!known) return null; // an unknown or expired ticket is declined, like a real server
+    const expected = await computeBinder(hello.raw, hello.psk, known.psk, known.hash, prefixPieces);
+    if (!timingSafeEqual(hello.psk.binders[0], expected)) {
+      state.binderVerified = false;
+      return { badBinder: true };
+    }
+    state.binderVerified = true;
+    // An honest server only selects a PSK alongside a suite of the PSK's hash; when the suite
+    // is pinned to a different hash it declines (resumeCipher overrides to script the
+    // mismatched-acceptance misbehaviour the client must catch).
+    if (pinnedSuite && CIPHER_PARAMS[pinnedSuite].hash !== known.hash && !opts.resumeCipher) {
+      return null;
+    }
+    return { psk: known.psk, hash: known.hash };
+  };
+
+  let resumption = await evaluatePsk(ch, [], opts.cipher ?? null);
+  if (resumption?.badBinder) {
+    // RFC 8446 s4.2.11.2: a binder that does not validate MUST abort the handshake.
+    await record.sendAlert(ALERT_LEVEL.fatal, 51); // decrypt_error
+    state.stopped = 'bad-binder';
+    drainQuietly(record);
+    return;
+  }
+
+  let suite;
+  if (opts.cipher) suite = opts.cipher;
+  else if (resumption) {
+    suite = opts.resumeCipher ??
+      TLS13_CIPHERS.find((c) => ch.cipherSuites.includes(c) &&
+        CIPHER_PARAMS[c].hash === resumption.hash);
+  } else suite = TLS13_CIPHERS.find((c) => ch.cipherSuites.includes(c));
   if (!suite) throw new Error('test server: no mutually supported cipher suite');
   let hash = CIPHER_PARAMS[suite].hash;
   // The transcript hash is fixed by the suite the server just chose — same reasoning as the
@@ -316,6 +447,26 @@ async function drive(record, identity, opts, state, kill) {
       drainQuietly(record);
       return;
     }
+
+    // The ClientHello2 binder covers Transcript-Hash(message_hash(CH1) || HRR ||
+    // Truncate(CH2)). The prefix is rebuilt here BY HAND — the message_hash framing included —
+    // rather than through the Transcript class, so the client's s4.4.1 substitution is
+    // cross-checked by arithmetic it does not share. Re-evaluated from scratch: the client may
+    // legitimately have dropped the PSK if the HRR pinned a suite of a different hash.
+    const ch1Digest = new Uint8Array(
+      await crypto.subtle.digest(hash, state.clientHellos[0].raw));
+    const hrrBinderPrefix = [
+      concat([u8(HANDSHAKE_TYPE.message_hash), u24(ch1Digest.byteLength), ch1Digest]),
+      hrr,
+    ];
+    resumption = await evaluatePsk(ch, hrrBinderPrefix, suite);
+    if (resumption?.badBinder) {
+      await record.sendAlert(ALERT_LEVEL.fatal, 51); // decrypt_error
+      state.stopped = 'bad-binder';
+      drainQuietly(record);
+      return;
+    }
+
     transcript.update(ch.raw);
     // Captured so the test can recompute this hash independently of the Transcript class:
     // client and server sharing one substitution bug must not be able to vouch for each other.
@@ -342,6 +493,12 @@ async function drive(record, identity, opts, state, kill) {
         EXTENSION.key_share,
         concat([u16(group), vector(2, serverShare.keyExchange)]), // one KeyShareEntry, no list
       ),
+      // pre_shared_key: a bare selected_identity (s4.2.11). pskSelectedIdentity scripts a
+      // selection outside the offered range; pskSelectUnoffered a selection with no offer at
+      // all. Both are the client's job to refuse.
+      resumption || opts.pskSelectUnoffered
+        ? rawExtension(EXTENSION.pre_shared_key, u16(opts.pskSelectedIdentity ?? 0))
+        : null,
     ],
   });
   transcript.update(sh);
@@ -359,7 +516,9 @@ async function drive(record, identity, opts, state, kill) {
 
   // --- key schedule ------------------------------------------------------------------------
   const shared = await deriveSharedSecret(group, serverShare.privateKey, clientShare.keyExchange);
-  const early = await earlySecret(hash);
+  // psk_dhe_ke: the Early Secret comes from the PSK when resuming, and the ECDHE share always
+  // feeds the Handshake Secret — resumption changes the first extraction, nothing else.
+  const early = await earlySecret(hash, resumption?.psk ?? null);
   const handshakeSecret = await deriveHandshakeSecret(hash, early, shared);
   const hsSecrets = await handshakeTrafficSecrets(hash, handshakeSecret, await transcript.hash());
   await record.setSendKeys({ cipher: suite, secret: hsSecrets.server });
@@ -370,44 +529,58 @@ async function drive(record, identity, opts, state, kill) {
   for (const extra of opts.eeExtra ?? []) eeParts.push(extra);
   const ee = handshakeMessage(HANDSHAKE_TYPE.encrypted_extensions, vector(2, concat(eeParts)));
 
-  const chain = opts.emptyCertificateList ? [] : [identity.certDer, ...(opts.extraChain ?? [])];
-  const entries = concat(chain.map((der, i) => {
-    let exts = i === 0 && opts.staple ? stapleEntryExtension(opts.staple) : EMPTY;
-    if (opts.entryExtensions?.[i] !== undefined) exts = opts.entryExtensions[i];
-    return new Builder().vector(3, der).vector(2, exts).build();
-  }));
-  const certMsg = handshakeMessage(
-    HANDSHAKE_TYPE.certificate,
-    new Builder().vector(1, EMPTY).vector(3, entries).build(),
-  );
+  let msgs;
+  if (resumption && !opts.resumeSendCertificate) {
+    // Resumed: the PSK authenticates, so the flight is EncryptedExtensions then Finished —
+    // no Certificate, no CertificateVerify (RFC 8446 s2.2). resumeSendCertificate scripts the
+    // violation of that rule, which the client must refuse.
+    transcript.update(ee);
+    const vd = await finishedVerifyData(hash, hsSecrets.server, await transcript.hash());
+    if (opts.corruptFinished) vd[0] ^= 0xff;
+    const fin = handshakeMessage(HANDSHAKE_TYPE.finished, vd);
+    transcript.update(fin);
+    state.flightLengths = [ee, fin].map((m) => m.byteLength);
+    msgs = [ee, fin];
+  } else {
+    const chain = opts.emptyCertificateList ? [] : [identity.certDer, ...(opts.extraChain ?? [])];
+    const entries = concat(chain.map((der, i) => {
+      let exts = i === 0 && opts.staple ? stapleEntryExtension(opts.staple) : EMPTY;
+      if (opts.entryExtensions?.[i] !== undefined) exts = opts.entryExtensions[i];
+      return new Builder().vector(3, der).vector(2, exts).build();
+    }));
+    const certMsg = handshakeMessage(
+      HANDSHAKE_TYPE.certificate,
+      new Builder().vector(1, EMPTY).vector(3, entries).build(),
+    );
 
-  // CertificateVerify signs the transcript THROUGH Certificate; Finished MACs it THROUGH
-  // CertificateVerify. The transcript itself always advances honestly — the wrong-transcript
-  // misbehaviour lies only about which hash gets signed, which is exactly the attack shape.
-  transcript.update(ee);
-  const hashThroughEe = await transcript.hash();
-  transcript.update(certMsg);
-  const hashThroughCert = await transcript.hash();
-  const signedHash =
-    opts.cvTranscript === 'throughEncryptedExtensions' ? hashThroughEe : hashThroughCert;
-  const signer = opts.signWith ?? identity.sign;
-  const cv = handshakeMessage(
-    HANDSHAKE_TYPE.certificate_verify,
-    new Builder()
-      .u16(opts.cvScheme ?? identity.scheme)
-      .vector(2, signer(certificateVerifyContent(signedHash, true)))
-      .build(),
-  );
-  transcript.update(cv);
+    // CertificateVerify signs the transcript THROUGH Certificate; Finished MACs it THROUGH
+    // CertificateVerify. The transcript itself always advances honestly — the wrong-transcript
+    // misbehaviour lies only about which hash gets signed, which is exactly the attack shape.
+    transcript.update(ee);
+    const hashThroughEe = await transcript.hash();
+    transcript.update(certMsg);
+    const hashThroughCert = await transcript.hash();
+    const signedHash =
+      opts.cvTranscript === 'throughEncryptedExtensions' ? hashThroughEe : hashThroughCert;
+    const signer = opts.signWith ?? identity.sign;
+    const cv = handshakeMessage(
+      HANDSHAKE_TYPE.certificate_verify,
+      new Builder()
+        .u16(opts.cvScheme ?? identity.scheme)
+        .vector(2, signer(certificateVerifyContent(signedHash, true)))
+        .build(),
+    );
+    transcript.update(cv);
 
-  const vd = await finishedVerifyData(hash, hsSecrets.server, await transcript.hash());
-  if (opts.corruptFinished) vd[0] ^= 0xff;
-  const fin = handshakeMessage(HANDSHAKE_TYPE.finished, vd);
-  transcript.update(fin);
-  state.flightLengths = [ee, certMsg, cv, fin].map((m) => m.byteLength);
+    const vd = await finishedVerifyData(hash, hsSecrets.server, await transcript.hash());
+    if (opts.corruptFinished) vd[0] ^= 0xff;
+    const fin = handshakeMessage(HANDSHAKE_TYPE.finished, vd);
+    transcript.update(fin);
+    state.flightLengths = [ee, certMsg, cv, fin].map((m) => m.byteLength);
 
-  let msgs = [ee, certMsg, cv, fin];
-  if (opts.flightOrder === 'certificateFirst') msgs = [certMsg, ee, cv, fin];
+    msgs = [ee, certMsg, cv, fin];
+    if (opts.flightOrder === 'certificateFirst') msgs = [certMsg, ee, cv, fin];
+  }
 
   if (opts.alertAfter === 'encryptedExtensions') {
     await record.writeHandshake([ee]);
@@ -451,5 +624,36 @@ async function drive(record, identity, opts, state, kill) {
   transcript.update(clientFin.raw);
   await record.setReceiveKeys({ cipher: suite, secret: appSecrets.client });
   record.markHandshakeComplete();
-  state.negotiated = { cipher: suite, group, alpn: opts.alpn ?? null };
+  state.negotiated = { cipher: suite, group, alpn: opts.alpn ?? null, resumed: Boolean(resumption) };
+
+  // --- NewSessionTicket(s) ------------------------------------------------------------------
+  // Issued from the server's OWN resumption_master_secret: its transcript, through the client
+  // Finished it just verified. If the client's derivation differs — a transcript missing its
+  // own Finished is the classic — the PSKs disagree and the next connection's binder fails
+  // here, on independent arithmetic. Writes are queued but not awaited: the record layer's
+  // write chain keeps them ordered before any later app data, and awaiting them would deadlock
+  // a zero-buffer loopback whose client has not started reading (a real server does not block
+  // its accept path on ticket delivery either). The cache is populated before the write is
+  // queued, so a test may reconnect the moment `done` resolves.
+  for (const [i, spec] of (opts.tickets ?? []).entries()) {
+    if (spec.rawBody) {
+      // Malformed-NST scripting: the bytes go out exactly as given, nothing is cached.
+      record.writeHandshake([handshakeMessage(HANDSHAKE_TYPE.new_session_ticket, spec.rawBody)])
+        .catch(() => {});
+      continue;
+    }
+    const nonce = spec.nonce ?? u8(i);
+    const resMaster = await resumptionMasterSecret(hash, masterSecret, await transcript.hash());
+    const psk = await resumptionPsk(hash, resMaster, nonce);
+    opts.sessionCache?.set(toHex(spec.ticket), { psk, hash });
+    const body = new Builder()
+      .push(u32(spec.lifetime ?? 3600))
+      .push(u32(spec.ageAdd ?? 0))
+      .vector(1, nonce)
+      .vector(2, spec.ticket)
+      .vector(2, spec.extensions ?? EMPTY)
+      .build();
+    record.writeHandshake([handshakeMessage(HANDSHAKE_TYPE.new_session_ticket, body)])
+      .catch(() => {});
+  }
 }

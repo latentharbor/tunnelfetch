@@ -18,6 +18,7 @@ import { ACCEPT_ENCODING, decodeBody } from './client/decode.js';
 import { CookieJar } from './client/cookies.js';
 import { DEFAULT_MAX_REDIRECTS, nextRequest, shouldRedirect } from './client/redirect.js';
 import { ConnectionPool, poolKey } from './pool.js';
+import { TicketStore } from './tls/tickets.js';
 import { DeadlineController, withIdleDeadline } from './util/deadline.js';
 import { nativeFetchCanServe, openConnection, targetFromUrl } from './transport.js';
 import { parseProxy } from './proxy/index.js';
@@ -107,6 +108,15 @@ export class Client {
     /** @type {Set<import('./http2/connection.js').Http2Connection>} */
     this._h2conns = new Set();
     this.jar = options.cookies ? (options.jar ?? new CookieJar()) : (options.jar ?? null);
+    // TLS 1.3 session tickets, per-Client for the same reason the pool is: a ticket is a
+    // credential bound to a trust configuration, and it is stored and looked up under the SAME
+    // key the pool uses, so a ticket can never resume a session for a request whose scheme,
+    // host, port, proxy, trust policy or TLS options differ from the connection that earned it.
+    // `options.now` (the test override for certificate validity) drives ticket ages too — the
+    // two are the same clock question.
+    this.tickets = new TicketStore(
+      typeof options.now === 'number' ? { now: () => options.now } : {},
+    );
     this._closed = false;
     // Bound so a Client can be handed straight to an SDK expecting a bare function.
     this.fetch = this.fetch.bind(this);
@@ -128,6 +138,7 @@ export class Client {
    *  closed or sockets leak for the isolate's lifetime. */
   async close() {
     this._closed = true;
+    this.tickets.clear(); // tickets are credentials; a closed Client keeps none
     const h2 = [...this._h2conns]; // the set, not the map: it also holds race-orphaned connections
     this._h2.clear();
     this._h2conns.clear();
@@ -322,6 +333,7 @@ async function openFreshAndSend(client, current, { hop, key, proxy, trust, tls }
       trust,
       tls,
       alpn,
+      resumption: resumptionFor(client, key),
       deps: o.deps,
       deadlines,
       limits: o.limits ?? {},
@@ -341,6 +353,38 @@ async function openFreshAndSend(client, current, { hop, key, proxy, trust, tls }
     if (conn && !isH2) await client.pool.discard(conn);
     throw err;
   }
+}
+
+/**
+ * Session-resumption wiring for one connection attempt: the freshest usable ticket stored under
+ * this pool key (consumed now, single-use), and the capture callback that files new tickets
+ * under the same key. That the offer and the capture share the connection's own pool key is the
+ * entire safety argument — a ticket can only ever be replayed to the exact
+ * scheme/host/port/proxy/trust/tls tuple that earned it.
+ *
+ * One policy carve-out: under `revocation: 'require-staple'` resumption is disabled outright
+ * (nothing stored, nothing offered). That caller demanded a stapled revocation proof on every
+ * connection, and a resumed handshake carries no certificate and therefore no staple — resuming
+ * would silently skip the exact check that was made mandatory. Costs one full handshake per
+ * connection, which is precisely what that trust posture asks for.
+ *
+ * @param {Client} client
+ * @param {string} key
+ * @returns {{ offer: object | null, onTicket: (t: object) => void } | undefined}
+ */
+function resumptionFor(client, key) {
+  const trust = client.options.trust ?? { mode: 'system' };
+  if (trust.revocation === 'require-staple') return undefined;
+  // Keyed by the FULL pool key, which already folds scheme, host, port, proxy, trust policy and
+  // TLS options — for exactly the reason the pool does it. A ticket is a credential: one obtained
+  // under a pinned or custom trust policy must never resume a connection for a caller who asked
+  // for something else, and keying by origin alone is precisely how that happens.
+  return {
+    offer: client.tickets.take(key),
+    onTicket: (t) => {
+      if (!client._closed) client.tickets.put(key, t);
+    },
+  };
 }
 
 /** Wrap a freshly negotiated h2 connection, register it for reuse, and arrange its own removal. */
@@ -423,6 +467,7 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
         proxy: parseProxy(o.proxy ?? null),
         trust: o.trust ?? { mode: 'system' },
         tls: o.tls ?? {},
+        resumption: resumptionFor(client, key),
         deps: o.deps,
         deadlines,
         limits: o.limits ?? {},

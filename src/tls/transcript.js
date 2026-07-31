@@ -65,6 +65,24 @@ export class Transcript {
   }
 
   /**
+   * Digest of everything appended so far PLUS `extra`, without appending it.
+   *
+   * Exists for exactly one caller: the PSK binder after a HelloRetryRequest, which is an HMAC
+   * over Transcript-Hash(message_hash(CH1) || HRR || Truncate(CH2)) (RFC 8446 s4.2.11.2). The
+   * truncated ClientHello2 must be hashed as a continuation of the real transcript but must
+   * never BECOME part of it — the transcript proper gets the full ClientHello2 with its binder,
+   * and folding the truncated form in even transiently would leave a window where the two
+   * bookkeepings disagree.
+   * @param {Uint8Array} extra
+   * @returns {Promise<Uint8Array>}
+   */
+  async hashWith(extra) {
+    return new Uint8Array(
+      await crypto.subtle.digest(this._hash, concat([...this._chunks, extra], this._len + extra.byteLength)),
+    );
+  }
+
+  /**
    * HelloRetryRequest transcript substitution (RFC 8446 s4.4.1): when a ServerHello is an HRR,
    * the transcript restarts as a synthetic handshake message
    *

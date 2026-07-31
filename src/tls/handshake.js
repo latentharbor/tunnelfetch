@@ -38,6 +38,8 @@ import {
   earlySecret,
   finishedVerifyData,
   handshakeTrafficSecrets,
+  resumptionMasterSecret,
+  resumptionPsk,
 } from './keyschedule.js';
 import {
   buildClientHello,
@@ -52,11 +54,18 @@ import {
   parseCertificate13,
   parseCertificateVerify,
   parseHelloRetryRequest,
+  parseNewSessionTicket,
   parseServerHello,
   selectServerKeyShare,
+  setPskBinder,
   verifyHandshakeSignature,
 } from './handshake-messages.js';
-import { decodeExtensionBlock, describeVersion, rejectUnofferedExtensions } from './extensions.js';
+import {
+  decodeExtensionBlock,
+  decodeServerPreSharedKey,
+  describeVersion,
+  rejectUnofferedExtensions,
+} from './extensions.js';
 import { Builder, Cursor, handshakeMessage } from './wire.js';
 import { connectTls } from './connect.js';
 
@@ -100,7 +109,22 @@ const describeType = (t) => `${hex8(t)} (${HS_NAME[t] ?? 'unknown'})`;
  * @property {import('./connect.js').TlsOptions} options
  * @property {import('./connect.js').TlsDeps} deps
  * @property {{ versions: number[], ciphers: number[], groups: number[], offerGroups: number[],
- *   alpn: string[], keyShares: import('./handshake-messages.js').KeyShare[] }} offer
+ *   alpn: string[], keyShares: import('./handshake-messages.js').KeyShare[],
+ *   psk: OfferedPsk | null }} offer
+ */
+
+/**
+ * The resumption PSK as prepared by connect.js: the caller's offer plus the secrets derived
+ * from it once (Early Secret, binder key) so neither hello build nor acceptance re-derives.
+ * @typedef {object} OfferedPsk
+ * @property {Uint8Array} identity
+ * @property {Uint8Array} psk
+ * @property {import('./keyschedule.js').ScheduleHash} hash
+ * @property {() => number} obfuscatedTicketAge
+ * @property {object | null} peer
+ * @property {Uint8Array} earlySecret
+ * @property {Uint8Array} binderKey
+ * @property {number} binderLen
  */
 
 /** Demand a specific handshake message, turning every other outcome into a named failure. */
@@ -173,6 +197,11 @@ export async function continueTls13(ctx) {
   let { hello, serverHello: sh, rawServerHello, suite, params } = ctx;
   let { keyShares } = ctx.offer;
   let hash = params.hash;
+  // The PSK the CURRENT hello carries. Starts as what connect.js offered in ClientHello1 and
+  // can only narrow: a HelloRetryRequest that pins a suite of a different hash removes it from
+  // ClientHello2 (s4.1.4), and every acceptance check below runs against this variable — never
+  // against the original offer — so a server cannot select what the live hello does not carry.
+  let offeredPsk = ctx.offer.psk ?? null;
 
   // --- HelloRetryRequest ---------------------------------------------------------------------
   if (sh.isHelloRetryRequest) {
@@ -190,11 +219,19 @@ export async function continueTls13(ctx) {
     await transcript.replaceWithMessageHash();
     transcript.update(rawServerHello);
 
+    // s4.1.4: the second hello SHOULD NOT offer a PSK whose hash differs from the suite the
+    // HelloRetryRequest just pinned — the server could never legally select it, and computing
+    // its binder would need a second transcript under the other hash. Dropping it here is what
+    // makes a later pre_shared_key in the real ServerHello provably a violation.
+    if (offeredPsk && offeredPsk.hash !== params.hash) offeredPsk = null;
+
     keyShares = [await generateKeyShare(group, deps)];
     // RFC 8446 s4.1.2: ClientHello2 reuses the random and the legacy session id verbatim — and
     // everything else about the offer, including the full VERSION list. If both versions were
     // offered, ClientHello2 offers both again; changing the extension set between hellos is not
-    // among the modifications s4.1.2 permits, and a strict server checks.
+    // among the modifications s4.1.2 permits (recomputing obfuscated_ticket_age and the binder
+    // IS: s4.1.2 lists "pre_shared_key" as one of the fields a second hello updates), and a
+    // strict server checks.
     hello = buildClientHello({
       hostname,
       keyShares,
@@ -205,8 +242,24 @@ export async function continueTls13(ctx) {
       random: hello.clientRandom,
       legacySessionId: hello.legacySessionId,
       extraExtensions: cookie ? [cookieExtension(cookie)] : [],
+      psk: offeredPsk && {
+        identity: offeredPsk.identity,
+        obfuscatedTicketAge: offeredPsk.obfuscatedTicketAge(),
+        binderLen: offeredPsk.binderLen,
+      },
       randomBytes: deps.randomBytes,
     });
+    if (offeredPsk) {
+      // The ClientHello2 binder covers Transcript-Hash(message_hash(CH1) || HRR ||
+      // Truncate(CH2)) (s4.2.11.2). The transcript object holds exactly the first two at this
+      // point, and hashWith appends the truncation without ever folding it in — the transcript
+      // proper receives the full patched hello below. The suite's hash and the PSK's hash are
+      // equal here by the drop above, so one digest serves both bookkeepings.
+      const truncatedHash = await transcript.hashWith(
+        hello.message.subarray(0, hello.truncatedLength));
+      setPskBinder(hello,
+        await finishedVerifyData(offeredPsk.hash, offeredPsk.binderKey, truncatedHash));
+    }
     transcript.update(hello.message);
     await record.writeHandshake([hello.message]);
 
@@ -255,10 +308,54 @@ export async function continueTls13(ctx) {
   checkSessionIdEcho(sh, hello.legacySessionId);
   transcript.update(rawServerHello);
 
+  // Did the server take the PSK? Every check is against the CURRENT hello's offer (s4.2.11:
+  // "Clients MUST verify that the server's selected_identity is within the range supplied by
+  // the client [and] that the server selected a cipher suite indicating a Hash associated with
+  // the PSK"). Fail closed on each: continuing after any of these means client and server
+  // disagree about which secret protects the connection.
+  let acceptedPsk = null;
+  const pskExt = sh.extensions.get(EXTENSION.pre_shared_key);
+  if (pskExt !== undefined) {
+    if (!offeredPsk) {
+      throw new TlsError(
+        codes.TLS_PSK,
+        'ServerHello selected a pre-shared key, but the ClientHello it answers offered none',
+      );
+    }
+    const selected = decodeServerPreSharedKey(pskExt);
+    if (selected !== 0) {
+      // Exactly one identity is ever offered, so the only selectable index is 0.
+      throw new TlsError(
+        codes.TLS_PSK,
+        `ServerHello selected pre-shared key identity ${selected}, but only one identity ` +
+          '(index 0) was offered',
+        { selected },
+      );
+    }
+    if (params.hash !== offeredPsk.hash) {
+      throw new TlsError(
+        codes.TLS_PSK,
+        `ServerHello accepted the offered PSK but selected cipher suite ${hex16(suite)} ` +
+          `(${params.hash}), while the PSK was minted under ${offeredPsk.hash}; a PSK may only ` +
+          'be used with the hash it was derived for (RFC 8446 s4.2.11)',
+        { suite, suiteHash: params.hash, pskHash: offeredPsk.hash },
+      );
+    }
+    acceptedPsk = offeredPsk;
+  }
+  // No pre_shared_key in the ServerHello means the server declined: the FULL handshake — with
+  // Certificate, CertificateVerify, and chain validation — continues on this same connection.
+  // No reconnect, no re-offer, no downgrade dance; declining costs nothing but the bytes.
+
+  // Only psk_dhe_ke is ever offered (s4.2.9), so a key exchange happens whether or not the PSK
+  // was taken; selectServerKeyShare fails closed on a ServerHello without key_share.
   const server = selectServerKeyShare(sh, keyShares);
   const shared = await deriveSharedSecret(server.group, server.privateKey, server.keyExchange);
 
-  const early = await earlySecret(hash);
+  // s7.1: with a PSK in use the Early Secret is extracted from it; otherwise from zeros. The
+  // accepted offer already carries that extraction (connect.js derived it for the binder), and
+  // its hash equals the negotiated hash by the acceptance check above.
+  const early = acceptedPsk ? acceptedPsk.earlySecret : await earlySecret(hash);
   const handshakeSecret = await deriveHandshakeSecret(hash, early, shared);
   const hsSecrets = await handshakeTrafficSecrets(hash, handshakeSecret, await transcript.hash());
 
@@ -294,50 +391,75 @@ export async function continueTls13(ctx) {
 
   let next = await record.nextHandshakeMessage();
   let certificateRequested = false;
-  if (next && !next.ccs && next.type === HANDSHAKE_TYPE.certificate_request) {
-    // We hold no client certificate, but the protocol still demands an answer: an empty
-    // Certificate message and no CertificateVerify (RFC 8446 s4.4.2).
-    certificateRequested = true;
-    transcript.update(next.raw);
+  let peer;
+  if (acceptedPsk) {
+    // Resumed: the server authenticates by proving it holds the PSK — its Finished MAC, under
+    // keys extracted from that PSK, is the proof — and s4.3.2 forbids it from sending
+    // CertificateRequest (and s2.2 from re-authenticating with a certificate) in this handshake.
+    // A server that sends either after selecting the PSK is not confused about framing, it is
+    // violating the PSK contract, so the error names that rather than a generic wrong-type.
+    if (next && !next.ccs &&
+        (next.type === HANDSHAKE_TYPE.certificate ||
+         next.type === HANDSHAKE_TYPE.certificate_request)) {
+      throw new TlsError(
+        codes.TLS_PSK,
+        `server resumed with the offered pre-shared key but then sent ${describeType(next.type)}; ` +
+          'a PSK handshake must not carry certificate messages (RFC 8446 s2.2, s4.3.2)',
+        { type: next.type },
+      );
+    }
+    // The certificate validated in the ORIGINAL handshake vouches for this connection, exactly
+    // as far as the ticket store's keying lets it: the store binds tickets to the full trust
+    // configuration, so this peer was validated under the same policy this caller asked for.
+    peer = acceptedPsk.peer;
+  } else {
+    if (next && !next.ccs && next.type === HANDSHAKE_TYPE.certificate_request) {
+      // We hold no client certificate, but the protocol still demands an answer: an empty
+      // Certificate message and no CertificateVerify (RFC 8446 s4.4.2).
+      certificateRequested = true;
+      transcript.update(next.raw);
+      next = await record.nextHandshakeMessage();
+    }
+
+    const certMsg = expect(next, HANDSHAKE_TYPE.certificate, 'Certificate');
+    transcript.update(certMsg.raw);
+    // The leaf's CertificateEntry may carry a stapled OCSP response (RFC 8446 s4.4.2.1); it rides
+    // to the trust layer alongside the chain and is judged there, under the same fail-closed rules.
+    const { chain, ocspResponse } = parseCertificate13(certMsg.body, {
+      offeredExtensions: hello.offeredExtensions,
+    });
+    const transcriptThroughCertificate = await transcript.hash();
+
+    const cv = expect(
+      await record.nextHandshakeMessage(),
+      HANDSHAKE_TYPE.certificate_verify,
+      'CertificateVerify',
+    );
+    const { algorithm, signature } = parseCertificateVerify(cv.body);
+    transcript.update(cv.raw);
+
+    // Trust first. The signature check below is only meaningful once the key performing it has been
+    // tied by the trust layer to a chain we accept for this hostname; done the other way round it
+    // merely proves that whoever holds the socket also holds a key, which is no evidence at all.
+    peer = await verifyPeer(chain, hostname, { ocspResponse });
+    const spki = peer?.spki?.spkiDer;
+    if (!spki) {
+      throw new TlsError(
+        codes.CONFIG_INVALID,
+        'verifyPeer must resolve with the validated leaf certificate, including spki.spkiDer',
+      );
+    }
+    await verifyHandshakeSignature({
+      scheme: algorithm,
+      spki,
+      signature,
+      content: certificateVerifyContent(transcriptThroughCertificate, true),
+    });
+
     next = await record.nextHandshakeMessage();
   }
 
-  const certMsg = expect(next, HANDSHAKE_TYPE.certificate, 'Certificate');
-  transcript.update(certMsg.raw);
-  // The leaf's CertificateEntry may carry a stapled OCSP response (RFC 8446 s4.4.2.1); it rides
-  // to the trust layer alongside the chain and is judged there, under the same fail-closed rules.
-  const { chain, ocspResponse } = parseCertificate13(certMsg.body, {
-    offeredExtensions: hello.offeredExtensions,
-  });
-  const transcriptThroughCertificate = await transcript.hash();
-
-  const cv = expect(
-    await record.nextHandshakeMessage(),
-    HANDSHAKE_TYPE.certificate_verify,
-    'CertificateVerify',
-  );
-  const { algorithm, signature } = parseCertificateVerify(cv.body);
-  transcript.update(cv.raw);
-
-  // Trust first. The signature check below is only meaningful once the key performing it has been
-  // tied by the trust layer to a chain we accept for this hostname; done the other way round it
-  // merely proves that whoever holds the socket also holds a key, which is no evidence at all.
-  const peer = await verifyPeer(chain, hostname, { ocspResponse });
-  const spki = peer?.spki?.spkiDer;
-  if (!spki) {
-    throw new TlsError(
-      codes.CONFIG_INVALID,
-      'verifyPeer must resolve with the validated leaf certificate, including spki.spkiDer',
-    );
-  }
-  await verifyHandshakeSignature({
-    scheme: algorithm,
-    spki,
-    signature,
-    content: certificateVerifyContent(transcriptThroughCertificate, true),
-  });
-
-  const sf = expect(await record.nextHandshakeMessage(), HANDSHAKE_TYPE.finished, 'server Finished');
+  const sf = expect(next, HANDSHAKE_TYPE.finished, 'server Finished');
   const expectedFinished = await finishedVerifyData(hash, hsSecrets.server, await transcript.hash());
   checkFinished(sf.body, expectedFinished);
   transcript.update(sf.raw);
@@ -362,17 +484,52 @@ export async function continueTls13(ctx) {
     clientFlight.push(empty);
     transcript.update(empty);
   }
-  clientFlight.push(
-    handshakeMessage(
-      HANDSHAKE_TYPE.finished,
-      await finishedVerifyData(hash, hsSecrets.client, await transcript.hash()),
-    ),
+  const clientFinished = handshakeMessage(
+    HANDSHAKE_TYPE.finished,
+    await finishedVerifyData(hash, hsSecrets.client, await transcript.hash()),
   );
+  clientFlight.push(clientFinished);
+  // Our own Finished joins the transcript too: resumption_master_secret is derived from the
+  // transcript THROUGH the client Finished (s7.1), so without this line every PSK minted from a
+  // ticket would be wrong — and wrong in a way a loopback test with the same omission on both
+  // sides would never notice.
+  transcript.update(clientFinished);
   await record.writeHandshake(clientFlight);
 
   await record.setSendKeys({ cipher: suite, secret: appSecrets.client });
   await record.setReceiveKeys({ cipher: suite, secret: appSecrets.server });
   record.markHandshakeComplete();
+
+  if (options.onSessionTicket) {
+    // NewSessionTicket arrives under application keys at the server's leisure; the record layer
+    // surfaces it here. Everything is derived lazily on the first ticket so a connection whose
+    // server never sends one pays nothing, and resumption_master_secret is computed once then
+    // reused — one server flight routinely carries two tickets. Parse or derivation failures
+    // propagate out of the read path and fail the connection: a peer whose post-handshake
+    // messages are malformed does not get to keep talking (same stance as KeyUpdate).
+    //
+    // 0-RTT, stated as a decision and not an omission: a ticket may advertise early_data, and
+    // this client records but never uses it. Early data is replayable by design — an attacker
+    // who captures the flight can replay it, and the server may accept both copies — which is
+    // unsafe for exactly the requests a proxy client carries (a caller's POST must not be
+    // executable twice by a third party). No option enables it.
+    let resMaster = null;
+    record.setPostHandshake(async ({ body }) => {
+      const t = parseNewSessionTicket(body);
+      resMaster ??= await resumptionMasterSecret(hash, masterSecret, await transcript.hash());
+      options.onSessionTicket({
+        identity: t.ticket,
+        psk: await resumptionPsk(hash, resMaster, t.nonce),
+        hash,
+        cipherSuite: suite,
+        lifetimeSec: t.lifetimeSec,
+        ageAdd: t.ageAdd,
+        maxEarlyDataSize: t.maxEarlyDataSize,
+        alpnProtocol: alpnProtocol ?? null,
+        peer,
+      });
+    });
+  }
 
   // The duplex is created on first access, not eagerly: consumers that drive the record layer
   // directly (record.readAppData/writeAppData) never need the platform-stream wrappers, and the
@@ -396,6 +553,10 @@ export async function continueTls13(ctx) {
       alpnProtocol: alpnProtocol ?? null,
       certificateRequested,
       hostname,
+      // True only when the server took the offered PSK. A declined offer reports false: the
+      // connection ran the full handshake and was authenticated by certificate, and a caller
+      // reading this field is usually asking "was the chain re-validated on this connection".
+      resumed: acceptedPsk !== null,
     },
     close: () => record.close(),
   };

@@ -89,6 +89,11 @@ export function targetFromUrl(input) {
  * @property {string[]} [alpn] the ALPN protocol list to offer, newest/most-preferred first.
  *   Kept separate from `tls` so offering `h2` does not read as a user-supplied TLS option (which
  *   would disable native-fetch delegation and enter the pool key). `tls.alpn` still wins if set.
+ * @property {{ offer?: import('./tls/connect.js').ResumptionOffer | null,
+ *   onTicket?: (t: import('./tls/connect.js').CapturedTicket) => void }} [resumption]
+ *   session-resumption wiring, injected per connection by the Client. Separate from `tls` for
+ *   the same reason `alpn` is: it must neither disable native-fetch delegation nor enter the
+ *   pool key — it is not caller configuration, it is state the Client derived FROM the pool key.
  * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness/keygen for
  *   reproducible handshakes
  * @property {AbortSignal} [signal]
@@ -111,6 +116,7 @@ export async function openConnection({
   deadlines,
   tls = {},
   alpn,
+  resumption,
   deps = {},
   signal,
   limits = {},
@@ -169,7 +175,9 @@ export async function openConnection({
             verifyChain({ chain, hostname, trust, now, ocspResponse: details?.ocspResponse ?? null }),
           // `alpn` is offered here rather than folded into `tls` so that the ALPN offer never
           // counts as a user TLS option; `tls.alpn` still overrides it when explicitly set.
-          options: alpn && !tls.alpn ? { ...tls, alpn } : tls,
+          // Resumption wiring joins the options the same way, and only when present, so a
+          // Client without a ticket produces byte-identical options to before the feature.
+          options: assembleTlsOptions(tls, alpn, resumption),
           deps,
         }),
       );
@@ -211,6 +219,26 @@ async function safeClose(duplex) {
   } catch {
     /* already gone */
   }
+}
+
+/**
+ * Fold the per-connection injections (ALPN offer, resumption wiring) into the caller's TLS
+ * options without ever mutating them. The caller's object is what the pool key and the
+ * delegation decision were computed from; growing keys on it here would silently change both.
+ * @param {import('./tls/connect.js').TlsOptions} tls
+ * @param {string[] | undefined} alpn
+ * @param {{ offer?: object | null, onTicket?: Function } | undefined} resumption
+ * @returns {import('./tls/connect.js').TlsOptions}
+ */
+function assembleTlsOptions(tls, alpn, resumption) {
+  const offer = resumption?.offer ?? null;
+  const onTicket = resumption?.onTicket ?? null;
+  if (!offer && !onTicket && !(alpn && !tls.alpn)) return tls;
+  const out = { ...tls };
+  if (alpn && !tls.alpn) out.alpn = alpn;
+  if (offer) out.psk = offer;
+  if (onTicket) out.onSessionTicket = onTicket;
+  return out;
 }
 
 /**

@@ -21,6 +21,43 @@
  * @property {number} [maxHandshakeMessage] per-message cap; certificate chains dominate sizing.
  * @property {number} [maxKeyUpdates] received KeyUpdates tolerated before it is called a flood.
  * @property {number} [maxTranscriptBytes] cap on buffered handshake transcript.
+ * @property {ResumptionOffer} [psk] offer this resumption PSK (TLS 1.3 only; requires 1.3 in
+ *   the offered versions). The server may decline, in which case the full handshake continues
+ *   on this same connection — there is no reconnect at any layer.
+ * @property {(ticket: CapturedTicket) => void} [onSessionTicket] receive each NewSessionTicket
+ *   this connection yields, already reduced to a usable PSK per RFC 8446 s7.1. Without this the
+ *   tickets are read and discarded, exactly as before.
+ */
+/**
+ * A resumption PSK ready to offer, as produced by the ticket store from a CapturedTicket.
+ * `obfuscatedTicketAge` is a closure, not a number, because the age must be current at the
+ * moment each hello is BUILT — a HelloRetryRequest builds a second hello later — and because
+ * clock policy belongs to the store, not to this layer (which otherwise never reads a clock).
+ * `peer` rides along opaquely: it is whatever the original session's verifyPeer resolved with,
+ * and a resumed session (which has no Certificate message to verify) reports it as its own —
+ * sound only because the ticket store keys tickets by the full trust configuration.
+ * @typedef {object} ResumptionOffer
+ * @property {Uint8Array} identity the ticket
+ * @property {Uint8Array} psk
+ * @property {import('./keyschedule.js').ScheduleHash} hash the hash the PSK was minted under
+ * @property {() => number} obfuscatedTicketAge uint32 per RFC 8446 s4.2.11.1
+ * @property {object} [peer]
+ */
+/**
+ * What a NewSessionTicket becomes by the time a caller sees it: the wire fields that govern
+ * offering (lifetime, age_add) plus the derived PSK and everything needed to check a future
+ * selection against it. `maxEarlyDataSize` is recorded for honesty but never acted on: 0-RTT
+ * is deliberately not implemented (see the driver's note).
+ * @typedef {object} CapturedTicket
+ * @property {Uint8Array} identity
+ * @property {Uint8Array} psk
+ * @property {import('./keyschedule.js').ScheduleHash} hash
+ * @property {number} cipherSuite
+ * @property {number} lifetimeSec
+ * @property {number} ageAdd
+ * @property {number | null} maxEarlyDataSize
+ * @property {string | null} alpnProtocol
+ * @property {object} peer
  */
 /**
  * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
@@ -38,6 +75,9 @@
  * @property {string | null} alpnProtocol
  * @property {string} hostname the identity the certificate was required to prove
  * @property {boolean} [extendedMasterSecret] TLS 1.2 only: whether RFC 7627 was in effect
+ * @property {boolean} [resumed] TLS 1.3 only: the server accepted the offered resumption PSK,
+ *   so no certificate crossed the wire on THIS connection; the identity is the one validated
+ *   by the original handshake the ticket came from
  */
 /**
  * A live TLS session: a plaintext duplex plus what was negotiated to get it.
@@ -129,6 +169,60 @@ export type TlsOptions = {
      * cap on buffered handshake transcript.
      */
     maxTranscriptBytes?: number | undefined;
+    /**
+     * offer this resumption PSK (TLS 1.3 only; requires 1.3 in
+     * the offered versions). The server may decline, in which case the full handshake continues
+     * on this same connection — there is no reconnect at any layer.
+     */
+    psk?: ResumptionOffer | undefined;
+    /**
+     * receive each NewSessionTicket
+     * this connection yields, already reduced to a usable PSK per RFC 8446 s7.1. Without this the
+     * tickets are read and discarded, exactly as before.
+     */
+    onSessionTicket?: ((ticket: CapturedTicket) => void) | undefined;
+};
+/**
+ * A resumption PSK ready to offer, as produced by the ticket store from a CapturedTicket.
+ * `obfuscatedTicketAge` is a closure, not a number, because the age must be current at the
+ * moment each hello is BUILT — a HelloRetryRequest builds a second hello later — and because
+ * clock policy belongs to the store, not to this layer (which otherwise never reads a clock).
+ * `peer` rides along opaquely: it is whatever the original session's verifyPeer resolved with,
+ * and a resumed session (which has no Certificate message to verify) reports it as its own —
+ * sound only because the ticket store keys tickets by the full trust configuration.
+ */
+export type ResumptionOffer = {
+    /**
+     * the ticket
+     */
+    identity: Uint8Array;
+    psk: Uint8Array;
+    /**
+     * the hash the PSK was minted under
+     */
+    hash: import("./keyschedule.js").ScheduleHash;
+    /**
+     * uint32 per RFC 8446 s4.2.11.1
+     */
+    obfuscatedTicketAge: () => number;
+    peer?: object | undefined;
+};
+/**
+ * What a NewSessionTicket becomes by the time a caller sees it: the wire fields that govern
+ * offering (lifetime, age_add) plus the derived PSK and everything needed to check a future
+ * selection against it. `maxEarlyDataSize` is recorded for honesty but never acted on: 0-RTT
+ * is deliberately not implemented (see the driver's note).
+ */
+export type CapturedTicket = {
+    identity: Uint8Array;
+    psk: Uint8Array;
+    hash: import("./keyschedule.js").ScheduleHash;
+    cipherSuite: number;
+    lifetimeSec: number;
+    ageAdd: number;
+    maxEarlyDataSize: number | null;
+    alpnProtocol: string | null;
+    peer: object;
 };
 /**
  * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
@@ -163,6 +257,12 @@ export type TlsSessionInfo = {
      * TLS 1.2 only: whether RFC 7627 was in effect
      */
     extendedMasterSecret?: boolean | undefined;
+    /**
+     * TLS 1.3 only: the server accepted the offered resumption PSK,
+     * so no certificate crossed the wire on THIS connection; the identity is the one validated
+     * by the original handshake the ticket came from
+     */
+    resumed?: boolean | undefined;
 };
 /**
  * A live TLS session: a plaintext duplex plus what was negotiated to get it.

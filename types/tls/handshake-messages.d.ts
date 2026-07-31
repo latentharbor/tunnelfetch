@@ -41,6 +41,11 @@ export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey
  * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
  * @property {number[]} [versions] default [TLS13, TLS12]
  * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
+ * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
+ *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
+ *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
+ *   `binderOffset` before the hello touches the wire — a zero binder on the wire is a hello
+ *   every honest server must reject.
  * @property {(n: number) => Uint8Array} [randomBytes] injectable randomness
  */
 /**
@@ -56,6 +61,9 @@ export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey
  * @property {number[]} offeredSigSchemes
  * @property {Set<number>} offeredExtensions extension types present in the hello
  * @property {string[]} offeredAlpn
+ * @property {number} [binderOffset] psk only: where the binder's bytes sit in `message`
+ * @property {number} [truncatedLength] psk only: how many leading bytes of `message` the binder
+ *   transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
  */
 /**
  * Build a ClientHello. Returns the framed handshake message plus the metadata the rest of the
@@ -64,7 +72,15 @@ export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey
  * @param {ClientHelloOptions} opts
  * @returns {ClientHello}
  */
-export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extraExtensions, randomBytes, }: ClientHelloOptions): ClientHello;
+export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extraExtensions, psk, randomBytes, }: ClientHelloOptions): ClientHello;
+/**
+ * Patch the real binder over the placeholder `buildClientHello` emitted. Separate from the
+ * builder because the binder is derived FROM the built message (truncated), so there is no
+ * ordering in which one function could do both.
+ * @param {ClientHello} hello a hello built with a psk offer
+ * @param {Uint8Array} binder
+ */
+export function setPskBinder(hello: ClientHello, binder: Uint8Array): void;
 /**
  * A parsed ServerHello. `isHelloRetryRequest` is decided by the random alone (RFC 8446 s4.1.3);
  * everything else is exactly what the wire carried, judged later by the negotiate* functions.
@@ -140,6 +156,29 @@ export function parseHelloRetryRequest(serverHello: ServerHello, { offeredGroups
 }): {
     group: number;
     cookie: Uint8Array | null;
+};
+/**
+ * NewSessionTicket (RFC 8446 s4.6.1), the post-handshake message a resumption PSK is minted
+ * from. Strict on structure — a truncated field, trailing bytes, or a zero-length ticket ends
+ * the connection, because a peer whose post-handshake messages do not parse cannot be trusted
+ * to frame the application data either — but faithful to s4.6.1 on extensions: early_data is
+ * validated in shape and its value RECORDED but never acted on (0-RTT is deliberately not
+ * implemented; see the driver), and unrecognized extensions are ignored, which s4.6.1 makes
+ * mandatory ("Clients MUST ignore unrecognized extensions").
+ *
+ * Lifetime semantics (zero means discard, 604800 s is the cap a client may honour) are POLICY,
+ * applied by the ticket store; this function reports what the wire said.
+ *
+ * @param {Uint8Array} body
+ * @returns {{ lifetimeSec: number, ageAdd: number, nonce: Uint8Array, ticket: Uint8Array,
+ *   maxEarlyDataSize: number | null }}
+ */
+export function parseNewSessionTicket(body: Uint8Array): {
+    lifetimeSec: number;
+    ageAdd: number;
+    nonce: Uint8Array;
+    ticket: Uint8Array;
+    maxEarlyDataSize: number | null;
 };
 /**
  * The CertificateStatus body of RFC 6066 s8: `status_type(1) || opaque OCSPResponse<1..2^24-1>`.
@@ -331,6 +370,17 @@ export type ClientHelloOptions = {
      */
     extraExtensions?: Uint8Array<ArrayBufferLike>[] | undefined;
     /**
+     * offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
+     * the real binder over `message.subarray(0, truncatedLength)` and patch it in at
+     * `binderOffset` before the hello touches the wire — a zero binder on the wire is a hello
+     * every honest server must reject.
+     */
+    psk?: {
+        identity: Uint8Array;
+        obfuscatedTicketAge: number;
+        binderLen: number;
+    } | undefined;
+    /**
      * injectable randomness
      */
     randomBytes?: ((n: number) => Uint8Array) | undefined;
@@ -355,6 +405,15 @@ export type ClientHello = {
      */
     offeredExtensions: Set<number>;
     offeredAlpn: string[];
+    /**
+     * psk only: where the binder's bytes sit in `message`
+     */
+    binderOffset?: number | undefined;
+    /**
+     * psk only: how many leading bytes of `message` the binder
+     * transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
+     */
+    truncatedLength?: number | undefined;
 };
 /**
  * A parsed ServerHello. `isHelloRetryRequest` is decided by the random alone (RFC 8446 s4.1.3);
