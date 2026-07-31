@@ -1006,6 +1006,56 @@ export default {
         } finally { await client.close(); }
       }));
     }
+    if (url.searchParams.get('reach')) {
+      // Do real sites actually refuse or challenge an HTTP/1.1 client with this TLS fingerprint?
+      // The question behind it is whether HTTP/2 is worth implementing, and that is an empirical
+      // question, not an architectural one. A challenge announces itself: Cloudflare answers 403
+      // with `cf-mitigated: challenge` and an interstitial, others send 403/429 with a body that
+      // does not look like the site. Recording the status, the mitigation header and a slice of
+      // the body distinguishes "refused us" from "served us fine" from "the proxy could not get
+      // there at all", which are three different answers.
+      const hosts = url.searchParams.get('reach').split(',').filter(Boolean);
+      results.push(await attempt(`reach ${hosts.length} hosts`, async () => {
+        const client = new Client({
+          connect, proxy, forceTunnel: true, maxBodyBytes: 512 * 1024,
+          timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
+        });
+        const out = [];
+        try {
+          for (const h of hosts) {
+            try {
+              const res = await client.fetch(`https://${h}/`, {
+                headers: {
+                  // A plausible browser UA, because sending an obviously-automated one would test
+                  // the UA string rather than the protocol and fingerprint.
+                  'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                    + '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+                  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'accept-language': 'en-US,en;q=0.9',
+                },
+              });
+              const body = await res.text();
+              out.push({
+                host: h,
+                status: res.status,
+                mitigated: res.headers.get('cf-mitigated'),
+                server: res.headers.get('server'),
+                bytes: body.length,
+                challenge: /just a moment|checking your browser|captcha|cf-chl|attention required/i
+                  .test(body.slice(0, 4000)),
+                alpn: res.tunnelfetch?.tls?.alpnProtocol ?? null,
+              });
+            } catch (e) {
+              out.push({ host: h, failed: true, code: e?.code ?? null,
+                error: String(e?.message ?? e).slice(0, 90) });
+            }
+          }
+        } finally {
+          await client.close();
+        }
+        return { hosts: out };
+      }));
+    }
     if (url.searchParams.get('poolx')) {
       const t = url.searchParams.get('poolx');
       results.push(await attempt(`poolx ${t}`, () => crossRequestPool({ proxy, url: `https://${t}/` })));
