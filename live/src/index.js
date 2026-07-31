@@ -118,7 +118,17 @@ async function pinMismatch({ proxy, url }) {
   }
 }
 
-/** Claiming a hostname the certificate does not cover must be refused by our own trust layer. */
+/**
+ * Claiming a hostname the certificate does not cover must be refused by our own trust layer.
+ *
+ * NOT REACHABLE as written, and kept only so the next person does not rediscover why: openConnection
+ * takes one `url` and derives BOTH the tunnel target and the identity to verify from it, so the two
+ * cannot be made to disagree without changing src/ to suit a test rig. Asking for a name nobody
+ * serves just makes the proxy answer 502 for a host that does not exist, which tests the proxy.
+ * The property is covered instead by fetching a real host whose certificate genuinely does not
+ * cover its name — see test/live/edge-interop.live.js and test/live/badssl.live.js.
+ */
+// eslint-disable-next-line no-unused-vars
 async function wrongHostname({ proxy, realHost, claimedHost }) {
   const conn = await openConnection({
     url: `https://${claimedHost}/`,
