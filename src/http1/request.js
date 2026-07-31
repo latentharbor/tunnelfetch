@@ -34,15 +34,27 @@ function latin1Bytes(s) {
 }
 
 /**
+ * A request head as this serialiser consumes it. Nothing optional is invented: what is absent
+ * here is absent on the wire.
+ * @typedef {object} RequestHead
+ * @property {string} method RFC 9110 token, sent verbatim (no case-folding)
+ * @property {string} target request-target, already encoded: origin-form (`/path?q`),
+ *   absolute-form, authority-form (CONNECT) or `*`
+ * @property {Headers | Iterable<[string, string]>} [headers]
+ * @property {'1.0' | '1.1'} [httpVersion] default '1.1'
+ */
+
+/**
  * Serialise a request head: request line, header fields, terminating blank line.
+ * Throws HttpError on any input the RFC 9110 grammar rejects — notably CR/LF in a value,
+ * which is header injection, never something to sanitise.
  *
  * `headers` may be a WHATWG Headers instance or any iterable of [name, value] pairs.
  * Pair iterables are written in caller order, unsorted — order can matter to real servers.
  * Note that a Headers instance has already lost the caller's order by spec (it iterates
  * lowercased and sorted); we serialise its iteration order as-is.
  *
- * @param {{ method: string, target: string, headers?: Headers|Iterable<[string,string]>,
- *           httpVersion?: '1.0'|'1.1' }} req
+ * @param {RequestHead} req
  * @returns {Uint8Array}
  */
 export function serializeRequestHead({ method, target, headers = [], httpVersion = '1.1' }) {
@@ -107,6 +119,18 @@ export function serializeRequestHead({ method, target, headers = [], httpVersion
           { name, value: rawValue },
         );
       }
+    }
+    // Beyond CR/LF/NUL, the RFC 9110 field-value grammar admits only HTAB, SP through '~', and
+    // obs-text (0x80-0xFF). The remaining control bytes — 0x01-0x08, VT, FF, 0x0E-0x1F and DEL —
+    // are not send-safe: the response parser refuses them on receipt (FIELD_VALUE_RE), and a
+    // serialiser laxer than the parser is a hole in the same fail-closed grammar. Reject rather
+    // than emit a byte the caller almost certainly did not mean and a proxy may mishandle.
+    if (/[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawValue)) {
+      throw new HttpError(
+        codes.HTTP_HEADER,
+        `header ${name} value contains a control byte the RFC 9110 field-value grammar forbids`,
+        { name, value: rawValue },
+      );
     }
     // Leading/trailing OWS is meaningless on the wire (the peer must strip it) and Headers
     // instances arrive pre-trimmed; trimming pair-iterable input keeps both paths identical.

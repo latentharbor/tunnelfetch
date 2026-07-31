@@ -152,7 +152,8 @@ export function decodeBody(stream, contentEncoding) {
 /**
  * Extract the charset parameter from a Content-Type value, handling quoting and other
  * parameters: `text/html; boundary=x; charset="ISO-8859-4"` -> 'iso-8859-4'.
- * @returns {string|null}
+ * @param {string | null | undefined} contentType
+ * @returns {string|null} lowercased charset label, or null when none is declared
  */
 export function charsetFromContentType(contentType) {
   if (!contentType) return null;
@@ -240,8 +241,11 @@ export function charsetFor(contentType, bodyPrefix) {
  * actually means, not C1 controls. A BOM matching the charset is stripped (TextDecoder default),
  * which is also what Response.text() does.
  *
+ * Throws HttpError (HTTP_CHARSET) for a label outside the WHATWG encoding registry.
+ *
  * @param {Uint8Array} bytes
  * @param {string} [charset]
+ * @returns {string}
  */
 export function decodeText(bytes, charset = 'utf-8') {
   let decoder;

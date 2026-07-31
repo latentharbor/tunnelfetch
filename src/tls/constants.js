@@ -101,7 +101,19 @@ export const TLS12_CIPHERS = [
   CIPHER.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 ];
 
-/** Per-suite parameters. `hash` drives the whole key schedule; `keyLen` the AEAD key size. */
+/**
+ * Per-suite parameters. `hash` drives the whole key schedule; `keyLen` the AEAD key size.
+ * @typedef {object} CipherParams
+ * @property {'SHA-256' | 'SHA-384'} hash the only hashes any negotiable suite selects
+ * @property {number} hashLen
+ * @property {number} keyLen
+ * @property {number} ivLen
+ * @property {number} tagLen
+ * @property {number} [fixedIvLen] TLS 1.2 only: the 4-byte implicit GCM salt of RFC 5288
+ * @property {'ecdsa' | 'rsa'} [sig] TLS 1.2 only: the authentication family the suite names
+ */
+
+/** @type {{ [suite: number]: CipherParams }} */
 export const CIPHER_PARAMS = {
   [CIPHER.TLS_AES_128_GCM_SHA256]: { hash: 'SHA-256', hashLen: 32, keyLen: 16, ivLen: 12, tagLen: 16 },
   [CIPHER.TLS_AES_256_GCM_SHA384]: { hash: 'SHA-384', hashLen: 48, keyLen: 32, ivLen: 12, tagLen: 16 },
@@ -139,7 +151,18 @@ export const GROUP_NAME = Object.fromEntries(Object.entries(GROUP).map(([k, v]) 
  */
 export const SUPPORTED_GROUPS = [GROUP.x25519, GROUP.secp256r1, GROUP.secp384r1, GROUP.secp521r1];
 
-/** WebCrypto parameters per group. x448 and the finite-field groups are absent by design. */
+/**
+ * WebCrypto parameters per group, discriminated on `kind` because X25519 sizes its shared
+ * secret in bytes while ECDH sizes it in bits.
+ * @typedef {{ kind: 'x25519', algorithm: { name: string }, publicLen: number, secretLen: number }
+ *   | { kind: 'ec', algorithm: { name: string, namedCurve: string }, publicLen: number,
+ *       secretBits: number }} GroupParams
+ */
+
+/**
+ * WebCrypto parameters per group. x448 and the finite-field groups are absent by design.
+ * @type {{ [group: number]: GroupParams }}
+ */
 export const GROUP_PARAMS = {
   [GROUP.x25519]: { kind: 'x25519', algorithm: { name: 'X25519' }, publicLen: 32, secretLen: 32 },
   [GROUP.secp256r1]: {
@@ -195,7 +218,20 @@ export const SUPPORTED_SIG_SCHEMES = [
   SIG_SCHEME.rsa_pkcs1_sha512,
 ];
 
-/** How to verify each scheme with WebCrypto. Absent entries are rejected with a named error. */
+/**
+ * How to verify one signature scheme with WebCrypto. `format: 'ecdsa-der'` marks the schemes
+ * whose wire signatures need the DER-to-P1363 conversion before subtle.verify will take them.
+ * @typedef {object} SigSchemeParams
+ * @property {{ name: string, namedCurve?: string, hash?: string }} import importKey algorithm
+ * @property {{ name: string, hash?: string, saltLength?: number }} verify verify() algorithm
+ * @property {'ecdsa-der'} [format]
+ * @property {number} [curveOrderLen] byte width of the curve order, ECDSA only
+ */
+
+/**
+ * How to verify each scheme with WebCrypto. Absent entries are rejected with a named error.
+ * @type {{ [scheme: number]: SigSchemeParams }}
+ */
 export const SIG_SCHEME_PARAMS = {
   [SIG_SCHEME.ecdsa_secp256r1_sha256]: {
     import: { name: 'ECDSA', namedCurve: 'P-256' }, verify: { name: 'ECDSA', hash: 'SHA-256' },

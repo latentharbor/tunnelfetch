@@ -71,6 +71,34 @@ export const DEFAULT_OFFER_GROUPS = [SUPPORTED_GROUPS[0]];
 
 const describeType = (t) => `${hex8(t)} (${HS_NAME[t] ?? 'unknown'})`;
 
+/**
+ * The injected trust decision. Must throw to reject; resolves with the validated leaf, whose
+ * SPKI is the only key a driver will accept a handshake signature from.
+ * @typedef {(chain: Uint8Array[], hostname: string)
+ *   => Promise<{ spki: { spkiDer: Uint8Array } }>} VerifyPeer
+ */
+
+/**
+ * Driver context assembled by connect.js after the ServerHello routed the connection: the
+ * record layer, the transcript (created under the negotiated suite's hash, ClientHello already
+ * folded in), the ClientHello metadata, the parsed ServerHello with its raw bytes, and the
+ * offer that produced them. Both continue* drivers consume exactly this shape.
+ * @typedef {object} HandshakeContext
+ * @property {import('./record.js').RecordLayer} record
+ * @property {import('./transcript.js').Transcript} transcript
+ * @property {import('./handshake-messages.js').ClientHello} hello
+ * @property {import('./handshake-messages.js').ServerHello} serverHello
+ * @property {Uint8Array} rawServerHello
+ * @property {number} suite
+ * @property {import('./constants.js').CipherParams} params
+ * @property {string} hostname
+ * @property {VerifyPeer} verifyPeer
+ * @property {import('./connect.js').TlsOptions} options
+ * @property {import('./connect.js').TlsDeps} deps
+ * @property {{ versions: number[], ciphers: number[], groups: number[], offerGroups: number[],
+ *   alpn: string[], keyShares: import('./handshake-messages.js').KeyShare[] }} offer
+ */
+
 /** Demand a specific handshake message, turning every other outcome into a named failure. */
 function expect(msg, type, where) {
   if (msg === null) {
@@ -99,13 +127,15 @@ function expect(msg, type, where) {
  * Run a TLS 1.3 handshake over a byte duplex and return the plaintext duplex above it.
  *
  * @param {object} args
- * @param {{readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array>}} args.transport
+ * @param {import('./connect.js').ByteDuplex} args.transport
  * @param {string} args.hostname the identity the certificate must prove, and the SNI sent
- * @param {(chain: Uint8Array[], hostname: string) => Promise<{spki: {spkiDer: Uint8Array}}>} args.verifyPeer
+ * @param {VerifyPeer} args.verifyPeer
  *   Must throw to reject. Resolves with the validated leaf; its SPKI is the only key this
  *   handshake will accept a CertificateVerify signature from.
- * @param {object} [args.options]
- * @param {{randomBytes?: (n:number)=>Uint8Array, generateKeyPair?: Function}} [args.deps]
+ * @param {import('./connect.js').TlsOptions} [args.options] `versions` is ignored: this entry
+ *   pins the offer to [TLS 1.3]
+ * @param {import('./connect.js').TlsDeps} [args.deps]
+ * @returns {Promise<import('./connect.js').TlsSession>}
  */
 export async function handshakeTls13({ transport, hostname, verifyPeer, options = {}, deps = {} }) {
   if (typeof verifyPeer !== 'function') {
@@ -129,10 +159,9 @@ export async function handshakeTls13({ transport, hostname, verifyPeer, options 
 
 /**
  * Continue a TLS 1.3 handshake from the first ServerHello (which may be a HelloRetryRequest).
- * Called by connect.js once negotiation routed the connection here; `ctx` carries the record
- * layer, the transcript (created under the negotiated suite's hash, ClientHello already folded
- * in), the ClientHello metadata, the parsed ServerHello with its raw bytes, and the offer that
- * produced them.
+ * Called by connect.js once negotiation routed the connection here.
+ * @param {HandshakeContext} ctx
+ * @returns {Promise<import('./connect.js').TlsSession>}
  */
 export async function continueTls13(ctx) {
   const { record, transcript, hostname, verifyPeer, options, deps } = ctx;

@@ -11,6 +11,11 @@ const EMPTY = new Uint8Array(0);
 
 /** Raised when the peer stops sending in the middle of a structure we must read whole. */
 export class UnexpectedEofError extends TunnelFetchError {
+  /**
+   * @param {number} wanted bytes the structure needed (-1 when scanning for a delimiter)
+   * @param {number} got bytes actually buffered when the stream ended
+   * @param {string} what the structure being read, named in the message
+   */
   constructor(wanted, got, what) {
     super('UNEXPECTED_EOF', `stream ended after ${got} of ${wanted} bytes while reading ${what}`, {
       wanted,
@@ -46,7 +51,10 @@ export class ByteReader {
     return this._eof && this._len === 0;
   }
 
-  /** Push bytes back to the front. Used when a layer over-reads (e.g. proxy replies with data). */
+  /**
+   * Push bytes back to the front. Used when a layer over-reads (e.g. proxy replies with data).
+   * @param {Uint8Array} bytes
+   */
   unshift(bytes) {
     if (bytes.byteLength === 0) return;
     if (this._head > 0) {
@@ -57,7 +65,11 @@ export class ByteReader {
     this._len += bytes.byteLength;
   }
 
-  /** Pull one more chunk from the source. Returns false at EOF. */
+  /**
+   * Pull one more chunk from the source. Returns false at EOF.
+   * @returns {Promise<boolean>} annotated because the tail-recursive skip of empty chunks
+   *   defeats return-type inference
+   */
   async _pull() {
     if (this._eof) return false;
     const { value, done } = await this._reader.read();
@@ -74,7 +86,11 @@ export class ByteReader {
     return this._pull();
   }
 
-  /** Take exactly n bytes from the buffer. Caller guarantees _len >= n. */
+  /**
+   * Take exactly n bytes from the buffer. Caller guarantees _len >= n.
+   * @param {number} n
+   * @returns {Uint8Array}
+   */
   _take(n) {
     if (n === 0) return EMPTY;
     const first = this._chunks[0];
@@ -111,7 +127,8 @@ export class ByteReader {
    * Read exactly n bytes, or throw. This is the workhorse for length-prefixed formats
    * (TLS records, chunked bodies, SOCKS5 replies).
    * @param {number} n
-   * @param {string} what described in the error if the stream ends early
+   * @param {string} [what] described in the error if the stream ends early
+   * @returns {Promise<Uint8Array>}
    */
   async readExactly(n, what = 'data') {
     if (n < 0 || !Number.isSafeInteger(n)) {
@@ -123,7 +140,11 @@ export class ByteReader {
     return this._take(n);
   }
 
-  /** Read at least 1 and at most n bytes. Returns null at clean EOF. */
+  /**
+   * Read at least 1 and at most n bytes. Returns null at clean EOF.
+   * @param {number} [n]
+   * @returns {Promise<Uint8Array | null>}
+   */
   async readSome(n = 65536) {
     while (this._len === 0) {
       if (!(await this._pull())) return null;
@@ -137,7 +158,8 @@ export class ByteReader {
    * make us buffer without bound.
    * @param {Uint8Array} needle
    * @param {number} maxBytes
-   * @param {string} what
+   * @param {string} [what]
+   * @returns {Promise<Uint8Array>}
    */
   async readUntil(needle, maxBytes, what = 'delimited data') {
     const nl = needle.byteLength;
@@ -178,7 +200,11 @@ export class ByteReader {
     }
   }
 
-  /** Drain everything remaining, up to maxBytes. */
+  /**
+   * Drain everything remaining, up to maxBytes.
+   * @param {number} [maxBytes]
+   * @returns {Promise<Uint8Array>}
+   */
   async readToEnd(maxBytes = Infinity) {
     const parts = [];
     let total = 0;
@@ -206,6 +232,7 @@ export class ByteReader {
     }
   }
 
+  /** @param {unknown} [reason] */
   async cancel(reason) {
     if (this._done) return;
     this._done = true;
@@ -225,12 +252,19 @@ export class ByteWriter {
     this._done = false;
   }
 
-  /** @param {Uint8Array} bytes */
+  /**
+   * @param {Uint8Array} bytes
+   * @returns {Promise<void>}
+   */
   write(bytes) {
     return this._writer.write(bytes);
   }
 
-  /** Write several buffers as one, avoiding per-piece stream overhead. */
+  /**
+   * Write several buffers as one, avoiding per-piece stream overhead.
+   * @param {Uint8Array[]} parts
+   * @returns {Promise<void>}
+   */
   writeAll(parts) {
     let total = 0;
     for (const p of parts) total += p.byteLength;
@@ -257,6 +291,7 @@ export class ByteWriter {
     }
   }
 
+  /** @param {unknown} [reason] */
   async abort(reason) {
     if (this._done) return;
     this._done = true;
@@ -270,7 +305,11 @@ export class ByteWriter {
 
 // ------------------------------------------------------------------ pure helpers
 
-/** @param {Uint8Array[]} parts */
+/**
+ * @param {Uint8Array[]} parts
+ * @param {number} [total] byte total, when the caller already counted; computed otherwise
+ * @returns {Uint8Array}
+ */
 export function concat(parts, total) {
   if (total === undefined) {
     total = 0;
@@ -286,7 +325,13 @@ export function concat(parts, total) {
   return out;
 }
 
-/** Boyer-Moore is not worth it for 1-4 byte needles over small buffers. */
+/**
+ * Boyer-Moore is not worth it for 1-4 byte needles over small buffers.
+ * @param {Uint8Array} haystack
+ * @param {Uint8Array} needle
+ * @param {number} [from]
+ * @returns {number} index of the first occurrence at or after `from`, or -1
+ */
 export function indexOf(haystack, needle, from = 0) {
   const n = needle.byteLength;
   const limit = haystack.byteLength - n;
@@ -301,6 +346,11 @@ export function indexOf(haystack, needle, from = 0) {
   return -1;
 }
 
+/**
+ * @param {Uint8Array} a
+ * @param {Uint8Array} b
+ * @returns {boolean}
+ */
 export function equal(a, b) {
   if (a.byteLength !== b.byteLength) return false;
   for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
@@ -313,6 +363,9 @@ export function equal(a, b) {
  * refuses MAC-then-encrypt cipher suites. It is used only where a timing leak would be a
  * nice-to-have for an attacker rather than a decryption oracle: certificate pins and Finished
  * verification, where the compared value is already authenticated or public.
+ * @param {Uint8Array} a
+ * @param {Uint8Array} b
+ * @returns {boolean}
  */
 export function timingSafeEqual(a, b) {
   if (a.byteLength !== b.byteLength) return false;
@@ -322,12 +375,20 @@ export function timingSafeEqual(a, b) {
 }
 
 const HEX = '0123456789abcdef';
+/**
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
 export function toHex(bytes) {
   let s = '';
   for (const b of bytes) s += HEX[b >> 4] + HEX[b & 15];
   return s;
 }
 
+/**
+ * @param {string} hex whitespace and ':' separators tolerated
+ * @returns {Uint8Array}
+ */
 export function fromHex(hex) {
   const clean = hex.replace(/[\s:]/g, '');
   if (clean.length % 2) throw new TunnelFetchError(codes.CONFIG_INVALID, 'odd-length hex string');
@@ -337,28 +398,44 @@ export function fromHex(hex) {
 }
 
 const encoder = new TextEncoder();
+/** @type {(s: string) => Uint8Array} */
 export const utf8 = (s) => encoder.encode(s);
-/** Latin-1 decode: HTTP header field values are opaque octets, not UTF-8. */
+/**
+ * Latin-1 decode: HTTP header field values are opaque octets, not UTF-8.
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
 export function latin1(bytes) {
   let s = '';
   for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]);
   return s;
 }
 
-/** Big-endian integer writers, the byte order of every protocol in this package. */
+/**
+ * Big-endian integer writers, the byte order of every protocol in this package.
+ * @param {number} n
+ * @returns {Uint8Array}
+ */
 export function u8(n) {
   return new Uint8Array([n & 0xff]);
 }
+/** @param {number} n @returns {Uint8Array} */
 export function u16(n) {
   return new Uint8Array([(n >>> 8) & 0xff, n & 0xff]);
 }
+/** @param {number} n @returns {Uint8Array} */
 export function u24(n) {
   return new Uint8Array([(n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
 }
+/** @param {number} n @returns {Uint8Array} */
 export function u32(n) {
   return new Uint8Array([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
 }
+/** Big-endian integer readers over a byte view at offset `o`. */
+/** @type {(b: Uint8Array, o?: number) => number} */
 export const readU16 = (b, o = 0) => (b[o] << 8) | b[o + 1];
+/** @type {(b: Uint8Array, o?: number) => number} */
 export const readU24 = (b, o = 0) => (b[o] << 16) | (b[o + 1] << 8) | b[o + 2];
+/** @type {(b: Uint8Array, o?: number) => number} */
 export const readU32 = (b, o = 0) =>
   ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;

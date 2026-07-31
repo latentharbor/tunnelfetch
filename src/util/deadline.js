@@ -21,11 +21,21 @@ import { TimeoutError, codes } from '../errors.js';
  * @property {number} [totalMs]      hard ceiling on the whole request; a backstop, not the control
  */
 
+// The idle default is deliberately generous, and the reasoning is asymmetry rather than taste.
+// Idle time is free on this runtime — it bills CPU, not wall clock — and once response headers
+// have arrived a connection no longer occupies one of the six per-invocation slots reserved for
+// requests still awaiting headers. So an over-long idle timeout costs a connection that is not
+// being paid for, while an over-short one aborts a request that was going to succeed. Nor can the
+// value be tuned to a peer's heartbeat: streaming APIs that send keep-alive events do not commit
+// to an interval, and a server generating a long response before its first token is legitimately
+// silent for exactly as long as it takes. Err long.
 export const DEFAULT_DEADLINES = Object.freeze({
   connectMs: 10_000,
   handshakeMs: 15_000,
+  // The one phase that does hold a header-wait slot, hence tighter than idle. A peer that buffers
+  // a whole slow response before sending its head needs this raised; streaming peers do not.
   headersMs: 30_000,
-  idleMs: 30_000,
+  idleMs: 60_000,
   totalMs: 0, // 0 means no ceiling: streaming responses legitimately run long
 });
 

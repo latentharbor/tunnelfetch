@@ -28,6 +28,7 @@ export const provenance = Object.freeze({
  * hex(SHA-256(subject DN DER)) -> packed anchors sharing that subject.
  * Packed anchor: { name, s: base64 subject DN, spki: base64 SPKI DER, ski: base64|null,
  * nc: base64 raw nameConstraints extnValue|null, nb/na: epoch ms }.
+ * @type {{ [subjectDnSha256: string]: PackedAnchor[] }}
  */
 const STORE = {
   '03e7f8944773e7ff16c5205d3b27a1f020d0e2f2e8afe70067720f39a60ebbf6': [
@@ -395,6 +396,25 @@ const STORE = {
   ],
 };
 
+/**
+ * @typedef {{ name: string, s: string, spki: string, ski: string | null, nc: string | null,
+ *   nb: number, na: number }} PackedAnchor
+ */
+
+/**
+ * An unpacked anchor record, shaped for path validation's normalizeAnchor: name constraints
+ * stay raw (`nameConstraintsBytes`) so only the anchor a handshake lands on pays for parsing.
+ * @typedef {object} StoredAnchor
+ * @property {string} subjectText
+ * @property {Uint8Array} subjectBytes
+ * @property {Uint8Array} spkiDer
+ * @property {Uint8Array | null} subjectKeyIdentifier
+ * @property {Uint8Array | null} nameConstraintsBytes
+ * @property {number} notBefore
+ * @property {number} notAfter
+ */
+
+/** @type {(b64: string) => Uint8Array} */
 function fromBase64(b64) {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -402,6 +422,7 @@ function fromBase64(b64) {
   return out;
 }
 
+/** @type {(p: PackedAnchor) => StoredAnchor} */
 function unpack(p) {
   return {
     subjectText: p.name,
@@ -420,6 +441,10 @@ function unpack(p) {
  * hash-bucket surprise cannot alias two names.
  */
 export const systemAnchors = {
+  /**
+   * @param {Uint8Array} dnBytes exact subject DN DER of the issuer being resolved
+   * @returns {Promise<StoredAnchor[]>}
+   */
   async forIssuer(dnBytes) {
     const digest = await crypto.subtle.digest('SHA-256', dnBytes);
     const packed = STORE[toHex(new Uint8Array(digest))];

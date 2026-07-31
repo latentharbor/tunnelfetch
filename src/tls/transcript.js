@@ -15,8 +15,8 @@ import { hashLength } from './keyschedule.js';
 
 export class Transcript {
   /**
-   * @param {string} hash 'SHA-256' | 'SHA-384' — fixed once the cipher suite is known
-   * @param {{ maxBytes?: number }} [opts]
+   * @param {import('./keyschedule.js').ScheduleHash} hash fixed once the cipher suite is known
+   * @param {{ maxBytes?: number }} [opts] transcript buffer cap, default 1 MiB
    */
   constructor(hash, { maxBytes = 1 << 20 } = {}) {
     hashLength(hash); // validate eagerly: a typo'd hash name must not surface at first hash()
@@ -51,7 +51,10 @@ export class Transcript {
     this._cached = null;
   }
 
-  /** Digest of everything appended so far. Does not consume; call as often as needed. */
+  /**
+   * Digest of everything appended so far. Does not consume; call as often as needed.
+   * @returns {Promise<Uint8Array>}
+   */
   async hash() {
     if (!this._cached) {
       this._cached = new Uint8Array(
@@ -69,6 +72,7 @@ export class Transcript {
    *
    * so that a stateless server need only remember the hash of the first ClientHello. Call this
    * after ClientHello1 is the only message in the transcript, before appending the HRR itself.
+   * @returns {Promise<void>}
    */
   async replaceWithMessageHash() {
     const digest = await this.hash();

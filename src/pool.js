@@ -21,9 +21,25 @@
 import { TunnelFetchError, codes } from './errors.js';
 
 /**
+ * Everything that decides whether two requests may share a socket. Mirrors what openConnection
+ * consumed to build the connection, because anything that influenced the connection must
+ * influence the key.
+ * @typedef {object} PoolKeyInput
+ * @property {string} scheme the URL protocol, colon included ('http:' | 'https:')
+ * @property {string} hostname
+ * @property {number} port
+ * @property {import('./proxy/index.js').ProxyConfig | null | undefined} proxy
+ * @property {import('./trust/index.js').TrustConfig | null | undefined} trust
+ * @property {import('./tls/connect.js').TlsOptions | null | undefined} tls
+ */
+
+/**
  * The trust configuration is part of the key. Two requests to the same origin under different
  * verification policies must not share a connection — the peer was validated under one policy and
  * silently reusing it satisfies the other policy without ever having checked it.
+ *
+ * @param {PoolKeyInput} input
+ * @returns {string}
  */
 export function poolKey({ scheme, hostname, port, proxy, trust, tls }) {
   const proxyPart = proxy
@@ -97,17 +113,41 @@ function anchorDigest(anchors = []) {
 
 const sortedEntries = (o) => Object.entries(o).sort(([a], [b]) => (a < b ? -1 : 1));
 
+/**
+ * What the pool stores: the connection object openConnection resolves to. The pool itself only
+ * ever calls `close?.()`, but naming the real type keeps take() useful to a caller.
+ * @typedef {import('./transport.js').Connection} PooledConnection
+ */
+
+/**
+ * @typedef {object} PoolOptions
+ * @property {number} [maxPerKey] idle connections kept per key, default 6
+ * @property {number} [maxTotal] idle connections kept across all keys, default 24
+ */
+
+/**
+ * Running counters, never reset. `discarded` includes connections refused at release time;
+ * `evicted` counts victims pushed out by a newer release under a full pool.
+ * @typedef {object} PoolStats
+ * @property {number} hits
+ * @property {number} misses
+ * @property {number} released
+ * @property {number} discarded
+ * @property {number} evicted
+ */
+
 export class ConnectionPool {
   /**
-   * @param {{ maxPerKey?: number, maxTotal?: number }} [opts]
+   * @param {PoolOptions} [opts]
    */
   constructor({ maxPerKey = 6, maxTotal = 24 } = {}) {
-    /** @type {Map<string, Array<{conn: any, since: number}>>} */
+    /** @type {Map<string, Array<{conn: PooledConnection}>>} */
     this._idle = new Map();
     this._total = 0;
     this._maxPerKey = maxPerKey;
     this._maxTotal = maxTotal;
     this._closed = false;
+    /** @type {PoolStats} */
     this.stats = { hits: 0, misses: 0, released: 0, discarded: 0, evicted: 0 };
   }
 
@@ -115,7 +155,11 @@ export class ConnectionPool {
     return this._total;
   }
 
-  /** Take an idle connection for `key`, or null. Most-recently-used first: it is likeliest live. */
+  /**
+   * Take an idle connection for `key`, or null. Most-recently-used first: it is likeliest live.
+   * @param {string} key
+   * @returns {PooledConnection | null}
+   */
   take(key) {
     this._assertOpen();
     const list = this._idle.get(key);
@@ -134,9 +178,19 @@ export class ConnectionPool {
    * Offer a connection back. Callers must have proven the body reached its declared end; this
    * method cannot verify that and deliberately does not pretend to — `eligible` is the caller's
    * assertion, and the one place it is computed is the HTTP framing layer.
+   * Idle entries carry no age, deliberately. Ageing them out would only narrow the window in
+   * which a peer reaps a socket we still believe in, never close it — the peer can hang up at any
+   * instant, including the one after the check. What actually makes reuse safe is the recovery in
+   * sendAndReceive(): a reused connection that ends without producing one response byte is proof
+   * the request was never seen, and it is re-sent on a fresh connection. An age field would look
+   * like a second line of defence while being neither necessary nor sufficient.
+   *
+   * @param {string} key
+   * @param {PooledConnection} conn
+   * @param {boolean} eligible
    * @returns {boolean} whether the connection was retained
    */
-  release(key, conn, eligible, now = 0) {
+  release(key, conn, eligible) {
     if (this._closed || !eligible) {
       this.stats.discarded++;
       void discard(conn);
@@ -156,20 +210,27 @@ export class ConnectionPool {
         return false;
       }
     }
-    list.push({ conn, since: now });
+    list.push({ conn });
     this._idle.set(key, list);
     this._total++;
     this.stats.released++;
     return true;
   }
 
-  /** Close and forget one connection that must not be reused. */
+  /**
+   * Close and forget one connection that must not be reused.
+   * @param {PooledConnection} conn
+   * @returns {Promise<void>}
+   */
   discard(conn) {
     this.stats.discarded++;
     return discard(conn);
   }
 
-  /** Close everything. A Client that is done must call this or sockets leak for the isolate. */
+  /**
+   * Close everything. A Client that is done must call this or sockets leak for the isolate.
+   * @returns {Promise<void>}
+   */
   async closeAll() {
     this._closed = true;
     const all = [];

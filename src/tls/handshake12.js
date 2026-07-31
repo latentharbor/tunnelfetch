@@ -101,6 +101,7 @@ const SIG_KIND = {
 /**
  * The one refusal that must fire regardless of which message was expected. Exported for
  * connect.js, whose ServerHello wait is the earliest point a 1.2 server can spring one.
+ * @returns {never}
  */
 export function refuseHelloRequest() {
   throw new TlsError(
@@ -155,68 +156,20 @@ function expectCcs(msg) {
   );
 }
 
-/**
- * TLS carries ECDSA signatures as DER Ecdsa-Sig-Value (RFC 8422 s5.10), but WebCrypto verifies
- * the raw IEEE P1363 r||s form, each half left-padded to the curve order length. The conversion
- * is strict — every historical "accept sloppy DER" allowance became a signature-malleability
- * bug somewhere — and it rejects rather than truncates anything that does not parse exactly.
- * Exported for direct testing; SIG_SCHEME_PARAMS carries the per-scheme orderLen.
- */
-export function ecdsaDerToRaw(sig, orderLen) {
-  const fail = (why) => {
-    throw new TlsError(codes.TLS_HANDSHAKE, `malformed DER ECDSA signature: ${why}`, {
-      length: sig.byteLength,
-    });
-  };
-  let pos = 0;
-  const byte = () => {
-    if (pos >= sig.byteLength) fail('truncated');
-    return sig[pos++];
-  };
-  const length = () => {
-    const first = byte();
-    if (first < 0x80) return first;
-    // Two INTEGERs of at most orderLen+1 bytes each never need more than one length octet.
-    if (first !== 0x81) fail(`unsupported length form ${hex8(first)}`);
-    const n = byte();
-    if (n < 0x80) fail('non-minimal long-form length');
-    return n;
-  };
-  if (byte() !== 0x30) fail('not a SEQUENCE');
-  if (length() !== sig.byteLength - pos) fail('SEQUENCE length disagrees with the signature length');
-  const integer = (name) => {
-    if (byte() !== 0x02) fail(`${name} is not an INTEGER`);
-    const n = length();
-    if (n === 0) fail(`${name} is empty`);
-    if (sig.byteLength - pos < n) fail(`${name} is truncated`);
-    let v = sig.subarray(pos, pos + n);
-    pos += n;
-    if (v[0] & 0x80) fail(`${name} is negative`);
-    if (n > 1 && v[0] === 0x00 && !(v[1] & 0x80)) fail(`${name} is not minimally encoded`);
-    if (v[0] === 0x00) v = v.subarray(1);
-    if (v.byteLength > orderLen) fail(`${name} is wider than the ${orderLen}-byte curve order`);
-    return v;
-  };
-  const r = integer('r');
-  const s = integer('s');
-  if (pos !== sig.byteLength) fail('trailing bytes after s');
-  const out = new Uint8Array(orderLen * 2);
-  out.set(r, orderLen - r.byteLength);
-  out.set(s, orderLen * 2 - s.byteLength);
-  return out;
-}
 
 /**
  * Run a TLS 1.2 handshake over a byte duplex and return the plaintext duplex above it.
  *
  * @param {object} args
- * @param {{readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array>}} args.transport
+ * @param {import('./connect.js').ByteDuplex} args.transport
  * @param {string} args.hostname the identity the certificate must prove, and the SNI sent
- * @param {(chain: Uint8Array[], hostname: string) => Promise<{spki: {spkiDer: Uint8Array}}>} args.verifyPeer
+ * @param {import('./handshake.js').VerifyPeer} args.verifyPeer
  *   Must throw to reject. Resolves with the validated leaf; its SPKI is the only key this
  *   handshake will accept a ServerKeyExchange signature from.
- * @param {object} [args.options]
- * @param {{randomBytes?: (n:number)=>Uint8Array, generateKeyPair?: Function}} [args.deps]
+ * @param {import('./connect.js').TlsOptions} [args.options] `versions` is ignored: this entry
+ *   pins the offer to [TLS 1.2]
+ * @param {import('./connect.js').TlsDeps} [args.deps]
+ * @returns {Promise<import('./connect.js').TlsSession>}
  */
 export async function handshakeTls12({ transport, hostname, verifyPeer, options = {}, deps = {} }) {
   if (typeof verifyPeer !== 'function') {
@@ -241,9 +194,10 @@ export async function handshakeTls12({ transport, hostname, verifyPeer, options 
 
 /**
  * Continue a TLS 1.2 handshake from the ServerHello. Called by connect.js once negotiation
- * routed the connection here; `ctx` carries the record layer (already pinned to 1.2 semantics),
- * the transcript (created under the negotiated suite's PRF hash, ClientHello already folded in),
- * the ClientHello metadata, the parsed ServerHello with its raw bytes, and the offer.
+ * routed the connection here; the record layer arrives already pinned to 1.2 semantics and the
+ * transcript already runs under the negotiated suite's PRF hash.
+ * @param {import('./handshake.js').HandshakeContext} ctx
+ * @returns {Promise<import('./connect.js').TlsSession>}
  */
 export async function continueTls12(ctx) {
   const { record, transcript, hello, serverHello: sh, rawServerHello, suite, params } = ctx;

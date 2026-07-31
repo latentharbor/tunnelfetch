@@ -1,5 +1,7 @@
 # tunnelfetch
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 A `fetch`-shaped HTTP client that can route through an HTTP CONNECT, HTTPS, or SOCKS5 proxy on
 runtimes that expose only raw TCP — principally Cloudflare Workers (`workerd`).
 
@@ -61,6 +63,19 @@ npm install tunnelfetch
 The package ships plain ESM under `src/`. There is no build output and no `nodejs_compat`
 requirement — the live rig deploys with no compatibility flags at all.
 
+TypeScript declarations ship in `types/`, generated from the JSDoc in the source and committed, so
+nothing needs building on install. They are not decoration: `trust` is a discriminated union, which
+makes several ways of getting security configuration wrong into compile errors rather than runtime
+ones.
+
+```ts
+new Client({ trust: { mode: 'pinned' } });
+//                   ^ Property 'pins' is missing but required in type 'PinnedTrust'
+
+new Client({ trust: { mode: 'none' } });
+//                   ^ Property 'insecureAcceptAnyCertificate' is missing but required
+```
+
 ## Usage
 
 ### As a custom `fetch`
@@ -69,18 +84,23 @@ The OpenAI and Anthropic SDKs, and most libraries worth proxying, accept a `fetc
 shape is the primary deliverable.
 
 ```js
-import { createFetch } from 'tunnelfetch';
+import { Client } from 'tunnelfetch';
 import { connect } from 'cloudflare:sockets';
 import Anthropic from '@anthropic-ai/sdk';
 
+const transport = new Client({ connect, proxy: env.PROXY_URL });
+
 const client = new Anthropic({
   apiKey: env.ANTHROPIC_API_KEY,
-  fetch: createFetch({ connect, proxy: env.PROXY_URL }),
+  fetch: transport.fetch,          // already bound; the pool survives across calls
 });
 ```
 
-`createFetch` opens and closes a connection per call. For anything that makes several requests,
-use a `Client` so the TLS handshake is paid once.
+`client.fetch` is bound in the constructor precisely so it can be handed to an SDK by reference.
+Prefer it over `createFetch` here: `createFetch` opens and closes a connection per call, which on a
+CPU-metered runtime costs a full TLS handshake every time — measured at roughly 10 ms against
+1.2 ms for a pooled request. `createFetch` is for one-off calls, matching httpx's module-level
+helpers.
 
 ### With connection reuse and a cookie jar
 
@@ -112,6 +132,31 @@ try { await thirdPartyLibrary(); } finally { uninstall(); }
 
 This never happens on import. Silently replacing a global makes every unrelated failure in the
 process look like a bug in this package.
+
+### Server-sent events
+
+SSE has no code of its own here: it is a `text/event-stream` body like any other. What matters is
+that bodies genuinely stream, and they do — measured on the edge through a proxy, a 592 KB
+response arrives as 442 separate chunks, the first at the same instant as the headers.
+
+```js
+const client = new Client({
+  connect,
+  proxy: env.PROXY_URL,
+  timeouts: { idleMs: 60_000, totalMs: 0 },
+});
+const res = await client.fetch(url, { headers: { accept: 'text/event-stream' } });
+for await (const chunk of res.body) {
+  // events arrive as they are written, not when the response ends
+}
+```
+
+Two settings are worth choosing deliberately. `idleMs` is the gap between chunks, not the total
+duration — raise it above your feed's heartbeat interval, or a quiet-but-alive stream will be cut.
+`totalMs` defaults to off, which is what a long-lived stream wants; turn it on only as a backstop.
+
+Abandoning a stream part-way never returns the connection to the pool: its position is unknown,
+and reusing it would splice the remains of one response onto the next request.
 
 ## API
 
@@ -173,7 +218,7 @@ HTTP/2 and /3, and reaches origins raw sockets are forbidden from dialling.
 | `connectMs` | 10 000 | TCP connect and proxy handshake |
 | `handshakeMs` | 15 000 | TLS handshake |
 | `headersMs` | 30 000 | status line and headers |
-| `idleMs` | 30 000 | **gap between body chunks** |
+| `idleMs` | 60 000 | **gap between body chunks** |
 | `totalMs` | `0` (off) | whole-request ceiling |
 
 The idle deadline is the control, not the total: for a streaming response "how long since the last
@@ -181,6 +226,18 @@ byte" is the signal that something is wrong, while "how long in total" is not. E
 driven by stream events rather than by reading a clock, because on this runtime `Date.now()` is
 frozen for the whole of a synchronous slice and only advances across I/O — a deadline implemented
 by polling the clock would either never fire or fire at an unrelated moment.
+
+These are liveness controls, not cost controls. The runtime bills CPU, not wall clock, so a
+connection waiting on a slow peer is free; and after the response head arrives it stops occupying
+one of the six slots an invocation may have simultaneously awaiting headers. That asymmetry is why
+`idleMs` defaults long: too long merely holds an unbilled connection, too short kills a request
+that would have succeeded. Do not try to tune it to a peer's keep-alive interval — streaming APIs
+that send keep-alive events generally do not commit to one, and a peer that is computing a long
+answer before its first byte is legitimately silent for as long as that takes.
+
+`headersMs` is the one phase that does hold a header-wait slot, so it is tighter. Raise it for a
+peer that buffers an entire slow response before sending its head; a peer that streams sends its
+head immediately and never needs it.
 
 ## What this cannot do, and why
 
@@ -274,7 +331,7 @@ and Bun. The only runtime-specific piece is the `connect` function you supply.
 ## Testing
 
 ```bash
-npm test          # 853 offline tests, hermetic, no network
+npm test          # 866 offline tests, hermetic, no network
 npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 ```
 

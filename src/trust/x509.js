@@ -106,6 +106,16 @@ const ATTR_NAME = {
 };
 
 /**
+ * A parsed X.500 Name. `bytes` is the exact DER of the whole Name — the canonical identity for
+ * every comparison; `rdns` and `text` exist for constraint checks and log lines respectively.
+ * @typedef {object} DistinguishedName
+ * @property {Uint8Array} bytes
+ * @property {Array<Array<{ oid: string, value: string }>>} rdns one array per RDN, in order;
+ *   non-string attribute values are rendered as '#hex'
+ * @property {string} text human-readable 'CN=..., O=...' form
+ */
+
+/**
  * Name ::= RDNSequence ::= SEQUENCE OF RelativeDistinguishedName (SET OF AttributeTypeAndValue).
  *
  * `bytes` is the exact DER of the whole Name and is the canonical form used for all issuer ==
@@ -113,6 +123,10 @@ const ATTR_NAME = {
  * that spells its own name two different ways between certificates breaks every deployed
  * validator that matters (they compare bytes too), and a lax comparator is one more place to
  * confuse two names. Exact bytes, fail closed.
+ *
+ * @param {Uint8Array} bytes
+ * @param {import('./der.js').Tlv} tlv
+ * @returns {DistinguishedName}
  */
 export function parseName(bytes, tlv) {
   expectTlv(tlv, { tag: TAG.SEQUENCE, constructed: true }, 'Name');
@@ -231,6 +245,22 @@ const KEY_USAGE_BITS = [
   'keyAgreement', 'keyCertSign', 'cRLSign', 'encipherOnly', 'decipherOnly',
 ];
 
+/**
+ * The nine RFC 5280 s4.2.1.3 bits, each explicit so a validator reads `false`, never
+ * `undefined` — an absent bit and an unset bit must be indistinguishable.
+ * @typedef {object} KeyUsage
+ * @property {boolean} digitalSignature
+ * @property {boolean} nonRepudiation
+ * @property {boolean} keyEncipherment
+ * @property {boolean} dataEncipherment
+ * @property {boolean} keyAgreement
+ * @property {boolean} keyCertSign
+ * @property {boolean} cRLSign
+ * @property {boolean} encipherOnly
+ * @property {boolean} decipherOnly
+ */
+
+/** @returns {KeyUsage} */
 function parseKeyUsage(valueBytes) {
   const tlv = readAll(valueBytes, 'KeyUsage');
   const { bytes: bits, unusedBits } = readBitString(valueBytes, tlv, 'KeyUsage');
@@ -259,6 +289,18 @@ function parseExtendedKeyUsage(valueBytes) {
   return Object.freeze(kids.map((k) => readOid(valueBytes, k, 'KeyPurposeId')));
 }
 
+/**
+ * The SAN entries identity matching consults. `present` distinguishes "no SAN extension"
+ * (matches nothing, by policy) from "SAN with no entries of this type".
+ * @typedef {object} SubjectAltNames
+ * @property {boolean} present
+ * @property {ReadonlyArray<string>} dns
+ * @property {ReadonlyArray<Uint8Array>} ip raw 4- or 16-byte addresses
+ * @property {ReadonlyArray<string>} uri
+ * @property {ReadonlyArray<string>} email
+ */
+
+/** @returns {SubjectAltNames} */
 function parseSubjectAltName(valueBytes) {
   const seq = readSequence(valueBytes, 0, 'GeneralNames');
   if (seq.end !== valueBytes.byteLength) throw parseError(seq.end, 'trailing bytes in SubjectAltName');
@@ -305,11 +347,29 @@ function parseAuthorityKeyIdentifier(valueBytes) {
 }
 
 /**
+ * One GeneralSubtree, reduced to what constraint enforcement can act on. 'other' entries are
+ * forms this validator cannot enforce; path.js rejects the path when a critical extension
+ * carries one, which is why they are preserved rather than dropped.
+ * @typedef {{ type: 'dns', value: string } | { type: 'email', value: string }
+ *   | { type: 'uri', value: string } | { type: 'ip', addr: Uint8Array, mask: Uint8Array }
+ *   | { type: 'other', tag: number }} NameConstraintSubtree
+ */
+
+/**
+ * @typedef {object} NameConstraints
+ * @property {ReadonlyArray<NameConstraintSubtree> | null} permitted
+ * @property {ReadonlyArray<NameConstraintSubtree> | null} excluded
+ */
+
+/**
  * NameConstraints (RFC 5280 s4.2.1.10). Subtrees we cannot enforce are preserved as
  * `{type:'other'}` entries so path.js can refuse to ignore them when the extension is critical.
  * A GeneralSubtree with minimum != 0 or maximum present is demoted to unsupported for the same
  * reason: RFC 5280 forbids them, and enforcing a constraint we cannot interpret is worse than
  * rejecting.
+ *
+ * @param {Uint8Array} valueBytes the extnValue content
+ * @returns {NameConstraints}
  */
 export function parseNameConstraints(valueBytes) {
   const seq = readSequence(valueBytes, 0, 'NameConstraints');
@@ -436,6 +496,17 @@ const ECDSA_HASH = {
 };
 
 /**
+ * How to verify one certificate signature. `scheme` indexes SIG_SCHEME_PARAMS where the OID
+ * fully determines it; for ECDSA only the hash is known here and path.js completes the plan
+ * from the issuer's curve.
+ * @typedef {object} SignaturePlan
+ * @property {'rsa-pkcs1' | 'rsa-pss' | 'ecdsa' | 'ed25519'} kind
+ * @property {number} [scheme]
+ * @property {'SHA-256' | 'SHA-384' | 'SHA-512'} [hash] weaker hashes died in the OID check
+ * @property {string} name for error messages
+ */
+
+/**
  * Map a certificate's signature algorithm to a verification plan, or throw.
  *
  * Called by path.js exactly when a certificate's signature is about to anchor trust. Weak
@@ -444,7 +515,8 @@ const ECDSA_HASH = {
  * returns only the hash: in X.509 (unlike TLS) the curve belongs to the issuer's key, so path.js
  * completes the plan from the issuer's SPKI.
  *
- * @returns {{kind:'rsa-pkcs1'|'rsa-pss'|'ecdsa'|'ed25519', scheme?:number, hash?:string, name:string}}
+ * @param {Certificate} cert
+ * @returns {SignaturePlan}
  */
 export function resolveSignatureScheme(cert) {
   const { oid } = cert.signatureAlgorithm;
@@ -498,6 +570,21 @@ export function resolveSignatureScheme(cert) {
 
 // ------------------------------------------------------------------ SPKI
 
+/**
+ * A parsed SubjectPublicKeyInfo. `spkiDer` is the exact original element — the bytes WebCrypto
+ * imports and the bytes SPKI pinning hashes, so it must never be a re-encoding.
+ * @typedef {object} Spki
+ * @property {string} algorithmOid
+ * @property {string | null} curveOid named curve, EC keys only
+ * @property {Uint8Array} keyBytes the subjectPublicKey payload
+ * @property {Uint8Array} spkiDer
+ */
+
+/**
+ * @param {Uint8Array} bytes
+ * @param {import('./der.js').Tlv} tlv
+ * @returns {Spki}
+ */
 function parseSpki(bytes, tlv) {
   expectTlv(tlv, { tag: TAG.SEQUENCE, constructed: true }, 'SubjectPublicKeyInfo');
   const kids = children(bytes, tlv, 'SubjectPublicKeyInfo');
@@ -528,6 +615,8 @@ function parseSpki(bytes, tlv) {
 /**
  * Parse a bare SubjectPublicKeyInfo element (as stored for trust anchors, which persist only the
  * SPKI rather than a whole certificate). Same walk as inside a certificate.
+ * @param {Uint8Array} spkiDer
+ * @returns {Spki}
  */
 export function parseSubjectPublicKeyInfo(spkiDer) {
   return parseSpki(spkiDer, readAll(spkiDer, 'SubjectPublicKeyInfo'));
@@ -536,12 +625,54 @@ export function parseSubjectPublicKeyInfo(spkiDer) {
 // ------------------------------------------------------------------ certificate
 
 /**
- * Parse one DER certificate into a frozen, fully-walked structure.
+ * The certificate's signatureAlgorithm, with parameters kept both raw and as a Tlv because
+ * RSA-PSS resolution has to re-walk them.
+ * @typedef {object} AlgorithmId
+ * @property {string} oid
+ * @property {Uint8Array | null} paramsBytes
+ * @property {import('./der.js').Tlv | null} paramsTlv
+ * @property {Uint8Array} bytes the whole AlgorithmIdentifier element
+ */
+
+/**
+ * A fully parsed certificate. Frozen; every byte field is a subarray of the original `der`.
+ * This is the complete shape behind the trimmed `ParsedCertificate` documented on the public
+ * verifyChain surface.
+ * @typedef {object} Certificate
+ * @property {Uint8Array} der the original bytes, never re-encoded
+ * @property {Uint8Array} tbsBytes exact TBSCertificate slice the signature covers
+ * @property {number} version 1, 2 or 3
+ * @property {string} serialNumber hex of the INTEGER content bytes
+ * @property {boolean} serialNegative negative serials are misissuance but must still parse
+ * @property {AlgorithmId} signatureAlgorithm
+ * @property {Uint8Array} signature
+ * @property {DistinguishedName} issuer
+ * @property {DistinguishedName} subject
+ * @property {number} notBefore epoch ms
+ * @property {number} notAfter epoch ms
+ * @property {Spki} spki
+ * @property {Map<string, { critical: boolean, valueBytes: Uint8Array }>} extensions by OID
+ * @property {{ present: boolean, ca: boolean, pathLenConstraint: number | null }} basicConstraints
+ * @property {KeyUsage | null} keyUsage null when the extension is absent
+ * @property {ReadonlyArray<string> | null} extendedKeyUsage KeyPurposeId OIDs
+ * @property {SubjectAltNames} subjectAltNames
+ * @property {Uint8Array | null} subjectKeyIdentifier
+ * @property {Uint8Array | null} authorityKeyIdentifier keyIdentifier field only
+ * @property {NameConstraints | null} nameConstraints
+ * @property {ReadonlyArray<string>} unknownCriticalExtensions OIDs path.js must reject on
+ * @property {boolean} isSelfIssued subject DER equals issuer DER
+ */
+
+/**
+ * Parse one DER certificate into a frozen, fully-walked structure. Throws CertificateError
+ * (CERT_PARSE) on malformed or self-contradictory encodings; judgement about what the
+ * certificate MAY do lives in path.js.
  *
  * `tbsBytes` is the exact original slice of the TBSCertificate element — signature verification
  * happens over these bytes and never over anything re-encoded.
  *
  * @param {Uint8Array} der
+ * @returns {Certificate}
  */
 export function parseCertificate(der) {
   if (!(der instanceof Uint8Array)) {
@@ -728,7 +859,9 @@ const PEM_RE = /-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+?)-----END CERTIFIC
 
 /**
  * Extract every CERTIFICATE block from PEM text as DER. Used for user-supplied trust anchors;
- * TLS itself always delivers DER.
+ * TLS itself always delivers DER. Throws CERT_PARSE on bad base64 or when no block is found.
+ * @param {string} text
+ * @returns {Uint8Array[]}
  */
 export function decodePem(text) {
   const out = [];

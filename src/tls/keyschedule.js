@@ -23,7 +23,16 @@ const HASH_PARAMS = {
   'SHA-384': { len: 48 },
 };
 
-/** @param {string} hash */
+/**
+ * The only hashes reachable through this schedule; see the module comment for why the type
+ * refuses the rest of WebCrypto's registry.
+ * @typedef {'SHA-256' | 'SHA-384'} ScheduleHash
+ */
+
+/**
+ * @param {ScheduleHash} hash
+ * @returns {number} digest length in bytes; throws for any other hash name
+ */
 export function hashLength(hash) {
   const p = HASH_PARAMS[hash];
   if (!p) {
@@ -41,7 +50,7 @@ const zeros = (n) => new Uint8Array(n);
  * bytes produce the identical MAC. RFC 5869 defines the default salt as HashLen zeros for the
  * same reason, so the substitution below is exact, not an approximation.
  *
- * @param {string} hash
+ * @param {ScheduleHash} hash
  * @param {Uint8Array} keyBytes
  * @param {Uint8Array} data
  * @returns {Promise<Uint8Array>}
@@ -53,17 +62,24 @@ export async function hmac(hash, keyBytes, data) {
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
 }
 
-/** HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM). RFC 5869 s2.2. */
+/**
+ * HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM). RFC 5869 s2.2.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} salt
+ * @param {Uint8Array} ikm
+ * @returns {Promise<Uint8Array>}
+ */
 export async function hkdfExtract(hash, salt, ikm) {
   return hmac(hash, salt, ikm);
 }
 
 /**
  * HKDF-Expand(PRK, info, L). RFC 5869 s2.3: T(i) = HMAC(PRK, T(i-1) || info || i), i in 1..N.
- * @param {string} hash
+ * @param {ScheduleHash} hash
  * @param {Uint8Array} prk
  * @param {Uint8Array} info
  * @param {number} length
+ * @returns {Promise<Uint8Array>}
  */
 export async function hkdfExpand(hash, prk, info, length) {
   const len = hashLength(hash);
@@ -94,6 +110,7 @@ export async function hkdfExpand(hash, prk, info, length) {
  * @param {string} label label WITHOUT the "tls13 " prefix
  * @param {Uint8Array} context
  * @param {number} length
+ * @returns {Uint8Array}
  */
 export function hkdfLabel(label, context, length) {
   const full = utf8('tls13 ' + label);
@@ -112,18 +129,37 @@ export function hkdfLabel(label, context, length) {
   return concat([u16(length), u8(full.byteLength), full, u8(context.byteLength), context]);
 }
 
-/** HKDF-Expand-Label(Secret, Label, Context, Length). RFC 8446 s7.1. */
+/**
+ * HKDF-Expand-Label(Secret, Label, Context, Length). RFC 8446 s7.1.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} secret
+ * @param {string} label
+ * @param {Uint8Array} context
+ * @param {number} length
+ * @returns {Promise<Uint8Array>}
+ */
 export async function hkdfExpandLabel(hash, secret, label, context, length) {
   return hkdfExpand(hash, secret, hkdfLabel(label, context, length), length);
 }
 
-/** Derive-Secret(Secret, Label, Messages) — the transcript is passed already hashed. */
+/**
+ * Derive-Secret(Secret, Label, Messages) — the transcript is passed already hashed.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} secret
+ * @param {string} label
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<Uint8Array>}
+ */
 export async function deriveSecret(hash, secret, label, transcriptHash) {
   return hkdfExpandLabel(hash, secret, label, transcriptHash, hashLength(hash));
 }
 
 /** Hash of the empty string, used by the two "derived" steps. Cached: it is a constant. */
 const emptyHashCache = new Map();
+/**
+ * @param {ScheduleHash} hash
+ * @returns {Promise<Uint8Array>}
+ */
 export async function emptyHash(hash) {
   hashLength(hash);
   let d = emptyHashCache.get(hash);
@@ -152,24 +188,46 @@ export async function emptyHash(hash) {
 //                    (transcript: ClientHello..server Finished)
 //             +--> "res master" (transcript: ClientHello..client Finished)
 
-/** Early Secret = HKDF-Extract(salt: 0, IKM: PSK or zeros). */
+/**
+ * Early Secret = HKDF-Extract(salt: 0, IKM: PSK or zeros).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array | null} [psk]
+ * @returns {Promise<Uint8Array>}
+ */
 export async function earlySecret(hash, psk) {
   return hkdfExtract(hash, EMPTY, psk ?? zeros(hashLength(hash)));
 }
 
-/** Handshake Secret = HKDF-Extract(Derive-Secret(early, "derived", ""), ECDHE). */
+/**
+ * Handshake Secret = HKDF-Extract(Derive-Secret(early, "derived", ""), ECDHE).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} early
+ * @param {Uint8Array} ecdheShared
+ * @returns {Promise<Uint8Array>}
+ */
 export async function deriveHandshakeSecret(hash, early, ecdheShared) {
   const derived = await deriveSecret(hash, early, 'derived', await emptyHash(hash));
   return hkdfExtract(hash, derived, ecdheShared);
 }
 
-/** Master Secret = HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0). */
+/**
+ * Master Secret = HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} handshakeSecret
+ * @returns {Promise<Uint8Array>}
+ */
 export async function deriveMasterSecret(hash, handshakeSecret) {
   const derived = await deriveSecret(hash, handshakeSecret, 'derived', await emptyHash(hash));
   return hkdfExtract(hash, derived, zeros(hashLength(hash)));
 }
 
-/** {client,server}_handshake_traffic_secret. Transcript: ClientHello..ServerHello. */
+/**
+ * {client,server}_handshake_traffic_secret. Transcript: ClientHello..ServerHello.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} handshakeSecret
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<{ client: Uint8Array, server: Uint8Array }>}
+ */
 export async function handshakeTrafficSecrets(hash, handshakeSecret, transcriptHash) {
   return {
     client: await deriveSecret(hash, handshakeSecret, 'c hs traffic', transcriptHash),
@@ -177,7 +235,13 @@ export async function handshakeTrafficSecrets(hash, handshakeSecret, transcriptH
   };
 }
 
-/** {client,server}_application_traffic_secret_0 and exporter_master_secret. */
+/**
+ * {client,server}_application_traffic_secret_0 and exporter_master_secret.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} masterSecret
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<{ client: Uint8Array, server: Uint8Array, exporterMaster: Uint8Array }>}
+ */
 export async function applicationTrafficSecrets(hash, masterSecret, transcriptHash) {
   return {
     client: await deriveSecret(hash, masterSecret, 'c ap traffic', transcriptHash),
@@ -186,27 +250,57 @@ export async function applicationTrafficSecrets(hash, masterSecret, transcriptHa
   };
 }
 
-/** resumption_master_secret. Transcript: ClientHello..client Finished. */
+/**
+ * resumption_master_secret. Transcript: ClientHello..client Finished.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} masterSecret
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<Uint8Array>}
+ */
 export async function resumptionMasterSecret(hash, masterSecret, transcriptHash) {
   return deriveSecret(hash, masterSecret, 'res master', transcriptHash);
 }
 
-/** The PSK a NewSessionTicket names: HKDF-Expand-Label(res master, "resumption", nonce). */
+/**
+ * The PSK a NewSessionTicket names: HKDF-Expand-Label(res master, "resumption", nonce).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} resumptionMaster
+ * @param {Uint8Array} ticketNonce
+ * @returns {Promise<Uint8Array>}
+ */
 export async function resumptionPsk(hash, resumptionMaster, ticketNonce) {
   return hkdfExpandLabel(hash, resumptionMaster, 'resumption', ticketNonce, hashLength(hash));
 }
 
-/** finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length). RFC 8446 s4.4.4. */
+/**
+ * finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length). RFC 8446 s4.4.4.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} trafficSecret
+ * @returns {Promise<Uint8Array>}
+ */
 export async function finishedKey(hash, trafficSecret) {
   return hkdfExpandLabel(hash, trafficSecret, 'finished', EMPTY, hashLength(hash));
 }
 
-/** verify_data = HMAC(finished_key, Transcript-Hash). */
+/**
+ * verify_data = HMAC(finished_key, Transcript-Hash).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} trafficSecret
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<Uint8Array>}
+ */
 export async function finishedVerifyData(hash, trafficSecret, transcriptHash) {
   return hmac(hash, await finishedKey(hash, trafficSecret), transcriptHash);
 }
 
-/** [sender]_write_key and [sender]_write_iv from a traffic secret. RFC 8446 s7.3. */
+/**
+ * [sender]_write_key and [sender]_write_iv from a traffic secret. RFC 8446 s7.3.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} trafficSecret
+ * @param {number} keyLen
+ * @param {number} ivLen
+ * @returns {Promise<{ key: Uint8Array, iv: Uint8Array }>}
+ */
 export async function trafficKeys(hash, trafficSecret, keyLen, ivLen) {
   return {
     key: await hkdfExpandLabel(hash, trafficSecret, 'key', EMPTY, keyLen),
@@ -214,7 +308,12 @@ export async function trafficKeys(hash, trafficSecret, keyLen, ivLen) {
   };
 }
 
-/** application_traffic_secret_N+1 for KeyUpdate. RFC 8446 s7.2. */
+/**
+ * application_traffic_secret_N+1 for KeyUpdate. RFC 8446 s7.2.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} trafficSecret
+ * @returns {Promise<Uint8Array>}
+ */
 export async function nextTrafficSecret(hash, trafficSecret) {
   return hkdfExpandLabel(hash, trafficSecret, 'traffic upd', EMPTY, hashLength(hash));
 }
@@ -229,11 +328,12 @@ export async function nextTrafficSecret(hash, trafficSecret) {
  * TLS 1.2 replaced the 1.1 MD5/SHA-1 split PRF with a single suite-selected hash, which for
  * every suite in constants.js is SHA-256 or SHA-384.
  *
- * @param {string} hash
+ * @param {ScheduleHash} hash
  * @param {Uint8Array} secret
  * @param {string} label ASCII label, e.g. 'master secret'
  * @param {Uint8Array} seed
  * @param {number} length
+ * @returns {Promise<Uint8Array>}
  */
 export async function prf12(hash, secret, label, seed, length) {
   if (!Number.isInteger(length) || length < 1) {
@@ -251,7 +351,14 @@ export async function prf12(hash, secret, label, seed, length) {
   return out;
 }
 
-/** master_secret = PRF(pre_master, "master secret", client_random + server_random)[0..47]. */
+/**
+ * master_secret = PRF(pre_master, "master secret", client_random + server_random)[0..47].
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} preMaster
+ * @param {Uint8Array} clientRandom
+ * @param {Uint8Array} serverRandom
+ * @returns {Promise<Uint8Array>}
+ */
 export async function masterSecret12(hash, preMaster, clientRandom, serverRandom) {
   return prf12(hash, preMaster, 'master secret', concat([clientRandom, serverRandom]), 48);
 }
@@ -262,6 +369,10 @@ export async function masterSecret12(hash, preMaster, clientRandom, serverRandom
  * handshake and kills the triple-handshake attack. This is the variant the handshake layer
  * must offer and prefer; a server that refuses the extension still gets masterSecret12, but
  * that acceptance is deliberately flagged by the handshake layer as a weaker session.
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} preMaster
+ * @param {Uint8Array} sessionHash
+ * @returns {Promise<Uint8Array>}
  */
 export async function extendedMasterSecret12(hash, preMaster, sessionHash) {
   return prf12(hash, preMaster, 'extended master secret', sessionHash, 48);
@@ -274,11 +385,15 @@ export async function extendedMasterSecret12(hash, preMaster, sessionHash) {
  * client_write_key + server_write_key + client_write_IV + server_write_IV, where the "IV" is
  * the 4-byte implicit GCM salt of RFC 5288.
  *
- * @param {string} hash
+ * @param {ScheduleHash} hash
  * @param {Uint8Array} master
  * @param {Uint8Array} clientRandom
  * @param {Uint8Array} serverRandom
  * @param {{ keyLen: number, fixedIvLen: number, macLen?: number }} lens
+ * @returns {Promise<{ clientWriteKey: Uint8Array, serverWriteKey: Uint8Array,
+ *   clientWriteIv: Uint8Array, serverWriteIv: Uint8Array,
+ *   clientWriteMacKey?: Uint8Array, serverWriteMacKey?: Uint8Array }>} MAC keys present only
+ *   when macLen > 0, which no AEAD suite ever passes
  */
 export async function keyBlock12(hash, master, clientRandom, serverRandom, lens) {
   const { keyLen, fixedIvLen, macLen = 0 } = lens;
@@ -302,6 +417,11 @@ export async function keyBlock12(hash, master, clientRandom, serverRandom, lens)
 /**
  * verify_data = PRF(master, "client finished" | "server finished", Hash(messages))[0..11].
  * 12 bytes for every suite this package negotiates (RFC 5246 s7.4.9).
+ * @param {ScheduleHash} hash
+ * @param {Uint8Array} master
+ * @param {'client finished' | 'server finished'} label
+ * @param {Uint8Array} transcriptHash
+ * @returns {Promise<Uint8Array>}
  */
 export async function verifyData12(hash, master, label, transcriptHash) {
   if (label !== 'client finished' && label !== 'server finished') {

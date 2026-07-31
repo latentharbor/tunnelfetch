@@ -11,34 +11,78 @@
 // package, so `install()` exists, is explicit, and hands back its own undo.
 
 import { ConfigError, HttpError, TunnelFetchError, codes } from './errors.js';
-import { ByteReader, ByteWriter, concat, utf8 } from './util/bytes.js';
+import { ByteReader, ByteWriter, UnexpectedEofError, concat, utf8 } from './util/bytes.js';
 import { serializeRequestHead } from './http1/request.js';
 import { bodyFraming, readResponseBody, readResponseHead } from './http1/response.js';
 import { ACCEPT_ENCODING, decodeBody } from './client/decode.js';
 import { CookieJar } from './client/cookies.js';
 import { DEFAULT_MAX_REDIRECTS, nextRequest, shouldRedirect } from './client/redirect.js';
 import { ConnectionPool, poolKey } from './pool.js';
-import { DeadlineController } from './util/deadline.js';
+import { DeadlineController, withIdleDeadline } from './util/deadline.js';
 import { nativeFetchCanServe, openConnection, targetFromUrl } from './transport.js';
 import { parseProxy } from './proxy/index.js';
 
 /** Status codes whose Response may not carry a body, per the Response constructor. */
 const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
 
+/**
+ * A `fetch`-shaped function. Deliberately the platform's own signature: being assignable to
+ * `typeof fetch` is what lets an SDK accept this in place of the global without adapting.
+ * @typedef {(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>} FetchLike
+ */
+
+/**
+ * What a Response carries about the connection that produced it, under the non-standard
+ * `tunnelfetch` property.
+ * @typedef {object} ResponseDetail
+ * @property {string} url
+ * @property {boolean} proxied
+ * @property {string | null} proxy the proxy actually used, credentials omitted
+ * @property {import('./tls/connect.js').TlsSessionInfo | null} tls null for cleartext
+ * @property {'1.0' | '1.1'} httpVersion
+ * @property {'none' | 'content-length' | 'chunked' | 'until-close'} framing
+ */
+
+/**
+ * Limits on what a peer may make us buffer. Each is a fail-closed cap, not a hint.
+ * @typedef {object} Limits
+ * @property {number} [maxHeaderBytes] response head, default 65536
+ * @property {number} [maxProxyReplyBytes] proxy CONNECT reply head, default 32768
+ */
+
+/**
+ * @typedef {object} ClientOptions
+ * @property {import('./proxy/index.js').ConnectFn} [connect] Socket factory. Required for any
+ *   request the platform's own `fetch` cannot serve — which is every proxied request, and every
+ *   request asking for a trust policy `fetch` cannot express.
+ * @property {string | import('./proxy/index.js').ProxyConfig | null} [proxy] URL string or
+ *   config object; `http:`, `https:`, `socks5:` and `socks5h:`.
+ * @property {import('./trust/index.js').TrustConfig} [trust] certificate policy, httpx's
+ *   `verify=`. Default `{ mode: 'system' }`.
+ * @property {import('./tls/connect.js').TlsOptions} [tls] handshake knobs.
+ * @property {import('./util/deadline.js').DeadlineOptions} [timeouts] connect / handshake /
+ *   headers / idle / total, in ms. The idle gap is the control; total is a backstop.
+ * @property {boolean} [cookies] enable a per-Client cookie jar.
+ * @property {import('./client/cookies.js').CookieJar} [jar] supply a jar directly, e.g. to share
+ *   one across Clients or to persist it.
+ * @property {number} [maxRedirects] default 20.
+ * @property {number} [maxBodyBytes] enforced from Content-Length before a byte is read.
+ * @property {boolean} [decompress] gzip/deflate. Default true. Never `br`; the runtime cannot
+ *   decompress it, so it is never advertised either.
+ * @property {boolean} [keepAlive] default true.
+ * @property {boolean} [forceTunnel] never delegate to the platform's fetch, even when it could
+ *   serve the request. Mainly for exercising this stack against origins that do not need it.
+ * @property {FetchLike} [nativeFetch] delegation target; defaults to `globalThis.fetch`.
+ * @property {{ maxPerKey?: number, maxTotal?: number }} [pool] connection pool sizing.
+ * @property {Limits} [limits]
+ * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness and key generation.
+ * @property {AbortSignal} [signal] aborts every request this Client makes.
+ * @property {number} [now] epoch ms override, for certificate validity in tests.
+ */
+
 export class Client {
   /**
-   * @param {object} [options]
-   * @param {import('./proxy/index.js').ConnectFn} [options.connect] socket factory; required for
-   *   anything the platform's fetch cannot serve
-   * @param {string|object|null} [options.proxy]
-   * @param {object} [options.trust] httpx-style `verify=`: {mode:'system'|'anchors'|'pinned'|'none'|'custom'}
-   * @param {object} [options.tls] handshake options
-   * @param {object} [options.timeouts] connect/handshake/headers/idle/total, in ms
-   * @param {boolean} [options.cookies] enable a per-Client cookie jar
-   * @param {number} [options.maxRedirects]
-   * @param {number} [options.maxBodyBytes]
-   * @param {boolean} [options.forceTunnel] never delegate to the platform fetch
-   * @param {typeof globalThis.fetch} [options.nativeFetch]
+   * @param {ClientOptions} [options]
    */
   constructor(options = {}) {
     this.options = { ...options };
@@ -49,6 +93,11 @@ export class Client {
     this.fetch = this.fetch.bind(this);
   }
 
+  /**
+   * @param {RequestInfo | URL} input
+   * @param {RequestInit} [init]
+   * @returns {Promise<Response & { tunnelfetch?: ResponseDetail }>}
+   */
   async fetch(input, init) {
     if (this._closed) {
       throw new TunnelFetchError(codes.POOL_CLOSED, 'this Client has been closed');
@@ -66,6 +115,9 @@ export class Client {
 /**
  * A standalone fetch bound to a configuration, matching httpx's module-level helpers. Creates and
  * closes a Client per call, so no connection is reused; use `new Client()` when reuse matters.
+ *
+ * @param {ClientOptions} [options]
+ * @returns {FetchLike}
  */
 export function createFetch(options = {}) {
   return async function tunnelFetch(input, init) {
@@ -81,6 +133,9 @@ export function createFetch(options = {}) {
 /**
  * Replace `globalThis.fetch`, for libraries that only accept the global. Returns the undo.
  * Never called automatically, and never on import.
+ *
+ * @param {ClientOptions} [options]
+ * @returns {() => void} uninstall; idempotent, and a no-op if someone else has since taken the global
  */
 export function install(options = {}) {
   const previous = globalThis.fetch;
@@ -133,11 +188,14 @@ async function performFetch(client, input, init) {
       return finish(response, current.url, history.length > 0);
     }
 
+    // nextRequest owns `history`: it appends this hop's key (for loop detection) and reads the
+    // array's length as the hop budget. Pushing here as well would count every hop twice and halve
+    // the effective maxRedirects — the `redirected` flag below reads the same array and stays
+    // correct because nextRequest appends exactly one entry per redirect followed.
     const next = nextRequest(current, response, { maxRedirects, history });
     // The previous body must be drained (or discarded) before the socket can be reused, and the
     // caller will never read a redirect's body.
     await response.body?.cancel?.().catch(() => {});
-    history.push({ method: current.method, url: current.url.href });
     current = next;
   }
 }
@@ -215,6 +273,28 @@ async function exchange(client, current, { hop }) {
   }
 }
 
+/**
+ * Does this failure prove the peer never saw the request? Only then may it be re-sent.
+ *
+ * The single provable case is a connection that ended having produced no response byte at all,
+ * which is exactly what an idle keep-alive socket the peer had already closed looks like. It
+ * surfaces two ways depending on how the peer hung up: a clean close_notify drains the record
+ * layer and the head reader hits EOF with nothing buffered, while a bare TCP close makes the
+ * record layer refuse the truncation itself. Both report `got: 0`.
+ *
+ * Everything else must fall through and be reported, a timeout above all: a request that timed out
+ * may be executing on the server at this moment, so re-sending it would apply a non-idempotent
+ * operation twice — precisely the ambiguous state this package refuses to continue in. Partial
+ * bytes disqualify too, because a peer that had begun answering had the request.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function serverNeverSawIt(err) {
+  if (err instanceof UnexpectedEofError) return err.detail?.got === 0;
+  return err instanceof TunnelFetchError && err.code === codes.TLS_TRUNCATED && err.detail?.got === 0;
+}
+
 async function sendAndReceive(client, conn, current, { key, deadlines, reused }) {
   const o = client.options;
   const target = targetFromUrl(current.url);
@@ -243,10 +323,10 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
       readResponseHead(reader, { maxHeaderBytes: o.limits?.maxHeaderBytes }),
     );
   } catch (err) {
-    // A reused connection the server had already closed looks exactly like a truncated response.
-    // Retrying once on a fresh connection is the standard remedy and is safe here because the
-    // request has not been answered.
-    if (reused) {
+    // A reused connection the server had already reaped looks exactly like a truncated response,
+    // and re-sending on a fresh connection is the standard remedy. It is only safe, though, when
+    // the failure proves the server never saw the request — see serverNeverSawIt().
+    if (reused && serverNeverSawIt(err)) {
       await client.pool.discard(conn);
       deadlines.endPhase();
       const fresh = await openConnection({
@@ -291,8 +371,13 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
     },
   );
 
+  // The idle deadline wraps the RAW body, before any content decoding. Wrapping the decoded
+  // stream instead would judge liveness by decompressed output, and a decompressor legitimately
+  // consumes input for a while before producing any — so a healthy stream would look stalled.
+  // What "still alive" means is bytes arriving from the peer, which is exactly this stream.
   deadlines.beginIdle();
-  const decoded = decodeResponseBody(raw, headInfo.headers, deadlines, o);
+  const guarded = framing.kind === 'none' ? raw : withIdleDeadline(raw, deadlines);
+  const decoded = decodeResponseBody(guarded, headInfo.headers, o);
   return buildResponse(headInfo, decoded, framing, conn);
 }
 
@@ -306,11 +391,11 @@ function wantsKeepAlive(headInfo) {
   return true;
 }
 
-function decodeResponseBody(raw, headers, deadlines, options) {
-  if (options.decompress === false) return raw;
+function decodeResponseBody(body, headers, options) {
+  if (options.decompress === false) return body;
   const encoding = headers.get('content-encoding');
-  if (!encoding) return raw;
-  return decodeBody(raw, encoding);
+  if (!encoding) return body;
+  return decodeBody(body, encoding);
 }
 
 function buildResponse(headInfo, body, framing, conn) {
@@ -366,9 +451,18 @@ function buildHeaders(client, current, target) {
   }
   headers.set('connection', client.options.keepAlive === false ? 'close' : 'keep-alive');
 
-  // Content-Length must describe exactly what we are about to write.
+  // Framing is the client's to declare, never the caller's. The body is always buffered whole by
+  // performFetch, so every request this client sends is Content-Length-framed and never chunked.
+  // A caller-supplied Transfer-Encoding is therefore always a lie (we do not chunk the body), and
+  // a caller-supplied Content-Length is at best redundant and at worst a smuggling vector: emitting
+  // Content-Length AND Transfer-Encoding together is the exact ambiguity bodyFraming() refuses on
+  // the response side (RFC 9112 §6.1: a sender MUST NOT send Content-Length with Transfer-Encoding),
+  // and a Content-Length that does not match the bytes written (e.g. one left on a bodyless GET)
+  // desynchronises the very next message. Drop both, then state the one truth.
+  headers.delete('transfer-encoding');
   if (current.body) headers.set('content-length', String(current.body.byteLength));
   else if (['POST', 'PUT', 'PATCH'].includes(current.method)) headers.set('content-length', '0');
+  else headers.delete('content-length');
 
   const ordered = [['host', hostValue]];
   for (const [k, v] of headers) {

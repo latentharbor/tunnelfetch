@@ -8,23 +8,44 @@
     "node": ">=20"
   },
   "exports": {
-    ".": "./src/index.js",
-    "./proxy": "./src/proxy/index.js",
-    "./http1": "./src/http1/index.js",
-    "./tls": "./src/tls/index.js",
-    "./trust": "./src/trust/index.js",
-    "./roots": "./src/trust/roots.js"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./proxy": {
+      "types": "./types/proxy/index.d.ts",
+      "default": "./src/proxy/index.js"
+    },
+    "./http1": {
+      "types": "./types/http1/index.d.ts",
+      "default": "./src/http1/index.js"
+    },
+    "./tls": {
+      "types": "./types/tls/index.d.ts",
+      "default": "./src/tls/index.js"
+    },
+    "./trust": {
+      "types": "./types/trust/index.d.ts",
+      "default": "./src/trust/index.js"
+    },
+    "./roots": {
+      "types": "./types/trust/roots.d.ts",
+      "default": "./src/trust/roots.js"
+    }
   },
   "files": [
     "src",
+    "types",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "sideEffects": false,
   "scripts": {
     "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
     "test:live": "node --test --test-reporter=spec \"test/live/**/*.live.js\"",
-    "roots:refresh": "node scripts/refresh-roots.mjs"
+    "roots:refresh": "node scripts/refresh-roots.mjs",
+    "types": "tsc -p tsconfig.json"
   },
   "keywords": [
     "fetch",
@@ -35,5 +56,9 @@
     "cloudflare-workers",
     "workerd",
     "edge"
-  ]
+  ],
+  "types": "./types/index.d.ts",
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
 }

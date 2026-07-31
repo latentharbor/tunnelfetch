@@ -1,0 +1,29 @@
+{
+  "//": [
+    "Declaration generation only. The package is authored in JavaScript with JSDoc and ships that",
+    "JavaScript unchanged — TypeScript is never in a consumer's path, and `types/` is checked in so",
+    "nobody has to run this. It exists so a TypeScript caller gets real types instead of `any`,",
+    "and so that a mistake like asking for `mode: 'pinned'` without pins is a compile error rather",
+    "than a runtime one discovered in production.",
+    "",
+    "checkJs is off deliberately: this step must always be able to emit. Correctness of the output",
+    "is guarded by test/types.test.js, which regenerates and compares against what is committed —",
+    "otherwise the declarations would drift out of date silently, which is the same failure mode as",
+    "a stale root store."
+  ],
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2022", "dom"],
+    "skipLibCheck": true,
+    "strict": true,
+    "outDir": "types",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.js"]
+}

@@ -111,17 +111,74 @@ function expectServerHello(msg, offers12) {
 }
 
 /**
+ * A byte duplex: what every layer in this package consumes and produces.
+ * @typedef {{ readable: ReadableStream<Uint8Array>,
+ *             writable: WritableStream<Uint8Array> }} ByteDuplex
+ */
+
+/**
+ * Handshake knobs. Every one of these narrows what is offered; none can widen it beyond what
+ * `constants.js` permits, so no option here can talk the client into a suite it refuses.
+ *
+ * @typedef {object} TlsOptions
+ * @property {number[]} [versions] versions to offer, from `TLS13` / `TLS12`. Default both.
+ * @property {string[]} [alpn] ALPN protocols to offer. Default `['http/1.1']`.
+ * @property {number[]} [groups] supported_groups, in preference order.
+ * @property {number[]} [offerGroups] groups to send an actual key_share for. Default the first
+ *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
+ * @property {number[]} [ciphers] cipher suites to offer, in preference order.
+ * @property {Uint8Array} [clientRandom] fixed ClientHello.random, for reproducible handshakes.
+ * @property {Uint8Array} [legacySessionId] fixed legacy_session_id, likewise.
+ * @property {boolean} [compatibilityCcs] send the middlebox-compatibility ChangeCipherSpec.
+ *   Default true.
+ * @property {number} [maxHandshakeMessage] per-message cap; certificate chains dominate sizing.
+ * @property {number} [maxKeyUpdates] received KeyUpdates tolerated before it is called a flood.
+ * @property {number} [maxTranscriptBytes] cap on buffered handshake transcript.
+ */
+
+/**
+ * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
+ * is what allows a recorded session to be replayed in an offline test.
+ * @typedef {object} TlsDeps
+ * @property {(n: number) => Uint8Array} [randomBytes]
+ * @property {(algorithm: object, group: number) => Promise<CryptoKeyPair>} [generateKeyPair]
+ */
+
+/**
+ * What a completed handshake reports about itself.
+ * @typedef {object} TlsSessionInfo
+ * @property {number} version negotiated version, `0x0304` or `0x0303`
+ * @property {number} cipherSuite negotiated suite
+ * @property {number} group negotiated key-exchange group
+ * @property {string | null} alpnProtocol
+ * @property {string} hostname the identity the certificate was required to prove
+ * @property {boolean} [extendedMasterSecret] TLS 1.2 only: whether RFC 7627 was in effect
+ */
+
+/**
+ * A live TLS session: a plaintext duplex plus what was negotiated to get it.
+ * @typedef {object} TlsSession
+ * @property {ReadableStream<Uint8Array>} readable
+ * @property {WritableStream<Uint8Array>} writable
+ * @property {import('./record.js').RecordLayer} record
+ * @property {object} peer whatever `verifyPeer` resolved with: the validated leaf
+ * @property {TlsSessionInfo} info
+ * @property {() => Promise<void>} close
+ */
+
+/**
  * Run a TLS handshake over a byte duplex, negotiating the version, and return the plaintext
  * duplex above it. The default offer is [TLS 1.3, TLS 1.2]; `options.versions` narrows it.
  *
  * @param {object} args
- * @param {{readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array>}} args.transport
+ * @param {ByteDuplex} args.transport
  * @param {string} args.hostname the identity the certificate must prove, and the SNI sent
  * @param {(chain: Uint8Array[], hostname: string) => Promise<{spki: {spkiDer: Uint8Array}}>} args.verifyPeer
  *   Must throw to reject. Resolves with the validated leaf; its SPKI is the only key either
  *   driver will accept a handshake signature from.
- * @param {object} [args.options] driver options, plus `versions: number[]` to narrow the offer
- * @param {{randomBytes?: (n:number)=>Uint8Array, generateKeyPair?: Function}} [args.deps]
+ * @param {TlsOptions} [args.options]
+ * @param {TlsDeps} [args.deps]
+ * @returns {Promise<TlsSession>}
  */
 export async function connectTls({ transport, hostname, verifyPeer, options = {}, deps = {} }) {
   if (typeof verifyPeer !== 'function') {

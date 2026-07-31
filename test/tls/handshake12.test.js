@@ -10,7 +10,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as nodeSign } from 'node:crypto';
 
-import { handshakeTls12, ecdsaDerToRaw } from '../../src/tls/handshake12.js';
+import { handshakeTls12 } from '../../src/tls/handshake12.js';
+import { ecdsaDerToRaw as derToRaw } from '../../src/trust/der.js';
 import { connectTls } from '../../src/tls/connect.js';
 import { parseServerHello, verifyHandshakeSignature } from '../../src/tls/handshake-messages.js';
 import {
@@ -25,7 +26,7 @@ import {
   TLS13,
 } from '../../src/tls/constants.js';
 import { Builder } from '../../src/tls/wire.js';
-import { CertificateError, codes } from '../../src/errors.js';
+import { CertificateError, TlsError, codes } from '../../src/errors.js';
 import { concat, toHex, utf8 } from '../../src/util/bytes.js';
 import { collect, duplexPair, rejectsWithCode } from '../_harness.js';
 import { makeEcdhe, serverIdentity, startServer12 } from './_server12.js';
@@ -381,6 +382,16 @@ test('connectTls with versions [TLS12] is byte-for-byte this driver', async () =
 });
 
 // ================================================================ the DER signature bridge
+//
+// These vectors deliberately drive src/trust/der.js — the single implementation the handshake
+// path reaches through verifyHandshakeSignature. handshake12.js used to export a byte-identical
+// copy purely so this file could import it; that second implementation is exactly how the
+// signature got converted twice once before, so it is gone and the vectors point at the original.
+const ecdsaDerToRaw = (sig, orderLen) =>
+  derToRaw(sig, orderLen, (why) =>
+    new TlsError(codes.TLS_HANDSHAKE, `malformed DER ECDSA signature: ${why}`, {
+      length: sig.byteLength,
+    }));
 
 test('ecdsaDerToRaw: fixed vectors, sign-byte stripping, and a WebCrypto round trip', async () => {
   // Minimal hand-built Ecdsa-Sig-Value: r=1, s=2.

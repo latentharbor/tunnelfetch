@@ -247,16 +247,33 @@ test('package.json ships src/ and nothing that leaks the development rig', async
   assert.ok(pkg.files.includes('src'));
   assert.ok(!pkg.files.includes('probe'), 'the probe is a development rig, not part of the package');
   assert.ok(!pkg.files.includes('test'));
-  for (const [name, target] of Object.entries(pkg.exports)) {
-    assert.ok(target.startsWith('./src/'), `export "${name}" must point into src/, got ${target}`);
+  for (const [name, conditions] of Object.entries(pkg.exports)) {
+    const runtime = typeof conditions === 'string' ? conditions : conditions.default;
+    const types = typeof conditions === 'string' ? null : conditions.types;
+    assert.ok(runtime?.startsWith('./src/'), `export "${name}" must run from src/, got ${runtime}`);
+
     // A subpath export naming a file that does not exist fails only for the consumer who tries
     // it, which is the worst place to find out; `npm pack` will happily ship the broken map.
-    const resolved = join(root, target.slice(2));
-    const mod = await import(pathToFileURL(resolved).href);
+    const mod = await import(pathToFileURL(join(root, runtime.slice(2))).href);
     assert.ok(
       Object.keys(mod).length > 0,
-      `export "${name}" resolves to ${target} but exports nothing`,
+      `export "${name}" resolves to ${runtime} but exports nothing`,
     );
+
+    if (types !== null) {
+      assert.ok(types.startsWith('./types/'), `export "${name}" types must be in types/`);
+      // `types` must come before `default` in the object: Node and TypeScript both resolve
+      // conditions in declaration order, and a `default` listed first wins for everyone.
+      assert.equal(
+        Object.keys(conditions)[0],
+        'types',
+        `export "${name}" must list the "types" condition before "default"`,
+      );
+      await assert.doesNotReject(
+        () => readFile(join(root, types.slice(2)), 'utf8'),
+        `export "${name}" points at ${types}, which does not exist — run \`npm run types\``,
+      );
+    }
   }
 });
 

@@ -5,10 +5,19 @@
 // (TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256) under TLS 1.2, not implemented" is actionable.
 // Every throw site therefore carries the concrete value the peer asked for, in `detail`.
 
+/**
+ * One of the stable machine-readable codes in {@link codes}. Exported as a named union so a
+ * caller can exhaustively switch on `err.code` and have the compiler point at the case they
+ * forgot when a release adds one.
+ * @typedef {(typeof codes)[keyof typeof codes]} ErrorCode
+ */
+
 /** Base for everything this package throws. Never thrown directly. */
 export class TunnelFetchError extends Error {
   /**
-   * @param {string} code stable machine-readable code
+   * @param {string} code stable machine-readable code, normally an {@link ErrorCode}. Typed as
+   *   string because one internal code (`UNEXPECTED_EOF`, from the byte layer) deliberately
+   *   lives outside the public table.
    * @param {string} message human-readable, must name concrete values
    * @param {Record<string, unknown>} [detail]
    */
@@ -119,7 +128,15 @@ export const codes = /** @type {const} */ ({
   CONFIG_INVALID: 'CONFIG_INVALID',
 });
 
-/** Format a byte as 0xNN, for error messages that must name a concrete wire value. */
+/**
+ * Format a byte as 0xNN, for error messages that must name a concrete wire value.
+ * @param {number} n
+ * @returns {string}
+ */
 export const hex8 = (n) => `0x${(n & 0xff).toString(16).padStart(2, '0')}`;
-/** Format a 16-bit wire value as 0xNNNN (cipher suites, groups, signature schemes). */
+/**
+ * Format a 16-bit wire value as 0xNNNN (cipher suites, groups, signature schemes).
+ * @param {number} n
+ * @returns {string}
+ */
 export const hex16 = (n) => `0x${(n & 0xffff).toString(16).padStart(4, '0')}`;

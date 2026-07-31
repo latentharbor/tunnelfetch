@@ -19,6 +19,7 @@ export const DEFAULT_MAX_REDIRECTS = 20;
  * @param {number} status
  * @param {string} [method] accepted for API symmetry; the status alone decides, because even a
  *   combination we will rewrite (303 + POST) is still a redirect — it just mutates the method.
+ * @returns {boolean}
  */
 export function shouldRedirect(status, method) { // eslint-disable-line no-unused-vars
   return REDIRECT_STATUSES.has(status);
@@ -76,8 +77,10 @@ function encodeLocationOctets(location) {
 
 /**
  * Resolve a Location header against the current URL, enforcing the scheme allow-list.
+ * Throws HttpError for a missing/unparseable Location or a non-http(s) scheme.
  * @param {URL} currentUrl
  * @param {string|null|undefined} location
+ * @returns {URL}
  */
 export function resolveLocation(currentUrl, location) {
   if (location === null || location === undefined || location.trim() === '') {
@@ -120,14 +123,43 @@ const BODY_HEADERS = ['content-length', 'content-type', 'content-encoding', 'tra
 const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
 
 /**
- * Compute the follow-up request for a redirect response.
+ * A request as the redirect engine consumes it. Bodies stay in whatever form the caller holds
+ * them; this layer only decides whether they survive the hop, never reads them.
+ * @typedef {Uint8Array | string | ReadableStream<Uint8Array> | null} RedirectBody
+ * @typedef {object} RedirectableRequest
+ * @property {string} method
+ * @property {string | URL} url
+ * @property {Headers | Record<string, string>} [headers]
+ * @property {RedirectBody} [body]
+ */
+
+/**
+ * The follow-up request. `url` and `headers` are always normalised instances; `body` is the
+ * caller's own value passed through, or null when the method rewrite dropped it.
+ * @typedef {object} NextRequest
+ * @property {string} method
+ * @property {URL} url
+ * @property {Headers} headers credential and body-describing headers already stripped per the
+ *   rules above
+ * @property {RedirectBody} body
+ */
+
+/**
+ * @typedef {object} NextRequestOptions
+ * @property {number} [maxRedirects] default 20
+ * @property {string[]} [history] pass the SAME array across every hop of one logical fetch; it
+ *   is both the loop detector and the hop counter
+ */
+
+/**
+ * Compute the follow-up request for a redirect response. Throws rather than returning a
+ * failure: LimitError past `maxRedirects`, HttpError for loops and bad Locations, ConfigError
+ * for a non-redirect status or an unreplayable stream body on 307/308.
  *
- * @param {{ method: string, url: string|URL, headers?: Headers|Record<string,string>,
- *           body?: Uint8Array|string|ReadableStream|null }} current
+ * @param {RedirectableRequest} current
  * @param {{ status: number, headers: Headers|Record<string,string> }} response
- * @param {{ maxRedirects?: number, history?: string[] }} [options] pass the SAME `history` array
- *   across every hop of one logical fetch; it is both the loop detector and the hop counter.
- * @returns {{ method: string, url: URL, headers: Headers, body: any }}
+ * @param {NextRequestOptions} [options]
+ * @returns {NextRequest}
  */
 export function nextRequest(current, response, options = {}) {
   const { maxRedirects = DEFAULT_MAX_REDIRECTS, history = [] } = options;

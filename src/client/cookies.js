@@ -22,6 +22,7 @@
  * category wins — a time (hh:mm:ss), a day (1-2 digits), a month (3-letter name), and a year
  * (2-4 digits). Each token may carry trailing non-digit junk after the match.
  *
+ * @param {string} s
  * @returns {number|null} epoch milliseconds UTC, or null if the string is not a cookie date.
  */
 export function parseCookieDate(s) {
@@ -77,14 +78,23 @@ export function parseCookieDate(s) {
   return ms;
 }
 
-/** RFC 6265 s5.1.4: the default path is the request path up to (not including) its last '/'. */
+/**
+ * RFC 6265 s5.1.4: the default path is the request path up to (not including) its last '/'.
+ * @param {string} requestPath
+ * @returns {string}
+ */
 export function defaultPath(requestPath) {
   if (!requestPath || requestPath[0] !== '/') return '/';
   const cut = requestPath.lastIndexOf('/');
   return cut === 0 ? '/' : requestPath.slice(0, cut);
 }
 
-/** RFC 6265 s5.1.4 path-match. */
+/**
+ * RFC 6265 s5.1.4 path-match.
+ * @param {string} requestPath
+ * @param {string} cookiePath
+ * @returns {boolean}
+ */
 export function pathMatches(requestPath, cookiePath) {
   if (requestPath === cookiePath) return true;
   if (!requestPath.startsWith(cookiePath)) return false;
@@ -92,7 +102,12 @@ export function pathMatches(requestPath, cookiePath) {
   return cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/';
 }
 
-/** RFC 6265 s5.1.3 domain-match: exact, or host ends with '.' + domain. */
+/**
+ * RFC 6265 s5.1.3 domain-match: exact, or host ends with '.' + domain.
+ * @param {string} host
+ * @param {string} cookieDomain
+ * @returns {boolean}
+ */
 export function domainMatches(host, cookieDomain) {
   if (host === cookieDomain) return true;
   return host.endsWith('.' + cookieDomain);
@@ -104,18 +119,43 @@ const looksLikeIp = (host) =>
 
 let seqCounter = 0; // creation-order tiebreak; the injected clock may legally stand still
 
+/**
+ * A stored cookie, as entries() exposes it. Records are live jar state, not copies.
+ * @typedef {object} Cookie
+ * @property {string} name
+ * @property {string} value quotes already stripped
+ * @property {string} domain lowercased; the Domain attribute, or the request host
+ * @property {boolean} hostOnly true when no Domain attribute applied — exact-host match only
+ * @property {string} path
+ * @property {boolean} secure
+ * @property {boolean} httpOnly
+ * @property {string | null} sameSite lowercased attribute value, stored verbatim — servers send
+ *   values outside strict/lax/none and this jar does not enforce SameSite anyway
+ * @property {number} expiry epoch ms; Infinity for a session cookie
+ * @property {number} creation epoch ms from the injected clock, kept across overwrites (s5.3)
+ * @property {number} seq creation-order tiebreak for the frozen-clock runtime
+ */
+
+/**
+ * @typedef {object} CookieJarOptions
+ * @property {() => number} [now] injectable clock returning epoch ms. On the target runtime
+ *   Date.now() freezes for a whole execution slice, so expiry must be testable via this knob.
+ * @property {number} [maxCookies] global cap, default 3000
+ * @property {number} [maxPerDomain] per-domain cap, default 50
+ */
+
 export class CookieJar {
   /**
-   * @param {{ now?: () => number, maxCookies?: number, maxPerDomain?: number }} [options]
-   *   `now` is the injectable clock (epoch ms). The caps exist because this jar lives inside
-   *   a long-lived Worker isolate: an unbounded jar fed by a hostile or merely enthusiastic
-   *   server is a slow memory leak, so overflow evicts the oldest cookies instead of growing.
+   * @param {CookieJarOptions} [options]
+   *   The caps exist because this jar lives inside a long-lived Worker isolate: an unbounded
+   *   jar fed by a hostile or merely enthusiastic server is a slow memory leak, so overflow
+   *   evicts the oldest cookies instead of growing.
    */
   constructor({ now = () => Date.now(), maxCookies = 3000, maxPerDomain = 50 } = {}) {
     this._now = now;
     this._maxCookies = maxCookies;
     this._maxPerDomain = maxPerDomain;
-    /** @type {Map<string, object>} key "domain|path|name" -> cookie record */
+    /** @type {Map<string, Cookie>} key "domain|path|name" -> cookie record */
     this._cookies = new Map();
     this._rejected = 0;
   }
@@ -130,9 +170,11 @@ export class CookieJar {
   }
 
   /**
-   * Ingest the Set-Cookie values of one response.
+   * Ingest the Set-Cookie values of one response. Never throws on a bad cookie — rejection is
+   * silent per RFC 6265, counted in `rejected`.
    * @param {string|URL} url the request URL the response belongs to
    * @param {string[]} setCookieValues one array entry per Set-Cookie header
+   * @returns {void}
    */
   setFromResponse(url, setCookieValues) {
     const u = url instanceof URL ? url : new URL(url);
@@ -143,7 +185,13 @@ export class CookieJar {
     }
   }
 
-  /** @returns {boolean} stored or deliberately deleted (true) vs ignored (false) */
+  /**
+   * @param {string} host
+   * @param {boolean} requestSecure
+   * @param {string} requestPath
+   * @param {string} setCookie
+   * @returns {boolean} stored or deliberately deleted (true) vs ignored (false)
+   */
   _setOne(host, requestSecure, requestPath, setCookie) {
     if (typeof setCookie !== 'string') return false;
     const semi = setCookie.indexOf(';');
@@ -281,7 +329,10 @@ export class CookieJar {
     return true;
   }
 
-  /** Evict expired cookies first, then the oldest by creation, per-domain then globally. */
+  /**
+   * Evict expired cookies first, then the oldest by creation, per-domain then globally.
+   * @param {string} domain
+   */
   _enforceCaps(domain) {
     const now = this._now();
     for (const [k, c] of this._cookies) if (c.expiry <= now) this._cookies.delete(k);
@@ -306,6 +357,7 @@ export class CookieJar {
   /**
    * The Cookie header value for a request, or null if no cookie matches.
    * @param {string|URL} url
+   * @returns {string | null}
    */
   headerFor(url) {
     const u = url instanceof URL ? url : new URL(url);
@@ -334,7 +386,10 @@ export class CookieJar {
     return matched.map((c) => `${c.name}=${c.value}`).join('; ');
   }
 
-  /** Everything currently stored, for tests and debugging. Records are live; do not mutate. */
+  /**
+   * Everything currently stored, for tests and debugging. Records are live; do not mutate.
+   * @returns {Cookie[]}
+   */
   entries() {
     return [...this._cookies.values()];
   }

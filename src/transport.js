@@ -22,8 +22,19 @@ import { DeadlineController } from './util/deadline.js';
 const DEFAULT_PORT = { 'http:': 80, 'https:': 443 };
 
 /**
- * Split a request URL into what the transport needs.
+ * A request URL reduced to what the transport dials.
+ * @typedef {object} TransportTarget
+ * @property {URL} url
+ * @property {string} hostname IPv6 unbracketed, as the socket API and SOCKS5 want it
+ * @property {number} port explicit port, or the scheme default
+ * @property {boolean} secure whether the scheme is https:
+ */
+
+/**
+ * Split a request URL into what the transport needs. Throws ConfigError on any scheme other
+ * than http: and https:.
  * @param {string | URL} input
+ * @returns {TransportTarget}
  */
 export function targetFromUrl(input) {
   const url = input instanceof URL ? input : new URL(String(input));
@@ -41,17 +52,53 @@ export function targetFromUrl(input) {
 }
 
 /**
- * Open a connection carrying application bytes for `url`.
+ * What a Response's `tunnelfetch` detail reports about the connection, before the HTTP layer
+ * adds the per-response httpVersion and framing.
+ * @typedef {object} ConnectionInfo
+ * @property {string} url
+ * @property {boolean} proxied
+ * @property {string | null} proxy the proxy actually used, credentials omitted
+ * @property {import('./tls/connect.js').TlsSessionInfo | null} tls null for cleartext
+ */
+
+/**
+ * A live connection carrying application bytes: the duplex, its provenance, and the deadline
+ * controller that governs it. This is what the pool stores and what sendAndReceive consumes.
+ * @typedef {object} Connection
+ * @property {ReadableStream<Uint8Array>} readable
+ * @property {WritableStream<Uint8Array>} writable
+ * @property {() => Promise<void> | void} close
+ * @property {ConnectionInfo} info
+ * @property {import('./trust/index.js').ParsedCertificate | null} [peerCertificate] TLS only;
+ *   null when trust mode 'none' accepted a leaf it could not parse
+ * @property {DeadlineController} deadlines
+ * @property {boolean} ownsDeadlines whether this call created the controller (and must dispose
+ *   it) rather than borrowing the caller's
+ */
+
+/**
+ * @typedef {object} OpenConnectionOptions
+ * @property {string | URL} url
+ * @property {import('./proxy/index.js').ConnectFn} connect injected socket factory
+ * @property {string | import('./proxy/index.js').ProxyConfig | null} [proxy]
+ * @property {import('./trust/index.js').TrustConfig} [trust] the `verify=`-style knob, passed
+ *   through to the trust layer
+ * @property {DeadlineController} [deadlines] borrow the request's controller; omitting it makes
+ *   this call own (and dispose) a fresh one
+ * @property {import('./tls/connect.js').TlsOptions} [tls] handshake options
+ * @property {import('./tls/connect.js').TlsDeps} [deps] injectable randomness/keygen for
+ *   reproducible handshakes
+ * @property {AbortSignal} [signal]
+ * @property {{ maxProxyReplyBytes?: number }} [limits] cap on the proxy CONNECT reply head
+ * @property {number} [now] epoch ms override for certificate validity
+ */
+
+/**
+ * Open a connection carrying application bytes for `url`. Throws (ProxyError, TlsError,
+ * CertificateError, TimeoutError, ConfigError) rather than resolving with a failure value.
  *
- * @param {object} args
- * @param {string|URL} args.url
- * @param {import('./proxy/index.js').ConnectFn} args.connect injected socket factory
- * @param {string|object|null} [args.proxy]
- * @param {object} [args.trust] the `verify=`-style knob, passed through to the trust layer
- * @param {DeadlineController} [args.deadlines]
- * @param {object} [args.tls] handshake options (alpn, groups, ciphers, ...)
- * @param {object} [args.deps] injectable randomness/keygen for reproducible handshakes
- * @param {AbortSignal} [args.signal]
+ * @param {OpenConnectionOptions} args
+ * @returns {Promise<Connection>}
  */
 export async function openConnection({
   url,
@@ -158,6 +205,20 @@ async function safeClose(duplex) {
 }
 
 /**
+ * The delegation decision, with the disqualifying reason spelled out so a caller's error can
+ * quote it. Discriminated on `ok` so `reason` is a string exactly when there is one.
+ * @typedef {{ ok: true, reason: null } | { ok: false, reason: string }} NativeFetchVerdict
+ */
+
+/**
+ * @typedef {object} NativeFetchQuery
+ * @property {import('./proxy/index.js').ProxyConfig | string | null} [proxy]
+ * @property {import('./trust/index.js').TrustConfig | null} [trust]
+ * @property {import('./tls/connect.js').TlsOptions | null} [tls]
+ * @property {boolean} [forceTunnel]
+ */
+
+/**
  * Can the platform's own fetch() satisfy this request in full?
  *
  * Delegating to the native implementation when it can is strictly better — it is faster, does not
@@ -166,6 +227,9 @@ async function safeClose(duplex) {
  * quietly satisfying a request that asked for a pinned certificate by handing it to an
  * implementation using a different trust store would answer a security question the caller did
  * not ask. So anything the native path cannot honour disqualifies it.
+ *
+ * @param {NativeFetchQuery} query
+ * @returns {NativeFetchVerdict}
  */
 export function nativeFetchCanServe({ proxy, trust, tls, forceTunnel }) {
   if (forceTunnel) return { ok: false, reason: 'forceTunnel was requested' };

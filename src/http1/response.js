@@ -127,20 +127,47 @@ async function readOneHead(reader, budget) {
 }
 
 /**
+ * One skipped 1xx head. Kept because Early Hints (103) carry Link headers a caller may want;
+ * everything else about a 1xx is noise by definition.
+ * @typedef {object} InformationalHead
+ * @property {'1.0' | '1.1'} httpVersion
+ * @property {number} status
+ * @property {string} statusText
+ * @property {Headers} headers
+ */
+
+/**
+ * The parsed response head. `setCookie` repeats the raw Set-Cookie values because the Headers
+ * class folds duplicates with ", ", which destroys cookie dates — no jar can be built from the
+ * folded form.
+ * @typedef {object} ResponseHead
+ * @property {'1.0' | '1.1'} httpVersion only versions the status-line grammar admits
+ * @property {number} status
+ * @property {string} statusText may be empty; `HTTP/1.1 200` is a legal status line
+ * @property {Headers} headers
+ * @property {string[]} setCookie one entry per Set-Cookie header, unfolded
+ * @property {InformationalHead[]} informational 1xx heads skipped before the real response
+ */
+
+/**
+ * @typedef {object} ReadHeadOptions
+ * @property {number} [maxHeaderBytes] budget for the ENTIRE head phase, default 65536
+ */
+
+/**
  * Read the response head: status line and header fields, plus any preceding informational
  * (1xx) responses, which are legal noise before the real response (100 Continue, 103 Early
  * Hints). They are skipped — 1xx never has a body — and returned in `informational` so a
  * caller can surface Early Hints. 101 is fatal: this client never offers an upgrade, so a
  * peer switching protocols means the bytes that follow are not HTTP and cannot be framed.
+ * Malformed heads throw HttpError; an oversized head throws LimitError.
  *
  * `maxHeaderBytes` bounds the ENTIRE head phase, informational heads included; a per-head
  * budget would let a peer stream 1xx responses forever.
  *
  * @param {import('../util/bytes.js').ByteReader} reader
- * @param {{ maxHeaderBytes?: number }} [opts]
- * @returns {Promise<{ httpVersion: string, status: number, statusText: string,
- *           headers: Headers, setCookie: string[], informational: Array<{
- *           httpVersion: string, status: number, statusText: string, headers: Headers }> }>}
+ * @param {ReadHeadOptions} [opts]
+ * @returns {Promise<ResponseHead>}
  */
 export async function readResponseHead(reader, { maxHeaderBytes = 65536 } = {}) {
   const budget = { left: maxHeaderBytes };
@@ -177,7 +204,24 @@ function listElements(value) {
 }
 
 /**
- * Decide how the response body is delimited, per RFC 9112 §6.3, in its order.
+ * How a response body is delimited. The four kinds are exhaustive: RFC 9112 §6.3 admits no
+ * fifth, and everything ambiguous throws before a kind is chosen.
+ * @typedef {'none' | 'content-length' | 'chunked' | 'until-close'} FramingKind
+ */
+
+/**
+ * The framing decision. `length` is present exactly when `kind` is 'content-length'.
+ * @typedef {object} Framing
+ * @property {FramingKind} kind
+ * @property {number} [length] declared byte count, content-length framing only
+ * @property {boolean} keepAliveEligible whether the socket MAY be reused after the body ends
+ *   as framed; see bodyFraming for why this is the load-bearing bit
+ */
+
+/**
+ * Decide how the response body is delimited, per RFC 9112 §6.3, in its order. Ambiguous
+ * framing (TE and CL together, disagreeing duplicate CLs, an undecodable transfer coding)
+ * throws HttpError with HTTP_FRAMING_AMBIGUOUS — every one of those is a smuggling vector.
  *
  * `keepAliveEligible` is the load-bearing bit: it is true only when the body has a determinate
  * end (`none`, `content-length`, `chunked`). A connection pool must never reuse a socket after
@@ -186,9 +230,9 @@ function listElements(value) {
  * the response-to-the-wrong-request bug, and this flag is the only thing standing between the
  * pool and it. (A 2xx CONNECT reply is also ineligible: the socket is a tunnel now, not HTTP.)
  *
- * @param {{ status: number, method?: string, headers: Headers }} res
- * @returns {{ kind: 'none'|'content-length'|'chunked'|'until-close', length?: number,
- *            keepAliveEligible: boolean }}
+ * @param {{ status: number, method?: string, headers: Headers }} res the head fields framing
+ *   depends on; a full ResponseHead satisfies it
+ * @returns {Framing}
  */
 export function bodyFraming({ status, method, headers }) {
   // 1. Messages that never have a body, regardless of any framing headers present: a HEAD
@@ -285,6 +329,18 @@ export function bodyFraming({ status, method, headers }) {
 }
 
 /**
+ * A response body stream plus the completion contract a connection pool needs. The two extra
+ * properties are documented on readResponseBody, which is the only producer.
+ * @typedef {ReadableStream<Uint8Array> & { completed: Promise<boolean>,
+ *           trailers: Promise<Headers | null> }} BodyStream
+ */
+
+/**
+ * @typedef {object} ReadBodyOptions
+ * @property {number} [maxBytes] fail-closed cap on total payload bytes, default unlimited
+ */
+
+/**
  * Stream the response body according to `framing`.
  *
  * The returned ReadableStream<Uint8Array> carries two extra properties — the completion
@@ -302,10 +358,9 @@ export function bodyFraming({ status, method, headers }) {
  * Bytes are streamed through, never buffered whole; `maxBytes` bounds the total.
  *
  * @param {import('../util/bytes.js').ByteReader} reader
- * @param {{ kind: string, length?: number, keepAliveEligible: boolean }} framing
- * @param {{ maxBytes?: number }} [opts]
- * @returns {ReadableStream<Uint8Array> & { completed: Promise<boolean>,
- *           trailers: Promise<Headers|null> }}
+ * @param {Framing} framing
+ * @param {ReadBodyOptions} [opts]
+ * @returns {BodyStream}
  */
 export function readResponseBody(reader, framing, { maxBytes = Infinity } = {}) {
   if (framing.kind === 'none') {

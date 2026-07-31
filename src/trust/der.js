@@ -38,13 +38,38 @@ export const CLS = { UNIVERSAL: 0, APPLICATION: 1, CONTEXT: 2, PRIVATE: 3 };
 
 const TAG_NAME = Object.fromEntries(Object.entries(TAG).map(([k, v]) => [v, k]));
 
-/** Describe a tag for error messages: "SEQUENCE", "[0]", "APPLICATION 3". */
+/**
+ * One decoded tag-length-value element, as byte ranges into the ORIGINAL buffer. Every reader
+ * in the trust layer passes these around instead of slices precisely so that signature checks
+ * always run over the peer's own bytes.
+ * @typedef {object} Tlv
+ * @property {number} cls tag class, per {@link CLS}
+ * @property {boolean} constructed
+ * @property {number} tag tag number, high-tag-number form already decoded
+ * @property {number} start offset of the first header byte
+ * @property {number} headerLen tag + length octets
+ * @property {number} contentStart
+ * @property {number} contentEnd
+ * @property {number} end one past the element; equals contentEnd for every legal DER element
+ */
+
+/**
+ * Describe a tag for error messages: "SEQUENCE", "[0]", "APPLICATION 3".
+ * @param {number} cls
+ * @param {number} tag
+ * @returns {string}
+ */
 export function tagName(cls, tag) {
   if (cls === CLS.UNIVERSAL) return TAG_NAME[tag] ?? `UNIVERSAL ${tag}`;
   if (cls === CLS.CONTEXT) return `[${tag}]`;
   return `${cls === CLS.APPLICATION ? 'APPLICATION' : 'PRIVATE'} ${tag}`;
 }
 
+/**
+ * @param {number} offset
+ * @param {string} message
+ * @returns {CertificateError}
+ */
 export function parseError(offset, message) {
   return new CertificateError(codes.CERT_PARSE, `DER at offset ${offset}: ${message}`, { offset });
 }
@@ -56,8 +81,7 @@ export function parseError(offset, message) {
  *
  * @param {Uint8Array} bytes
  * @param {number} offset
- * @returns {{cls:number, constructed:boolean, tag:number, start:number, headerLen:number,
- *            contentStart:number, contentEnd:number, end:number}}
+ * @returns {Tlv}
  */
 export function readTlv(bytes, offset) {
   const len = bytes.byteLength;
@@ -129,11 +153,20 @@ export function readTlv(bytes, offset) {
 }
 
 /** The content bytes of a TLV, as a subarray of the original buffer. */
+/** @type {(bytes: Uint8Array, tlv: Tlv) => Uint8Array} */
 export const content = (bytes, tlv) => bytes.subarray(tlv.contentStart, tlv.contentEnd);
 /** The full element (tag + length + content), as a subarray of the original buffer. */
+/** @type {(bytes: Uint8Array, tlv: Tlv) => Uint8Array} */
 export const element = (bytes, tlv) => bytes.subarray(tlv.start, tlv.end);
 
-/** Assert a TLV has the given shape, with an error naming expected vs got at the offset. */
+/**
+ * Assert a TLV has the given shape, with an error naming expected vs got at the offset.
+ * @param {Tlv} tlv
+ * @param {{ cls?: number, tag: number, constructed?: boolean }} shape omitted `constructed`
+ *   accepts either form
+ * @param {string} what
+ * @returns {Tlv} the same tlv, for chaining into a reader
+ */
 export function expectTlv(tlv, { cls = CLS.UNIVERSAL, tag, constructed }, what) {
   const wrongShape = constructed !== undefined && tlv.constructed !== constructed;
   if (tlv.cls !== cls || tlv.tag !== tag || wrongShape) {
@@ -147,7 +180,13 @@ export function expectTlv(tlv, { cls = CLS.UNIVERSAL, tag, constructed }, what) 
   return tlv;
 }
 
-/** Read a TLV and require it to be a constructed SEQUENCE. */
+/**
+ * Read a TLV and require it to be a constructed SEQUENCE.
+ * @param {Uint8Array} bytes
+ * @param {number} offset
+ * @param {string} [what]
+ * @returns {Tlv}
+ */
 export function readSequence(bytes, offset, what = 'SEQUENCE') {
   return expectTlv(readTlv(bytes, offset), { tag: TAG.SEQUENCE, constructed: true }, what);
 }
@@ -156,6 +195,10 @@ export function readSequence(bytes, offset, what = 'SEQUENCE') {
  * Parse the content of a constructed element into its immediate children, requiring them to fill
  * the content exactly. Trailing bytes inside a container are as suspicious as trailing bytes
  * after the certificate.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {Tlv[]}
  */
 export function children(bytes, tlv, what = tagName(tlv.cls, tlv.tag)) {
   if (!tlv.constructed) {
@@ -175,7 +218,12 @@ export function children(bytes, tlv, what = tagName(tlv.cls, tlv.tag)) {
   return out;
 }
 
-/** Read the single top-level element and reject trailing bytes after it. */
+/**
+ * Read the single top-level element and reject trailing bytes after it.
+ * @param {Uint8Array} bytes
+ * @param {string} [what]
+ * @returns {Tlv}
+ */
 export function readAll(bytes, what = 'top-level element') {
   const tlv = readTlv(bytes, 0);
   if (tlv.end !== bytes.byteLength) {
@@ -188,6 +236,11 @@ export function readAll(bytes, what = 'top-level element') {
  * INTEGER: returns the raw big-endian content and, when it fits a safe JS number, the value.
  * DER minimality: the first nine bits must not be all-zero or all-one, else a shorter encoding
  * exists. Laxness here would let two different byte strings claim the same serial number.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {{ bytes: Uint8Array, value: number | null, negative: boolean }} `value` is null
+ *   when the magnitude does not fit a safe number (serials routinely do not)
  */
 export function readInteger(bytes, tlv, what = 'INTEGER') {
   expectTlv(tlv, { tag: TAG.INTEGER, constructed: false }, what);
@@ -214,6 +267,10 @@ export function readInteger(bytes, tlv, what = 'INTEGER') {
  * OBJECT IDENTIFIER to dotted string. Sub-identifiers are base-128 and must be minimal: a leading
  * 0x80 continuation byte is a second spelling of the same OID, and two spellings of one identity
  * is how "unknown critical extension" checks get bypassed.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {string} dotted form, e.g. '2.5.29.15'
  */
 export function readOid(bytes, tlv, what = 'OBJECT IDENTIFIER') {
   expectTlv(tlv, { tag: TAG.OID, constructed: false }, what);
@@ -249,6 +306,10 @@ export function readOid(bytes, tlv, what = 'OBJECT IDENTIFIER') {
 /**
  * BIT STRING: unused-bit count + payload. DER additionally requires the unused bits themselves to
  * be zero — a nonzero padding bit is another two-spellings ambiguity.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {{ unusedBits: number, bytes: Uint8Array }}
  */
 export function readBitString(bytes, tlv, what = 'BIT STRING') {
   expectTlv(tlv, { tag: TAG.BIT_STRING, constructed: false }, what);
@@ -267,7 +328,13 @@ export function readBitString(bytes, tlv, what = 'BIT STRING') {
   return { unusedBits, bytes: c.subarray(1) };
 }
 
-/** BOOLEAN. DER: content is exactly one byte, 0x00 or 0xff. */
+/**
+ * BOOLEAN. DER: content is exactly one byte, 0x00 or 0xff.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {boolean}
+ */
 export function readBoolean(bytes, tlv, what = 'BOOLEAN') {
   expectTlv(tlv, { tag: TAG.BOOLEAN, constructed: false }, what);
   const c = content(bytes, tlv);
@@ -303,6 +370,10 @@ function toEpochMs(tlv, kind, text, y, mo, d, h, mi, s) {
  * UTCTime, RFC 5280 profile: exactly YYMMDDHHMMSSZ. Seconds are mandatory, the zone is mandatory
  * and must be Z, and fractional seconds do not exist in this profile. The two-digit year pivots
  * at 50: 50..99 map to 19xx, 00..49 to 20xx (RFC 5280 s4.1.2.5.1).
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {number} epoch ms UTC
  */
 export function readUtcTime(bytes, tlv, what = 'UTCTime') {
   expectTlv(tlv, { tag: TAG.UTC_TIME, constructed: false }, what);
@@ -320,6 +391,10 @@ export function readUtcTime(bytes, tlv, what = 'UTCTime') {
 /**
  * GeneralizedTime, RFC 5280 profile: exactly YYYYMMDDHHMMSSZ. Fractional seconds are explicitly
  * forbidden by RFC 5280 s4.1.2.5.2, and allowing them would give one instant many encodings.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {number} epoch ms UTC
  */
 export function readGeneralizedTime(bytes, tlv, what = 'GeneralizedTime') {
   expectTlv(tlv, { tag: TAG.GENERALIZED_TIME, constructed: false }, what);
@@ -333,7 +408,13 @@ export function readGeneralizedTime(bytes, tlv, what = 'GeneralizedTime') {
   return toEpochMs(tlv, what, text, year, n(4), n(6), n(8), n(10), n(12));
 }
 
-/** Either time type, as used by Validity and by name-constraint-free consumers. */
+/**
+ * Either time type, as used by Validity and by name-constraint-free consumers.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {number} epoch ms UTC
+ */
 export function readTime(bytes, tlv, what = 'Time') {
   if (tlv.tag === TAG.UTC_TIME) return readUtcTime(bytes, tlv, what);
   if (tlv.tag === TAG.GENERALIZED_TIME) return readGeneralizedTime(bytes, tlv, what);
@@ -349,6 +430,10 @@ const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
  *
  * TeletexString is decoded as Latin-1: its real charset (T.61) is a negotiation-dependent mess
  * that no CA has honoured in decades, and Latin-1 is the universal de-facto reading.
+ * @param {Uint8Array} bytes
+ * @param {Tlv} tlv
+ * @param {string} [what]
+ * @returns {string}
  */
 export function readString(bytes, tlv, what = 'string') {
   const c = content(bytes, tlv);
@@ -427,6 +512,7 @@ export function readString(bytes, tlv, what = 'string') {
  * @param {Uint8Array} sig DER ECDSA-Sig-Value
  * @param {number} orderLen byte width of the curve order (32 / 48 / 66)
  * @param {(why: string) => Error} onInvalid builds the caller's own error type
+ * @returns {Uint8Array} r||s, each half left-padded to orderLen
  */
 export function ecdsaDerToRaw(sig, orderLen, onInvalid) {
   // Every failure below, DER-level or structural, is reported through the caller's error factory.

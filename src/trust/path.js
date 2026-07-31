@@ -43,9 +43,48 @@ const constraintError = (message, detail) =>
 // ------------------------------------------------------------------ anchors
 
 /**
+ * The RFC 5280 s6.1.1 trust-anchor triple, normalised. Validity bounds are recorded but never
+ * enforced — see the module comment for why expiring a root is store policy, not path policy.
+ * @typedef {object} TrustAnchor
+ * @property {Uint8Array} subjectBytes exact subject DN DER
+ * @property {string} subjectText
+ * @property {Uint8Array} spkiDer
+ * @property {Uint8Array | null} subjectKeyIdentifier
+ * @property {import('./x509.js').NameConstraints | null} nameConstraints
+ * @property {number | null} notBefore
+ * @property {number | null} notAfter
+ */
+
+/**
+ * Anything normalizeAnchor accepts: DER, a parsed certificate, or an anchor-shaped record.
+ * The record form also admits `nameConstraintsBytes` (raw extnValue), which is how the bundled
+ * store defers parsing to the one anchor a handshake actually lands on.
+ * @typedef {object} AnchorRecord
+ * @property {Uint8Array} subjectBytes
+ * @property {Uint8Array} spkiDer
+ * @property {string} [subjectText]
+ * @property {Uint8Array | null} [subjectKeyIdentifier]
+ * @property {import('./x509.js').NameConstraints | null} [nameConstraints]
+ * @property {Uint8Array | null} [nameConstraintsBytes]
+ * @property {number | null} [notBefore]
+ * @property {number | null} [notAfter]
+ */
+
+/** @typedef {Uint8Array | import('./x509.js').Certificate | AnchorRecord} AnchorLike */
+
+/**
+ * An indexed anchor lookup: everything path building needs from a root store. The bundled
+ * store implements it with a subject-hash index so a handshake touches one anchor, not all.
+ * @typedef {{ forIssuer: (subjectDn: Uint8Array) => AnchorLike[] | Promise<AnchorLike[]> }}
+ *   AnchorSource
+ */
+
+/**
  * Strip a parsed certificate down to the RFC 5280 s6.1.1 trust-anchor triple. Used for the
  * `mode:'anchors'` knob and by the root-store generator, so both feed path validation through
  * the identical shape.
+ * @param {import('./x509.js').Certificate} cert
+ * @returns {TrustAnchor}
  */
 export function anchorFromCertificate(cert) {
   return Object.freeze({
@@ -59,7 +98,12 @@ export function anchorFromCertificate(cert) {
   });
 }
 
-/** Accept an anchor object (from roots.js or anchorFromCertificate), DER, or a parsed cert. */
+/**
+ * Accept an anchor object (from roots.js or anchorFromCertificate), DER, or a parsed cert.
+ * @param {AnchorLike} a
+ * @param {number} [index]
+ * @returns {TrustAnchor}
+ */
 function normalizeAnchor(a, index) {
   if (a instanceof Uint8Array) return anchorFromCertificate(parseCertificate(a));
   if (a && a.tbsBytes) return anchorFromCertificate(a);
@@ -373,18 +417,22 @@ function checkConstraints(state, cert) {
 // ------------------------------------------------------------------ validation
 
 /**
- * Build and validate a certification path.
+ * Build and validate a certification path. Every failure throws a typed CertificateError;
+ * there is no boolean to forget to check.
  *
  * @param {object} opts
- * @param {Array<Uint8Array|object>} opts.chain DER (or already-parsed) certificates, leaf first,
- *   in whatever order and with whatever extras the server chose to send
- * @param {Array|{forIssuer: Function}} opts.anchors trust anchors, or an indexed anchor source
- * @param {string} [opts.hostname] identity to require of the leaf; omit to skip (index.js never omits)
+ * @param {Array<Uint8Array | import('./x509.js').Certificate>} opts.chain DER (or
+ *   already-parsed) certificates, leaf first, in whatever order and with whatever extras the
+ *   server chose to send
+ * @param {AnchorLike[] | AnchorSource} opts.anchors trust anchors, or an indexed anchor source
+ * @param {string | null} [opts.hostname] identity to require of the leaf; omit to skip
+ *   (index.js never omits)
  * @param {number} [opts.now] epoch ms
  * @param {number} [opts.maxPathLength] hard cap on path certificates — this runs on a metered
  *   runtime and a pathological chain must cost O(cap), not O(chain²)
- * @returns {Promise<{leaf: object, path: object[], anchor: object}>} parsed leaf, the validated
- *   path (leaf first), and the anchor that terminated it
+ * @returns {Promise<{ leaf: import('./x509.js').Certificate,
+ *   path: import('./x509.js').Certificate[], anchor: TrustAnchor }>} parsed leaf, the
+ *   validated path (leaf first), and the anchor that terminated it
  */
 export async function validatePath(
   { chain, anchors, hostname = null, now = Date.now(), maxPathLength = 10 },

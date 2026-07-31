@@ -28,6 +28,10 @@ export class Cursor {
     return this.pos >= this.bytes.byteLength;
   }
 
+  /**
+   * @param {number} n
+   * @param {string} field
+   */
   _need(n, field) {
     if (n < 0 || this.remaining < n) {
       throw new TlsError(
@@ -39,11 +43,19 @@ export class Cursor {
     }
   }
 
+  /**
+   * @param {string} [field]
+   * @returns {number}
+   */
   u8(field = 'uint8') {
     this._need(1, field);
     return this.bytes[this.pos++];
   }
 
+  /**
+   * @param {string} [field]
+   * @returns {number}
+   */
   u16(field = 'uint16') {
     this._need(2, field);
     const v = (this.bytes[this.pos] << 8) | this.bytes[this.pos + 1];
@@ -51,6 +63,10 @@ export class Cursor {
     return v;
   }
 
+  /**
+   * @param {string} [field]
+   * @returns {number}
+   */
   u24(field = 'uint24') {
     this._need(3, field);
     const v =
@@ -59,6 +75,10 @@ export class Cursor {
     return v;
   }
 
+  /**
+   * @param {string} [field]
+   * @returns {number}
+   */
   u32(field = 'uint32') {
     this._need(4, field);
     const b = this.bytes;
@@ -69,7 +89,12 @@ export class Cursor {
     return v;
   }
 
-  /** Fixed-length opaque bytes. Returns a view into the original buffer, never a copy. */
+  /**
+   * Fixed-length opaque bytes. Returns a view into the original buffer, never a copy.
+   * @param {number} n
+   * @param {string} [field]
+   * @returns {Uint8Array}
+   */
   take(n, field = 'opaque') {
     this._need(n, field);
     const out = this.bytes.subarray(this.pos, this.pos + n);
@@ -77,7 +102,12 @@ export class Cursor {
     return out;
   }
 
-  /** A vector whose length is carried in `lenBytes` (1, 2 or 3) leading octets. */
+  /**
+   * A vector whose length is carried in `lenBytes` (1, 2 or 3) leading octets.
+   * @param {1 | 2 | 3} lenBytes
+   * @param {string} [field]
+   * @returns {Uint8Array}
+   */
   vector(lenBytes, field = 'vector') {
     const n = lenBytes === 1 ? this.u8(`${field} length`)
       : lenBytes === 2 ? this.u16(`${field} length`)
@@ -85,7 +115,12 @@ export class Cursor {
     return this.take(n, field);
   }
 
-  /** Like `vector`, but hands back a Cursor so nested structures inherit the bound. */
+  /**
+   * Like `vector`, but hands back a Cursor so nested structures inherit the bound.
+   * @param {1 | 2 | 3} lenBytes
+   * @param {string} [field]
+   * @returns {Cursor}
+   */
   sub(lenBytes, field = 'vector') {
     return new Cursor(this.vector(lenBytes, field), `${this.what}.${field}`);
   }
@@ -93,6 +128,7 @@ export class Cursor {
   /**
    * Assert nothing is left. Trailing data inside a length-delimited structure means our idea of
    * the structure and the peer's disagree, which is exactly when to stop rather than guess.
+   * @param {string} [field]
    */
   end(field = 'structure') {
     if (!this.done) {
@@ -113,6 +149,10 @@ export class Builder {
     this.length = 0;
   }
 
+  /**
+   * @param {Uint8Array} bytes
+   * @returns {this}
+   */
   push(bytes) {
     if (bytes.byteLength) {
       this.parts.push(bytes);
@@ -121,12 +161,15 @@ export class Builder {
     return this;
   }
 
+  /** @param {number} n @returns {this} */
   u8(n) {
     return this.push(u8(n));
   }
+  /** @param {number} n @returns {this} */
   u16(n) {
     return this.push(u16(n));
   }
+  /** @param {number} n @returns {this} */
   u24(n) {
     return this.push(u24(n));
   }
@@ -134,6 +177,9 @@ export class Builder {
   /**
    * Write `body` prefixed by its length in `lenBytes` octets. Taking the body as bytes rather
    * than back-patching a placeholder means a length can never drift from what follows it.
+   * @param {1 | 2 | 3} lenBytes
+   * @param {Uint8Array} body
+   * @returns {this}
    */
   vector(lenBytes, body) {
     const n = body.byteLength;
@@ -151,17 +197,28 @@ export class Builder {
     return this.push(body);
   }
 
+  /** @returns {Uint8Array} */
   build() {
     return concat(this.parts, this.length);
   }
 }
 
-/** Convenience: build a length-prefixed vector standalone. */
+/**
+ * Convenience: build a length-prefixed vector standalone.
+ * @param {1 | 2 | 3} lenBytes
+ * @param {Uint8Array} body
+ * @returns {Uint8Array}
+ */
 export function vector(lenBytes, body) {
   return new Builder().vector(lenBytes, body).build();
 }
 
-/** Encode a handshake message: 1-byte type, 3-byte length, body. */
+/**
+ * Encode a handshake message: 1-byte type, 3-byte length, body.
+ * @param {number} type
+ * @param {Uint8Array} body
+ * @returns {Uint8Array}
+ */
 export function handshakeMessage(type, body) {
   return new Builder().u8(type).vector(3, body).build();
 }

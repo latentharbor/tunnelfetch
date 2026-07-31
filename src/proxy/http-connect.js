@@ -17,6 +17,21 @@ import { ByteReader, ByteWriter, latin1, utf8 } from '../util/bytes.js';
 const CRLFCRLF = utf8('\r\n\r\n');
 const MAX_REPLY_HEADER = 32 * 1024;
 
+/**
+ * The tunnel a proxy module hands back: the byte duplex plus the underlying socket, kept so a
+ * caller that must tear down the transport can reach past the wrapping streams.
+ * @typedef {import('./index.js').Duplex & { socket: import('./index.js').Duplex }} ProxyTunnel
+ */
+
+/**
+ * @typedef {object} HttpConnectOptions
+ * @property {import('./index.js').ProxyConfig} proxy protocol 'http' or 'https'
+ * @property {{ hostname: string, port: number }} target
+ * @property {import('./index.js').ConnectFn} connect injected socket factory
+ * @property {AbortSignal} [signal]
+ * @property {{ maxProxyReplyBytes?: number }} [limits] CONNECT reply head cap, default 32768
+ */
+
 /** RFC 7617: credentials are UTF-8 before base64, and btoa only accepts code units below 256. */
 function basicCredentials(username, password) {
   const raw = utf8(`${username}:${password ?? ''}`);
@@ -28,6 +43,14 @@ function authority(hostname, port) {
   return hostname.includes(':') ? `[${hostname}]:${port}` : `${hostname}:${port}`;
 }
 
+/**
+ * Establish a CONNECT tunnel through an http/https proxy. Resolves with the tunnel duplex;
+ * every refusal (non-2xx, 407 with or without credentials, malformed reply) throws a
+ * ProxyError naming what the proxy answered.
+ *
+ * @param {HttpConnectOptions} args
+ * @returns {Promise<ProxyTunnel>}
+ */
 export async function openHttpConnect({ proxy, target, connect, signal, limits = {} }) {
   signal?.throwIfAborted?.();
   const overTls = proxy.protocol === 'https';

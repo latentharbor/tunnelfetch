@@ -84,7 +84,11 @@ function parseIpv6(text) {
   return out;
 }
 
-/** Parse an IP literal (v4 dotted-quad or v6, optionally [bracketed]) to raw bytes, else null. */
+/**
+ * Parse an IP literal (v4 dotted-quad or v6, optionally [bracketed]) to raw bytes, else null.
+ * @param {string} text
+ * @returns {Uint8Array | null}
+ */
 export function parseIp(text) {
   let t = text;
   if (t.startsWith('[') && t.endsWith(']')) t = t.slice(1, -1);
@@ -156,8 +160,9 @@ const describeIp = (bytes) =>
  * CERT_NAME_MISMATCH with the entries that were considered, so one log line shows exactly how
  * close the certificate was.
  *
- * @param {ReturnType<import('./x509.js').parseCertificate>} cert
+ * @param {import('./x509.js').Certificate} cert
  * @param {string} hostname DNS name (A-label form) or IP literal, per the request URL
+ * @returns {void}
  */
 export function matchesIdentity(cert, hostname) {
   const { ip, host } = normalizeHostname(hostname);
@@ -202,6 +207,9 @@ export function matchesIdentity(cert, hostname) {
  * RFC 5280 s4.2.1.10 dNSName subtree: a constraint "example.com" covers the host itself and any
  * subdomain, at a label boundary. The seen-in-the-wild ".example.com" form covers subdomains
  * only. An empty constraint covers every DNS name (used by permittedSubtrees to say "any DNS").
+ * @param {string} name
+ * @param {string} base
+ * @returns {boolean}
  */
 export function dnsWithinSubtree(name, base) {
   const n = name.toLowerCase();
@@ -211,7 +219,13 @@ export function dnsWithinSubtree(name, base) {
   return n === b || n.endsWith(`.${b}`);
 }
 
-/** iPAddress subtree: same family, and (address & mask) equal on every byte. */
+/**
+ * iPAddress subtree: same family, and (address & mask) equal on every byte.
+ * @param {Uint8Array} ip
+ * @param {Uint8Array} addr
+ * @param {Uint8Array} mask
+ * @returns {boolean}
+ */
 export function ipWithinSubtree(ip, addr, mask) {
   if (ip.byteLength !== addr.byteLength || addr.byteLength !== mask.byteLength) return false;
   for (let i = 0; i < ip.byteLength; i++) {

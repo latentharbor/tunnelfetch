@@ -140,6 +140,15 @@ async function readTrailers(reader, maxTrailerBytes) {
 }
 
 /**
+ * Every cap is fail-closed: the peer controls chunk sizes and counts, so each one bounds what
+ * a hostile sender can make us buffer.
+ * @typedef {object} ChunkedOptions
+ * @property {number} [maxBytes] total payload cap, default unlimited
+ * @property {number} [maxChunkSize] per-chunk cap, default 64 MiB
+ * @property {number} [maxTrailerBytes] trailer-section cap, default 8192
+ */
+
+/**
  * Decode a chunked body from `reader`.
  *
  * Returns `{ stream, trailers }`:
@@ -154,7 +163,8 @@ async function readTrailers(reader, maxTrailerBytes) {
  * `reader` for the next message.
  *
  * @param {import('../util/bytes.js').ByteReader} reader
- * @param {{ maxBytes?: number, maxChunkSize?: number, maxTrailerBytes?: number }} [opts]
+ * @param {ChunkedOptions} [opts]
+ * @returns {{ stream: ReadableStream<Uint8Array>, trailers: Promise<Headers | null> }}
  */
 export function decodeChunked(
   reader,

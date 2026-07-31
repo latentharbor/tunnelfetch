@@ -32,6 +32,8 @@ function ext(type, body) {
  * server_name (RFC 6066). Only host_name (type 0) exists in practice.
  * An IP literal must NOT be sent as SNI — RFC 6066 s3 forbids it, and servers that do virtual
  * hosting will hand back an unrelated certificate if we do, which would look like an attack.
+ * @param {string} hostname
+ * @returns {Uint8Array | null} null for an IP literal, which sends no SNI at all
  */
 export function encodeServerName(hostname) {
   if (isIpLiteral(hostname)) return null;
@@ -43,25 +45,42 @@ export function encodeServerName(hostname) {
   return ext(EXTENSION.server_name, vector(2, entry));
 }
 
+/**
+ * @param {number[]} versions in preference order
+ * @returns {Uint8Array}
+ */
 export function encodeSupportedVersions(versions) {
   const b = new Builder();
   for (const v of versions) b.u16(v);
   return ext(EXTENSION.supported_versions, vector(1, b.build()));
 }
 
+/**
+ * @param {number[]} [groups]
+ * @returns {Uint8Array}
+ */
 export function encodeSupportedGroups(groups = SUPPORTED_GROUPS) {
   const b = new Builder();
   for (const g of groups) b.u16(g);
   return ext(EXTENSION.supported_groups, vector(2, b.build()));
 }
 
+/**
+ * @param {number[]} [schemes]
+ * @returns {Uint8Array}
+ */
 export function encodeSignatureAlgorithms(schemes = SUPPORTED_SIG_SCHEMES) {
   const b = new Builder();
   for (const s of schemes) b.u16(s);
   return ext(EXTENSION.signature_algorithms, vector(2, b.build()));
 }
 
-/** key_share entries, in the same order as supported_groups. */
+/**
+ * key_share entries, in the same order as supported_groups.
+ * @param {Array<{ group: number, keyExchange: Uint8Array }>} shares the public halves only;
+ *   private keys never reach the encoder
+ * @returns {Uint8Array}
+ */
 export function encodeKeyShare(shares) {
   const b = new Builder();
   for (const { group, keyExchange } of shares) {
@@ -70,11 +89,19 @@ export function encodeKeyShare(shares) {
   return ext(EXTENSION.key_share, vector(2, b.build()));
 }
 
-/** The HelloRetryRequest response carries a bare group id with no share. */
+/**
+ * The HelloRetryRequest response carries a bare group id with no share.
+ * @param {number} group
+ * @returns {Uint8Array}
+ */
 export function encodeKeyShareHrr(group) {
   return ext(EXTENSION.key_share, u16(group));
 }
 
+/**
+ * @param {string[]} protocols
+ * @returns {Uint8Array}
+ */
 export function encodeAlpn(protocols) {
   const b = new Builder();
   for (const p of protocols) b.vector(1, utf8(p));
@@ -107,6 +134,10 @@ export function encodeEcPointFormats() {
   return ext(EXTENSION.ec_point_formats, vector(1, Uint8Array.from([0])));
 }
 
+/**
+ * @param {Array<Uint8Array | null>} parts nulls tolerated so conditional extensions read cleanly
+ * @returns {Uint8Array}
+ */
 export function encodeExtensionBlock(parts) {
   const b = new Builder();
   for (const p of parts) if (p) b.push(p);
@@ -118,6 +149,8 @@ export function encodeExtensionBlock(parts) {
 /**
  * Decode an extension block into a Map. Duplicates are rejected rather than folded: a repeated
  * extension is never legitimate and letting the last one win is how parser-differential bugs start.
+ * @param {Uint8Array} bytes the block content, its outer length prefix already consumed
+ * @param {string} where named in errors, e.g. 'ServerHello'
  * @returns {Map<number, Uint8Array>}
  */
 export function decodeExtensionBlock(bytes, where) {
@@ -141,6 +174,10 @@ export function decodeExtensionBlock(bytes, where) {
 /**
  * RFC 8446 s4.2: the server may only send extensions the client offered. Anything else means we
  * and the server disagree about the negotiation, which is not a state to continue from.
+ * @param {Map<number, Uint8Array>} received
+ * @param {Set<number>} offered extension types the ClientHello carried
+ * @param {string} where
+ * @returns {void} throws TlsError on the first unoffered extension
  */
 export function rejectUnofferedExtensions(received, offered, where) {
   for (const type of received.keys()) {
@@ -154,7 +191,11 @@ export function rejectUnofferedExtensions(received, offered, where) {
   }
 }
 
-/** supported_versions in a ServerHello is a single uint16, not a list. */
+/**
+ * supported_versions in a ServerHello is a single uint16, not a list.
+ * @param {Uint8Array} data
+ * @returns {number}
+ */
 export function decodeSelectedVersion(data) {
   const c = new Cursor(data, 'supported_versions');
   const v = c.u16('selected_version');
@@ -162,6 +203,11 @@ export function decodeSelectedVersion(data) {
   return v;
 }
 
+/**
+ * @param {Uint8Array} data
+ * @param {string} where
+ * @returns {{ group: number, keyExchange: Uint8Array }}
+ */
 export function decodeKeyShareEntry(data, where) {
   const c = new Cursor(data, `${where} key_share`);
   const group = c.u16('group');
@@ -170,7 +216,11 @@ export function decodeKeyShareEntry(data, where) {
   return { group, keyExchange };
 }
 
-/** HelloRetryRequest's key_share is a bare group with no key. */
+/**
+ * HelloRetryRequest's key_share is a bare group with no key.
+ * @param {Uint8Array} data
+ * @returns {number}
+ */
 export function decodeKeyShareHrr(data) {
   const c = new Cursor(data, 'HelloRetryRequest key_share');
   const group = c.u16('selected_group');
@@ -178,6 +228,10 @@ export function decodeKeyShareHrr(data) {
   return group;
 }
 
+/**
+ * @param {Uint8Array} data
+ * @returns {string} the single protocol the server selected (RFC 7301 s3.2)
+ */
 export function decodeAlpn(data) {
   const c = new Cursor(data, 'alpn');
   const list = c.sub(2, 'protocol_name_list');
@@ -190,6 +244,11 @@ export function decodeAlpn(data) {
 
 // ------------------------------------------------------------------ validation helpers
 
+/**
+ * @param {number} group
+ * @param {string} where
+ * @returns {import('./constants.js').GroupParams} throws TlsUnsupportedError when unimplemented
+ */
 export function requireSupportedGroup(group, where) {
   const params = GROUP_PARAMS[group];
   if (!params) {
@@ -204,15 +263,27 @@ export function requireSupportedGroup(group, where) {
   return params;
 }
 
+/**
+ * @param {number} scheme
+ * @returns {string}
+ */
 export function describeSigScheme(scheme) {
   return `${hex16(scheme)}${SIG_SCHEME_NAME[scheme] ? ` (${SIG_SCHEME_NAME[scheme]})` : ''}`;
 }
 
+/**
+ * @param {number} version
+ * @returns {string}
+ */
 export function describeVersion(version) {
   return `${hex16(version)}${VERSION_NAME[version] ? ` (${VERSION_NAME[version]})` : ''}`;
 }
 
-/** Cheap classification, not validation: decides whether a name is legal as SNI. */
+/**
+ * Cheap classification, not validation: decides whether a name is legal as SNI.
+ * @param {string} host
+ * @returns {boolean}
+ */
 export function isIpLiteral(host) {
   if (host.includes(':')) return true; // only IPv6 literals contain a colon in a bare authority
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
