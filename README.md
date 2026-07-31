@@ -274,7 +274,7 @@ and Bun. The only runtime-specific piece is the `connect` function you supply.
 ## Testing
 
 ```bash
-npm test          # 841 offline tests, hermetic, no network
+npm test          # 845 offline tests, hermetic, no network
 npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 ```
 
