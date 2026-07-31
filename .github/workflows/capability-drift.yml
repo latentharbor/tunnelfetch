@@ -1,21 +1,32 @@
 name: Capability drift
 
-# Two things about this package rot on their own, without anyone touching the code.
+# Three things about this package rot on their own, with no commit to hang a check off.
 #
 #   * The runtime moves. This package implements TLS in JavaScript because nothing on workerd can
 #     hand a TLS handshake an already-open socket, which is what a proxy CONNECT tunnel is. That is
-#     a statement about a platform Cloudflare is actively filling in, not a law. When it stops being
-#     true, the right response is to reconsider the architecture — and the wrong one is to keep
-#     shipping a userland TLS stack because nobody thought to check.
+#     a statement about a platform Cloudflare is actively filling in, not a law. The wrong way to
+#     find out it has changed is not to.
 #   * The trust anchors go stale. Roots added upstream are ones this package rejects and browsers
-#     accept; roots distrusted upstream are ones this package still trusts. The offline suite
-#     catches the second problem by date, but only if the suite is actually run.
+#     accept; roots distrusted upstream are ones this package still trusts.
+#   * The package's own interop can break under it — a proxy, a TLS stack, a certificate chain
+#     somewhere changes and the code that was correct yesterday is not.
 #
-# So this runs on a schedule rather than on commits: there is no commit to hang it off. A failure
-# here is usually good news, and is never a regression in this package.
+# A failure here is often good news and is never, on its own, a regression in this package.
+#
+# Every Worker this workflow needs is deployed per run under a run-scoped name and deleted in an
+# `if: always()` step, so a failed test still cleans up and two concurrent runs cannot collide.
+# Nothing is left deployed between runs, which also removes the possibility of testing a
+# months-old deployment and calling it "no drift".
 #
 # Never triggered by pull_request: fork PRs cannot read secrets, and a job that appears to check
-# something while silently having no credentials is worse than no job.
+# something while having no credentials is worse than no job.
+#
+# Secrets required:
+#   CLOUDFLARE_API_TOKEN   scoped to Workers Scripts: Edit — nothing else
+#   CLOUDFLARE_ACCOUNT_ID
+#   TUNNELFETCH_PROXY      host:port:user:pass of a proxy you control
+# The rigs' own shared secret is generated per run rather than stored: it guards a Worker that
+# exists for a few minutes, so a long-lived secret would be a worse trade.
 
 on:
   schedule:
@@ -24,8 +35,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  runtime-capabilities:
+  edge:
+    # Everything that needs the package running on the runtime it targets.
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PROBE_NAME: tf-ci-probe-${{ github.run_id }}-${{ github.run_attempt }}
+      LIVE_NAME: tf-ci-live-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,21 +50,47 @@ jobs:
           node-version: '24'
       - run: npm ci
 
-      # Queries the already-deployed probe rather than deploying one, so this workflow never needs
-      # a Cloudflare token with deploy rights. The cost of that choice is that the deployment can
-      # drift from the source in this checkout — which is exactly what the first assertion in
-      # nodecompat.live.js checks, by comparing a fingerprint baked in at deploy time. If it fails,
-      # run `npm run probe:deploy` locally.
+      - name: generate a per-run rig token
+        run: echo "PROBE_TOKEN=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+
+      # deploy-probe.mjs bakes a hash of the rig's own source into the deployment, which the drift
+      # test asserts against the checkout. Here it always matches — the point of deploying per run —
+      # but the same script serves a human deploying by hand, where it does not.
+      - name: deploy the capability probe
+        run: |
+          node scripts/deploy-probe.mjs --dir probe --name "$PROBE_NAME" \
+            --var "PROBE_TOKEN:$PROBE_TOKEN" | tee /tmp/probe.log
+          grep -oP '(?<=DEPLOYED_URL=).*' /tmp/probe.log | tail -1 \
+            | sed 's/^/PROBE_URL=/' >> "$GITHUB_ENV"
+
+      - name: deploy the interop rig
+        run: |
+          node scripts/deploy-probe.mjs --dir live --name "$LIVE_NAME" \
+            --var "PROBE_TOKEN:$PROBE_TOKEN" | tee /tmp/live.log
+          grep -oP '(?<=DEPLOYED_URL=).*' /tmp/live.log | tail -1 \
+            | sed 's/^/LIVE_URL=/' >> "$GITHUB_ENV"
+
+      # Has the runtime started doing natively what this package does in JavaScript?
       - name: node compatibility has not changed under us
         env:
-          PROBE_URL: ${{ secrets.PROBE_URL }}
-          PROBE_TOKEN: ${{ secrets.PROBE_TOKEN }}
-          PROXY_1: ${{ secrets.PROXY_1 }}
+          PROXY_1: ${{ secrets.TUNNELFETCH_PROXY }}
         run: node --test --test-reporter=spec "test/live/nodecompat.live.js"
 
+      # Does the package still interoperate, measured where it runs rather than from a runner whose
+      # network is not ours to trust?
+      - name: the package still works end to end on the edge
+        env:
+          PROXY_1: ${{ secrets.TUNNELFETCH_PROXY }}
+        run: node --test --test-reporter=spec "test/live/edge-interop.live.js"
+
+      - name: remove the run's Workers
+        if: always()
+        run: node scripts/delete-worker.mjs "$PROBE_NAME" "$LIVE_NAME"
+
   trust-layer:
-    # Separate job so an outage at the misconfigured-TLS test site cannot mask a capability change,
-    # and vice versa. Both must pass; neither may skip.
+    # Separate job, and deliberately no Worker: these run from the runner straight through the
+    # proxy. Splitting them means an outage at the misconfigured-TLS test site cannot mask a
+    # capability change, and vice versa. Both must pass; neither may skip.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,10 +105,10 @@ jobs:
       # quietly passing it.
       - name: certificate validation still fails closed against real bad servers
         env:
-          PROXY_1: ${{ secrets.PROXY_1 }}
+          PROXY_1: ${{ secrets.TUNNELFETCH_PROXY }}
         run: node --test --test-reporter=spec "test/live/badssl.live.js"
 
       # Dates advance whether or not anyone commits, so the staleness assertion needs a trigger
-      # that is not a commit. Cheap enough to re-run the whole offline suite for.
+      # that is not a commit.
       - name: bundled trust anchors are still fresh
         run: node --test --test-reporter=spec "test/trust/roots-freshness.test.js"
