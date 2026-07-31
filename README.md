@@ -121,6 +121,22 @@ await client.close();          // required: releases pooled sockets
 
 Measured on the edge: first request 678 ms, second to the same origin 135 ms.
 
+The jar is deliberately minimal — it does RFC 6265 domain and path matching, `Secure`, host-only
+cookies, expiry and `Max-Age`, and nothing else. It does enforce the **`__Host-` and `__Secure-`
+name prefixes**, because those are not a convenience: the name is the server's claim that the
+cookie was set with particular attributes, and a client that ignores the claim silently removes a
+protection the server is relying on. A `Set-Cookie` that breaks its own prefix is refused whole,
+never repaired — repairing it would manufacture exactly the proof the server must not get.
+
+Prefix matching is case-**in**sensitive, which is a MUST in RFC 6265bis §5.4 and not an obvious
+choice: servers routinely compare cookie names case-insensitively, so a client matching
+case-sensitively will store `__SeCuRe-SID` without applying any of the rules and the server cannot
+tell it from the real one. Matching case-sensitively is CVE-2024-5699.
+
+Two related rules of §5.7 are **not** implemented, and are worth knowing if you rely on the jar for
+security: "Leave Secure Cookies Alone" (step 16), so a plain-named `Secure` cookie set over https
+can still be overwritten from http, and the 4096-octet name-plus-value cap (step 4).
+
 ### Replacing the global
 
 For libraries that only ever call the bare global:
@@ -218,7 +234,7 @@ access it was built to win did not survive a day. Bot detection is adversarial a
 protocol is a window, not a property. Do not adopt HTTP/2 here on the strength of one site's
 behaviour — measure your own targets, and expect the answer to change. Our TLS fingerprint and curl's produced
 identical outcomes on every reachable host in that sample, so JA3-style TLS shaping is not what
-gates access here — but curl's **HTTP/2** fingerprint passes where HTTP/1.1 is challenged. So the
+gates access here — but curl's **HTTP/2** fingerprint passed where HTTP/1.1 was challenged. So the
 `SETTINGS` frame values, the initial window sizes, the connection `WINDOW_UPDATE`, and the
 pseudo-header order are matched byte-for-byte to curl (8.7.1 / nghttp2), captured off the wire.
 This is empirical: a naïve h2 fingerprint can fail exactly where curl's succeeds, which would waste
@@ -304,7 +320,7 @@ Handing a request that asked for a pinned certificate to an implementation using
 store would answer a question the caller never asked.
 
 Delegation is usually what you want when it applies: it is faster, costs no metered CPU, speaks
-HTTP/2 and /3, and reaches origins raw sockets are forbidden from dialling.
+HTTP/3 — which this package cannot — and reaches origins raw sockets are forbidden from dialling.
 
 ### Timeouts
 
