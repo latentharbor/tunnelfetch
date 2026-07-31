@@ -234,6 +234,8 @@ const MAX_RECORDS = 512;
 /** Ciphertext is built once per isolate and sliced per request, so the encrypt side — which is
  *  setup, not the thing under test — never lands inside a measured request after the first. */
 const prebuilt = { plain: null, chunked: null };
+/** Per-isolate signature keys; see the keygen note in the sigverify op. */
+const SIGKEYS = new Map();
 
 async function prebuild(which, key16, iv) {
   if (prebuilt[which]) return prebuilt[which];
@@ -273,7 +275,7 @@ async function buildRecords(payload, key16, iv) {
  * `wrangler tail` reports, differenced across two runs with different `n` — that isolates the
  * marginal cost of one operation from the fixed cost of the request.
  */
-async function cryptoBench(op, n) {
+async function cryptoBench(op, n, extra = null) {
   const key16 = new Uint8Array(16).fill(7);
   const iv = new Uint8Array(12).fill(9);
   let sink = 0;
@@ -389,6 +391,42 @@ async function cryptoBench(op, n) {
     return { op, n, verified: sink };
   }
 
+  if (op === 'sigverify') {
+    // Signature verification priced per curve, keygen hoisted out of the loop so differencing two
+    // `n` values isolates the verify itself. Worth measuring precisely because chain validation
+    // does one of these per link, and a claim that one curve is an order of magnitude slower than
+    // another on this runtime is the kind of thing that gets reported upstream — so it should not
+    // rest on a single second-hand number.
+    const alg = extra || 'p256';
+    // Keys are generated once per isolate. RSA-2048 keygen costs 50-400 ms with enormous variance
+    // on this runtime, which swamps the differencing entirely — a first attempt at this produced a
+    // NEGATIVE marginal cost, which is how the contamination announced itself.
+    const cached = SIGKEYS.get(alg);
+    let pair; let params; let signParams;
+    if (cached) {
+      ({ pair, params } = cached); signParams = params;
+    } else if (alg === 'rsa2048') {
+      pair = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']);
+      params = { name: 'RSASSA-PKCS1-v1_5' }; signParams = params;
+    } else {
+      const curve = alg === 'p384' ? 'P-384' : alg === 'p521' ? 'P-521' : 'P-256';
+      const hash = curve === 'P-384' ? 'SHA-384' : curve === 'P-521' ? 'SHA-512' : 'SHA-256';
+      pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: curve }, true, ['sign', 'verify']);
+      params = { name: 'ECDSA', hash }; signParams = params;
+    }
+    const msg = new Uint8Array(256);
+    const sig = cached ? cached.sig : await crypto.subtle.sign(signParams, pair.privateKey, msg);
+    if (!cached) SIGKEYS.set(alg, { pair, params, sig });
+    for (let i = 0; i < n; i++) {
+      // A signature that fails fast would price the rejection path, not verification, so this
+      // verifies a genuinely valid pair every time.
+      if (!(await crypto.subtle.verify(params, pair.publicKey, sig, msg))) throw new Error('bad sig');
+      sink++;
+    }
+    return { op, alg, n, verified: sink };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };
@@ -409,7 +447,7 @@ export default {
       // `prebuilt` is per-isolate, so whether this request paid for the fixture matters to the
       // reading and must be recorded before the work, not inferred after it.
       markPath(op, { prebuilt: Boolean(prebuilt.plain || prebuilt.chunked) });
-      return Response.json(await cryptoBench(op, n));
+      return Response.json(await cryptoBench(op, n, url.searchParams.get('alg')));
     }
     if (!env.PROBE_TOKEN || request.headers.get('x-probe-token') !== env.PROBE_TOKEN) {
       return new Response('forbidden', { status: 403 });

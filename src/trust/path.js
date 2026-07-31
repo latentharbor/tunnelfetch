@@ -1,3 +1,25 @@
+// Cost profile, measured on the target runtime, recorded because it is counter-intuitive enough
+// that it has already sent one optimisation effort at the wrong target.
+//
+// Validating a chain costs ~3.5 ms for an all-ECDSA chain and ~0.8 ms for an RSA one. Almost all
+// of that is signature verification, not parsing: parseCertificate over a whole chain is ~158 us,
+// while a single ECDSA P-384 verify is ~665-816 us — 12x a P-256 verify (~56 us) and ~27x an
+// RSA-2048 verify (~25 us). A typical EC chain carries two P-384 links, so two operations account
+// for most of the total.
+//
+// This is not a runtime defect and it is not worth reporting as one: the same measurement in Node
+// gives RSA 26 us, P-256 53 us, P-384 371 us, so P-384 is intrinsically expensive and this runtime
+// is only ~2x slower at it. (An earlier investigation reported Node verifying all three in ~16 us
+// and concluded the runtime had a pathological P-384 implementation; that Node measurement did not
+// reproduce, and a P-384 verify faster than an RSA-2048 verify is not a plausible result.)
+//
+// The consequences that matter: there is no headroom here, because a signature check cannot be
+// skipped and hand-rolling P-384 in JavaScript would be both slower and a new security-critical
+// implementation this package exists to avoid. The cost is paid once per CONNECTION, so reuse is
+// what amortises it — a pooled request is ~0.88 ms against ~9-12 ms for a new EC connection. And
+// an origin whose certificate chain is RSA or P-256 validates several times cheaper here than one
+// using P-384, which is worth knowing if you control the origin.
+
 // RFC 5280 s6.1 certification path building and validation.
 //
 // The chain arrives leaf-first, but nothing else about it is trusted: real servers ship
