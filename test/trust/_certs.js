@@ -307,6 +307,7 @@ export function makeCert(opts) {
     keyType,
     spkiDer,
     ski: skiBytes,
+    serial,
     notBefore,
     notAfter,
   };
@@ -334,4 +335,149 @@ export function flipSignatureByte(der) {
   const out = der.slice();
   out[out.length - 4] ^= 0x01;
   return out;
+}
+
+// ------------------------------------------------------------------ OCSP responses (RFC 6960)
+
+export const enumerated = (v) => tlv(0x0a, [v]);
+
+/** GeneralizedTime — OCSP uses it for every timestamp, regardless of the year. */
+export function genTime(ms) {
+  const d = new Date(ms);
+  const s =
+    String(d.getUTCFullYear()).padStart(4, '0') + two(d.getUTCMonth() + 1) + two(d.getUTCDate()) +
+    two(d.getUTCHours()) + two(d.getUTCMinutes()) + two(d.getUTCSeconds()) + 'Z';
+  return tlv(0x18, ascii(s));
+}
+
+/** Minimal TLV walk for fixtures; the real reader under test lives in src/trust/der.js. */
+function tlvAt(buf, o) {
+  let len = buf[o + 1];
+  let head = 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[o + 2 + i];
+    head = 2 + n;
+  }
+  return { contentStart: o + head, contentEnd: o + head + len };
+}
+
+/** The subjectPublicKey BIT STRING payload of an SPKI — what OCSP's issuerKeyHash hashes. */
+export function spkiKeyBytes(spkiDer) {
+  const outer = tlvAt(spkiDer, 0);
+  const alg = tlvAt(spkiDer, outer.contentStart);
+  const bits = tlvAt(spkiDer, alg.contentEnd);
+  return spkiDer.subarray(bits.contentStart + 1, bits.contentEnd); // skip the unused-bits octet
+}
+
+const OCSP_HASH = {
+  sha1: { oid: '1.3.14.3.2.26', node: 'sha1' },
+  sha256: { oid: '2.16.840.1.101.3.4.2.1', node: 'sha256' },
+};
+
+const DAY = 24 * 3600 * 1000;
+
+/**
+ * Mint one DER OCSPResponse. Honest by default: a `successful` basic response whose CertID names
+ * `subject` under `issuer` (SHA-1 hashes, like real responders), status `good`, a live
+ * thisUpdate/nextUpdate window, signed by `issuer`'s key with the responder identified byName.
+ * Every field can be bent independently so a negative test changes exactly one thing.
+ *
+ * Options:
+ *   issuer            bundle whose name/key the CertID hashes and whose key signs (required)
+ *   subject           bundle whose serial the response covers (required)
+ *   status            'good' | 'revoked' | 'unknown'
+ *   revocationTime / reason    for 'revoked'; reason null omits the field
+ *   thisUpdate / nextUpdate / producedAt   epoch ms; nextUpdate null omits the field
+ *   signer            bundle that signs tbsResponseData and that responderId names (default issuer)
+ *   sigHash           'sha256' (default) | 'sha1' — the RESPONSE signature hash
+ *   responderId       'byName' | 'byKey'
+ *   certs             DER certificates to attach (a delegated responder's, typically)
+ *   hashAlg           'sha1' (default) | 'sha256' — the CertID hash
+ *   serialOverride    number, to mint a response about a different serial
+ *   nameHashOverride / keyHashOverride    raw bytes, to corrupt the CertID hashes
+ *   extraSingles      option objects (issuer/subject/status/...) prepended as more SingleResponses
+ *   responseStatus    non-zero mints a status-only response (tryLater etc.), no responseBytes
+ *   responseType      OID string, default id-pkix-ocsp-basic
+ *   singleExtensions / responseExtensions   [{ oid, critical, value }]
+ *   encodeVersion     number: explicitly encode ResponseData version (always illegal)
+ *   tamperSignature   flip one bit of the response signature
+ */
+export function makeOcspResponse(opts) {
+  const {
+    issuer, subject,
+    signer = issuer,
+    sigHash = 'sha256',
+    responderId = 'byName',
+    certs = [],
+    responseStatus = 0,
+    responseType = '1.3.6.1.5.5.7.48.1.1',
+    responseExtensions = null,
+    encodeVersion = null,
+    tamperSignature = false,
+    producedAt = (opts.thisUpdate ?? Date.now() - 3600 * 1000),
+    extraSingles = [],
+  } = opts;
+
+  if (responseStatus !== 0) return { der: seq(enumerated(responseStatus)) };
+
+  const buildSingle = (o) => {
+    const h = OCSP_HASH[o.hashAlg ?? 'sha1'];
+    const hash = (b) => new Uint8Array(createHash(h.node).update(b).digest());
+    const certId = seq(
+      seq(oid(o.hashOidOverride ?? h.oid), nul()),
+      octet(o.nameHashOverride ?? hash(o.issuer.dnBytes)),
+      octet(o.keyHashOverride ?? hash(spkiKeyBytes(o.issuer.spkiDer))),
+      int(o.serialOverride ?? o.subject.serial),
+    );
+    const status = o.status ?? 'good';
+    const statusDer =
+      status === 'good' ? ctxPrim(0, new Uint8Array(0))
+      : status === 'unknown' ? ctxPrim(2, new Uint8Array(0))
+      : ctx(1, genTime(o.revocationTime ?? Date.now() - DAY),
+          ...(o.reason === null ? [] : [ctx(0, enumerated(o.reason ?? 1))]));
+    const thisUpdate = o.thisUpdate ?? Date.now() - 3600 * 1000;
+    const nextUpdate = o.nextUpdate === undefined ? Date.now() + 7 * DAY : o.nextUpdate;
+    return seq(
+      certId,
+      statusDer,
+      genTime(thisUpdate),
+      ...(nextUpdate === null ? [] : [ctx(0, genTime(nextUpdate))]),
+      ...(o.singleExtensions
+        ? [ctx(1, seq(...o.singleExtensions.map((e) => extension(e.oid, e.critical, e.value))))]
+        : []),
+    );
+  };
+
+  const singles = [...extraSingles.map(buildSingle), buildSingle(opts)];
+
+  const keyBits = spkiKeyBytes(signer.spkiDer);
+  const rid = responderId === 'byKey'
+    ? ctx(2, octet(new Uint8Array(createHash('sha1').update(keyBits).digest())))
+    : ctx(1, signer.dnBytes);
+
+  const tbs = seq(
+    ...(encodeVersion === null ? [] : [ctx(0, int(encodeVersion))]),
+    rid,
+    genTime(producedAt),
+    seq(...singles),
+    ...(responseExtensions
+      ? [ctx(1, seq(...responseExtensions.map((e) => extension(e.oid, e.critical, e.value))))]
+      : []),
+  );
+
+  const sigAlg = sigAlgFor(signer.keyType, sigHash, false);
+  let signature = signTbs(tbs, signer.privateKey, signer.keyType, sigHash, false);
+  if (tamperSignature) {
+    signature = signature.slice();
+    signature[signature.length - 5] ^= 0x01;
+  }
+  const basic = seq(
+    tbs,
+    sigAlg,
+    bitstr(signature, 0),
+    ...(certs.length ? [ctx(0, seq(...certs.map((d) => Uint8Array.from(d))))] : []),
+  );
+  return { der: seq(enumerated(0), ctx(0, seq(oid(responseType), octet(basic)))) };
 }

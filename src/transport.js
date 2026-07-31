@@ -159,7 +159,10 @@ export async function openConnection({
           hostname: target.hostname,
           // Bound to this request's trust configuration, so a caller who asked for pinning gets
           // pinning on this connection and nothing else can quietly substitute a laxer policy.
-          verifyPeer: (chain, hostname) => verifyChain({ chain, hostname, trust, now }),
+          // The driver's third argument carries the stapled OCSP response when the server sent
+          // one; it is judged inside verifyChain under this same trust config.
+          verifyPeer: (chain, hostname, details) =>
+            verifyChain({ chain, hostname, trust, now, ocspResponse: details?.ocspResponse ?? null }),
           options: tls,
           deps,
         }),
@@ -240,6 +243,16 @@ export function nativeFetchCanServe({ proxy, trust, tls, forceTunnel }) {
       ok: false,
       reason: `trust mode "${mode}" cannot be expressed to the platform's fetch(), which exposes ` +
         'no certificate hooks',
+    };
+  }
+  if (trust?.revocation !== undefined && trust.revocation !== 'staple') {
+    // 'require-staple' is a strictness the platform's fetch cannot promise (it exposes no OCSP
+    // hooks), and an INVALID value must reach the tunnel path where the trust layer refuses it
+    // loudly — delegation would swallow the config error whole. Only the default posture (spelled
+    // or not) is delegatable, matching how an unspelled default has always been.
+    return {
+      ok: false,
+      reason: `trust.revocation "${trust.revocation}" cannot be honoured by the platform's fetch()`,
     };
   }
   if (tls && Object.keys(tls).length > 0) {

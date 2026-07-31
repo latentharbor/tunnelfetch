@@ -11,6 +11,8 @@ new Client({ trust: { mode: 'none', insecureAcceptAnyCertificate: true } });
 new Client({ trust: { mode: 'anchors', anchors: ['-----BEGIN CERTIFICATE-----'] } });
 new Client({ trust: { mode: 'anchors', anchors: [new Uint8Array([0x30])] } });
 new Client({ trust: { mode: 'custom', verify: async () => {} } });
+new Client({ trust: { mode: 'system', revocation: 'require-staple' } });
+new Client({ trust: { mode: 'anchors', anchors: [new Uint8Array([0x30])], revocation: 'staple' } });
 new Client({ maxRedirects: 10, maxBodyBytes: 1024, cookies: true, forceTunnel: true });
 new Client({ timeouts: { connectMs: 1000, idleMs: 5000 } });
 new Client({ proxy: 'http://user:pass@proxy.example:8080' });

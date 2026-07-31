@@ -73,8 +73,12 @@ const describeType = (t) => `${hex8(t)} (${HS_NAME[t] ?? 'unknown'})`;
 
 /**
  * The injected trust decision. Must throw to reject; resolves with the validated leaf, whose
- * SPKI is the only key a driver will accept a handshake signature from.
- * @typedef {(chain: Uint8Array[], hostname: string)
+ * SPKI is the only key a driver will accept a handshake signature from. `details.ocspResponse`
+ * is the peer's stapled DER OCSPResponse when it sent one — delivered here, at the same moment
+ * as the chain, because revocation is part of deciding whether to believe the certificate and
+ * must be settled before anything of ours goes on the wire.
+ * @typedef {(chain: Uint8Array[], hostname: string,
+ *   details?: { ocspResponse: Uint8Array | null })
  *   => Promise<{ spki: { spkiDer: Uint8Array } }>} VerifyPeer
  */
 
@@ -273,6 +277,19 @@ export async function continueTls13(ctx) {
   const eeExts = decodeExtensionBlock(eeCursor.vector(2, 'extensions'), 'EncryptedExtensions');
   eeCursor.end('EncryptedExtensions');
   rejectUnofferedExtensions(eeExts, hello.offeredExtensions, 'EncryptedExtensions');
+  if (eeExts.has(EXTENSION.status_request)) {
+    // We DID offer status_request, so the unoffered-extension check above cannot catch this —
+    // but RFC 8446 s4.2 places the server's answer in the leaf's CertificateEntry, never in
+    // EncryptedExtensions, and an extension in a message it is not specified for is a fatal
+    // illegal_parameter, not a tolerable relocation. Accepting a staple from here would also
+    // move it outside the certificate it is supposed to be bound to.
+    throw new TlsError(
+      codes.TLS_HANDSHAKE,
+      'server sent status_request in EncryptedExtensions; in TLS 1.3 a stapled certificate ' +
+        "status belongs in the leaf's CertificateEntry (RFC 8446 s4.4.2.1)",
+      { extension: EXTENSION.status_request },
+    );
+  }
   const alpnProtocol = checkAlpn(eeExts, alpn, 'EncryptedExtensions');
 
   let next = await record.nextHandshakeMessage();
@@ -287,7 +304,11 @@ export async function continueTls13(ctx) {
 
   const certMsg = expect(next, HANDSHAKE_TYPE.certificate, 'Certificate');
   transcript.update(certMsg.raw);
-  const chain = parseCertificate13(certMsg.body);
+  // The leaf's CertificateEntry may carry a stapled OCSP response (RFC 8446 s4.4.2.1); it rides
+  // to the trust layer alongside the chain and is judged there, under the same fail-closed rules.
+  const { chain, ocspResponse } = parseCertificate13(certMsg.body, {
+    offeredExtensions: hello.offeredExtensions,
+  });
   const transcriptThroughCertificate = await transcript.hash();
 
   const cv = expect(
@@ -301,7 +322,7 @@ export async function continueTls13(ctx) {
   // Trust first. The signature check below is only meaningful once the key performing it has been
   // tied by the trust layer to a chain we accept for this hostname; done the other way round it
   // merely proves that whoever holds the socket also holds a key, which is no evidence at all.
-  const peer = await verifyPeer(chain, hostname);
+  const peer = await verifyPeer(chain, hostname, { ocspResponse });
   const spki = peer?.spki?.spkiDer;
   if (!spki) {
     throw new TlsError(

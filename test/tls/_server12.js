@@ -252,6 +252,9 @@ class Bail extends Error {
  *   ems                 echo extended_master_secret when offered (default true)
  *   renegotiationInfo   echo renegotiation_info when offered (default true)
  *   alpn                protocol to select, or null for none (default null)
+ *   staple              DER OCSPResponse: echo status_request in the ServerHello and send a
+ *                       CertificateStatus message right after Certificate (RFC 6066 s8)
+ *   echoStatusRequest   echo status_request but send no CertificateStatus (legal)
  *   requestCertificate  send CertificateRequest (default false)
  *   packing             'per-message' (default) | 'single' | 'split' + splitSize
  *   explicitNonceXor    8 bytes XORed into the explicit GCM nonce (still unique per record)
@@ -260,7 +263,9 @@ class Bail extends Error {
  * explicitCurve, tamperSignature, signWith, emptyCertList, echoSessionId via sessionId:'echo',
  * renegotiationInfoBody, emsBody, includeUnofferedExtension, extraExtensions ([[type, data]]),
  * doneBody, outOfOrder, helloRequest ('before-server-hello' | 'after-handshake'),
- * fatalAlertAfterServerHello, closeAfterServerHello, skipCcs, wrongFinished.
+ * fatalAlertAfterServerHello, closeAfterServerHello, skipCcs, wrongFinished,
+ * stapleWithoutEcho (CertificateStatus with no ServerHello echo), statusEchoBody (non-empty
+ * echo), stapleStatusType (CertificateStatus status_type other than ocsp(1)).
  */
 export function startServer12({ readable, writable }, opts = {}) {
   const state = {
@@ -422,6 +427,7 @@ async function run(br, writer, opts, state) {
     hasEms: ch.extensions.has(23),
     hasRenegotiationInfo: ch.extensions.has(0xff01),
     hasEcPointFormats: ch.extensions.has(11),
+    hasStatusRequest: ch.extensions.has(5),
     sni: decodeSni(ch.extensions.get(0)),
     alpn: decodeAlpnList(ch.extensions.get(16)),
     groups: ch.extensions.has(10) ? u16List(ch.extensions.get(10)) : [],
@@ -449,6 +455,12 @@ async function run(br, writer, opts, state) {
   }
   if (emsActive) extensions.push(ext(23, opts.emsBody ?? new Uint8Array(0)));
   if (state.clientHello.hasEcPointFormats) extensions.push(ext(11, Uint8Array.of(1, 0)));
+  // RFC 6066 s8: the empty status_request echo that licenses a later CertificateStatus message.
+  // `staple` implies the echo; `echoStatusRequest` echoes without ever sending the message
+  // (legal); `stapleWithoutEcho` sends the message with no echo (illegal, for negative tests).
+  if (state.clientHello.hasStatusRequest && (opts.staple || opts.echoStatusRequest)) {
+    extensions.push(ext(5, opts.statusEchoBody ?? new Uint8Array(0)));
+  }
   if (alpnSelected) {
     const name = ascii(alpnSelected);
     extensions.push(ext(16, concat([u16(name.byteLength + 1), u8(name.byteLength), name])));
@@ -510,6 +522,12 @@ async function run(br, writer, opts, state) {
   const serverHelloDone = hs(14, opts.doneBody ?? new Uint8Array(0));
 
   const flight = [serverHello, certificate];
+  const stapleDer = opts.staple ?? opts.stapleWithoutEcho;
+  if (stapleDer) {
+    // CertificateStatus (RFC 6066 s8): status_type ocsp(1) + u24-length DER OCSPResponse,
+    // immediately after Certificate.
+    flight.push(hs(22, concat([u8(opts.stapleStatusType ?? 1), u24(stapleDer.byteLength), stapleDer])));
+  }
   if (!opts.omitServerKeyExchange) flight.push(serverKeyExchange);
   if (opts.outOfOrder) {
     // Swap Certificate and ServerKeyExchange: same messages, illegal order.

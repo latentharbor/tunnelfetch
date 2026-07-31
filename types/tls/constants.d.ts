@@ -17,6 +17,7 @@ export namespace HANDSHAKE_TYPE {
     let certificate_verify: number;
     let client_key_exchange: number;
     let finished: number;
+    let certificate_status: number;
     let key_update: number;
     let message_hash: number;
 }

@@ -21,6 +21,7 @@ export const TAG = {
   OCTET_STRING: 4,
   NULL: 5,
   OID: 6,
+  ENUMERATED: 10,
   UTF8_STRING: 12,
   SEQUENCE: 16,
   SET: 17,

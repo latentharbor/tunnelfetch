@@ -40,8 +40,10 @@
 //     required policy set, RFC 5280 policy processing cannot fail a path. policyConstraints and
 //     inhibitAnyPolicy — which would change that — are always critical and are NOT in
 //     KNOWN_EXTENSIONS, so a path carrying them is rejected, never quietly mis-validated.
-//   * Revocation (CRL/OCSP): unreachable from a metered edge runtime mid-handshake. This is a
-//     documented gap, not a silent one.
+//   * Revocation FETCHING (CRL downloads, responder queries): unreachable from a metered edge
+//     runtime mid-handshake, and a privacy leak besides. Revocation is instead checked from a
+//     stapled OCSP response when the handshake carries one — see src/trust/ocsp.js for the
+//     verification and src/trust/index.js for the policy on absence.
 
 import { CertificateError, ConfigError, codes } from '../errors.js';
 import { equal, toHex } from '../util/bytes.js';
@@ -184,14 +186,28 @@ function ecdsaDerToRaw(sig, orderLen, subject) {
 }
 
 /**
- * Verify `cert`'s signature over its original TBSCertificate bytes with the issuer's public key.
+ * Verify `cert`'s signature over its original to-be-signed bytes with the signer's public key.
  *
  * The scheme comes from resolveSignatureScheme (which is where MD5/SHA-1 die, before any
  * cryptography runs). For ECDSA the curve belongs to the issuer's key, not the OID, so the
  * WebCrypto import parameters are chosen from the issuer's SPKI and only the hash from the OID —
  * both looked up in SIG_SCHEME_PARAMS rather than re-declared here.
+ *
+ * Exported (as verifySignedObject) for the OCSP checker: a BasicOCSPResponse is signed exactly
+ * like a certificate — an AlgorithmIdentifier, a BIT STRING over the original DER of a TBS
+ * element — and two implementations of "check an X.509-style signature" is two chances for one
+ * of them to be subtly the weaker. `cert` is therefore the structural subset both callers can
+ * supply: `{ tbsBytes, signature, signatureAlgorithm, subject: { text } }`, which a parsed
+ * Certificate satisfies as-is and the OCSP checker fakes up from response fields.
+ *
+ * @param {{ tbsBytes: Uint8Array, signature: Uint8Array,
+ *           signatureAlgorithm: import('./x509.js').AlgorithmId,
+ *           subject: { text: string } }} cert what was signed, certificate-shaped
+ * @param {Uint8Array} issuerSpkiDer the signer's SubjectPublicKeyInfo, DER
+ * @param {string} issuerText the signer's name, for error messages
+ * @returns {Promise<void>} every failure throws a typed CertificateError
  */
-async function verifyCertSignature(cert, issuerSpkiDer, issuerText) {
+export async function verifySignedObject(cert, issuerSpkiDer, issuerText) {
   const scheme = resolveSignatureScheme(cert); // throws CERT_SIGNATURE_WEAK / _UNSUPPORTED
   const issuerSpki = parseSubjectPublicKeyInfo(issuerSpkiDer);
   const mismatch = (why) =>
@@ -289,7 +305,7 @@ async function buildPath(certs, anchorSource, maxPathLength) {
       .filter((a) => kidCompatible(current.authorityKeyIdentifier, a.subjectKeyIdentifier ?? null));
     for (const anchor of anchorCandidates) {
       try {
-        await verifyCertSignature(current, anchor.spkiDer, anchor.subjectText ?? '<anchor>');
+        await verifySignedObject(current, anchor.spkiDer, anchor.subjectText ?? '<anchor>');
         return { path, anchor, topVerified: true };
       } catch (e) {
         // Only "this particular key did not make this signature" keeps the search going; a weak
@@ -315,7 +331,7 @@ async function buildPath(certs, anchorSource, maxPathLength) {
     } else if (candidates.length > 1) {
       for (const i of candidates) {
         try {
-          await verifyCertSignature(current, certs[i].spki.spkiDer, certs[i].subject.text);
+          await verifySignedObject(current, certs[i].spki.spkiDer, certs[i].subject.text);
           chosen = i;
           break;
         } catch (e) {
@@ -494,7 +510,7 @@ export async function validatePath(
 
     const parent = j === path.length - 1 ? null : path[j + 1];
     if (!(topVerified && parent === null)) {
-      await verifyCertSignature(
+      await verifySignedObject(
         cert,
         parent ? parent.spki.spkiDer : anchor.spkiDer,
         parent ? parent.subject.text : (anchor.subjectText ?? '<anchor>'),

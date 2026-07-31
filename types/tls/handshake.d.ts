@@ -34,9 +34,14 @@ export function continueTls13(ctx: HandshakeContext): Promise<import("./connect.
 export const DEFAULT_OFFER_GROUPS: number[];
 /**
  * The injected trust decision. Must throw to reject; resolves with the validated leaf, whose
- * SPKI is the only key a driver will accept a handshake signature from.
+ * SPKI is the only key a driver will accept a handshake signature from. `details.ocspResponse`
+ * is the peer's stapled DER OCSPResponse when it sent one — delivered here, at the same moment
+ * as the chain, because revocation is part of deciding whether to believe the certificate and
+ * must be settled before anything of ours goes on the wire.
  */
-export type VerifyPeer = (chain: Uint8Array[], hostname: string) => Promise<{
+export type VerifyPeer = (chain: Uint8Array[], hostname: string, details?: {
+    ocspResponse: Uint8Array | null;
+}) => Promise<{
     spki: {
         spkiDer: Uint8Array;
     };

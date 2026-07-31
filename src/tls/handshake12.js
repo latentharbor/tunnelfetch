@@ -61,6 +61,7 @@ import {
   deriveSharedSecret,
   generateKeyShare,
   parseCertificate12,
+  parseCertificateStatus,
   parseServerKeyExchangeEcdhe,
   serverKeyExchangeContent,
   verifyHandshakeSignature,
@@ -266,6 +267,19 @@ export async function continueTls12(ctx) {
   }
   const extendedMasterSecret = emsEcho !== undefined;
 
+  // RFC 6066 s8: a server that intends to send CertificateStatus announces it by echoing
+  // status_request with EMPTY extension_data. The echo is permission to send the message, not a
+  // promise to — a server may echo and then have nothing to staple.
+  const statusEcho = sh.extensions.get(EXTENSION.status_request);
+  if (statusEcho && statusEcho.byteLength !== 0) {
+    throw new TlsError(
+      codes.TLS_HANDSHAKE,
+      `status_request in a ServerHello must have empty extension_data (RFC 6066 s8), got ` +
+        `${statusEcho.byteLength} bytes`,
+      { length: statusEcho.byteLength },
+    );
+  }
+
   // In 1.2 the ALPN answer lives in the ServerHello — there is no EncryptedExtensions.
   const alpnProtocol = checkAlpn(sh.extensions, alpn, 'ServerHello');
   transcript.update(rawServerHello);
@@ -280,6 +294,27 @@ export async function continueTls12(ctx) {
   const chain = parseCertificate12(certMsg.body);
 
   let next = await record.nextHandshakeMessage();
+
+  // CertificateStatus (RFC 6066 s8): the stapled OCSP response, arriving as its own handshake
+  // message immediately after Certificate — TLS 1.2's shape of what 1.3 carries inside the
+  // CertificateEntry. Legal only when the ServerHello echoed status_request; a staple nobody
+  // announced is a message from outside the negotiated protocol and ends the handshake. It is
+  // optional even when announced. The message must be folded into the transcript exactly here,
+  // like every other handshake message, or both Finished computations drift.
+  let ocspResponse = null;
+  if (next !== null && !next.ccs && next.type === HANDSHAKE_TYPE.certificate_status) {
+    if (statusEcho === undefined) {
+      throw new TlsError(
+        codes.TLS_HANDSHAKE,
+        'server sent CertificateStatus without echoing status_request in its ServerHello ' +
+          '(RFC 6066 s8 requires the echo first)',
+      );
+    }
+    ocspResponse = parseCertificateStatus(next.body, 'CertificateStatus');
+    transcript.update(next.raw);
+    next = await record.nextHandshakeMessage();
+  }
+
   if (
     next !== null &&
     !next.ccs &&
@@ -335,7 +370,7 @@ export async function continueTls12(ctx) {
   // round it merely proves that whoever holds the socket also holds a key, which is no evidence
   // at all. Nothing of ours — no key share, no Finished — has been sent yet, so a failure here
   // leaks nothing but the ClientHello.
-  const peer = await verifyPeer(chain, hostname);
+  const peer = await verifyPeer(chain, hostname, { ocspResponse });
   const spki = peer?.spki?.spkiDer;
   if (!spki) {
     throw new TlsError(

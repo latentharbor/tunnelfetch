@@ -52,6 +52,15 @@ export function rawExtension(type, data) {
 }
 
 /**
+ * A status_request CertificateEntry extension carrying a DER OCSPResponse (RFC 8446 s4.4.2.1:
+ * the extension body is the RFC 6066 CertificateStatus shape). Exported so tests can plant
+ * staples on arbitrary entries through `entryExtensions`.
+ */
+export function stapleEntryExtension(ocspDer) {
+  return rawExtension(EXTENSION.status_request, new Builder().u8(1).vector(3, ocspDer).build());
+}
+
+/**
  * Parse a ClientHello body. Strict about the parts a real server must be strict about
  * (legacy_version, null-only compression) so a client regression in those fields fails the
  * handshake instead of being absorbed by a permissive test double.
@@ -221,6 +230,11 @@ function killableTransport({ readable, writable }) {
  *   alpn                    protocol to select in EncryptedExtensions (absent = no ALPN ext)
  *   eeExtra                 raw extension blobs appended to EncryptedExtensions
  *   extraChain              extra DER certs after the leaf; emptyCertificateList sends none
+ *   staple                  DER OCSPResponse to attach to the LEAF CertificateEntry as a
+ *                           status_request extension (RFC 8446 s4.4.2.1)
+ *   entryExtensions         { [index]: rawBytes } raw extension-block bytes per CertificateEntry,
+ *                           overriding `staple` for that index — for malformed and misplaced
+ *                           staples
  *   cvTranscript            'throughEncryptedExtensions' signs the WRONG transcript point
  *   signWith / cvScheme     sign CertificateVerify with a different key / claim a scheme
  *   corruptFinished         flip a byte of the server Finished verify_data
@@ -357,7 +371,11 @@ async function drive(record, identity, opts, state, kill) {
   const ee = handshakeMessage(HANDSHAKE_TYPE.encrypted_extensions, vector(2, concat(eeParts)));
 
   const chain = opts.emptyCertificateList ? [] : [identity.certDer, ...(opts.extraChain ?? [])];
-  const entries = concat(chain.map((der) => new Builder().vector(3, der).vector(2, EMPTY).build()));
+  const entries = concat(chain.map((der, i) => {
+    let exts = i === 0 && opts.staple ? stapleEntryExtension(opts.staple) : EMPTY;
+    if (opts.entryExtensions?.[i] !== undefined) exts = opts.entryExtensions[i];
+    return new Builder().vector(3, der).vector(2, exts).build();
+  }));
   const certMsg = handshakeMessage(
     HANDSHAKE_TYPE.certificate,
     new Builder().vector(1, EMPTY).vector(3, entries).build(),

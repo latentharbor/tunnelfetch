@@ -184,6 +184,14 @@ for await (const chunk of res.body) {
 { mode: 'none', insecureAcceptAnyCertificate: true } // no verification at all
 ```
 
+吊销状态通过 **OCSP stapling**（RFC 6960，经 TLS `status_request` 扩展）检查：每个 hello 都请求服务器附上装订响应；收到的装订响应必须严格解析、与已验证证书的签发者和序列号匹配、签名经签发 CA 或其授权应答者验证通过、且处于新鲜度窗口之内——已验证的 `revoked`（以及 `unknown`）一律使连接失败。服务器**没有**装订时默认放行，因为大多数服务器不装订，硬性失败会弄断大半个网络；已知对端会装订的调用方可以强制要求：
+
+```js
+{ mode: 'system', revocation: 'require-staple' }    // 缺失即 OCSP_REQUIRED
+```
+
+刻意不存在任何能忽略 revoked 结论的配置值。
+
 `mode: 'none'` 必须同时带上第二个标志；靠打错字是到不了这一档的。pin 不匹配时会把实际看到的 pin 报出来，正确的值可以直接从日志里复制：
 
 ```
@@ -228,7 +236,7 @@ CertificateError [CERT_PIN_MISMATCH]: no certificate in the chain matches any co
 - **RSA 密钥传输。** 没有前向保密。
 - **ChaCha20-Poly1305。** 加上它换不来任何东西：服务器只能从我们报出的套件里选，TLS 1.3 强制要求 AES-128-GCM，而 AES-GCM 在 TLS 1.2 的实际部署中无处不在。WebCrypto 没有 ChaCha20，要提供它就得引入 `node:crypto` 依赖，兼容性收益却是零。
 - **客户端证书 (mTLS)、会话恢复、0-RTT、重协商。** 收到 `HelloRequest` 会拒绝，而不是照办。
-- **证书吊销 (CRL / OCSP)。** 检查吊销需要在握手中途发一次网络请求；这没有实现，而假装实现了比坦白说明更糟。
+- **吊销信息的主动获取（下载 CRL、查询 OCSP 应答者）。** 两者都要在握手中途经代理多跑网络往返，而且 OCSP 查询会把你访问的源站告诉 CA。吊销状态**会**从服务器装订（staple）的 OCSP 响应中校验（见上文 Trust 一节）；没有实现、也不打算实现的，是替服务器去取它没有装订的东西。
 - **证书策略处理** (`policyConstraints`、`inhibitAnyPolicy`)。它们永远是 critical 的，所以一旦出现就直接拒绝，而不是被错误地校验过去。
 - **dNSName 与 iPAddress 之外的名称约束。** 标为 *critical* 且指名不支持类型的约束扩展会被拒绝；非 critical 的则按 RFC 5280 允许的那样忽略。
 - **cookie 的 public suffix list。** 只实现了“域名里没有点”这一道防护，所以 `Domain=com` 会被拒绝，`Domain=co.uk` 不会。如实写明，而不是伪造。
@@ -363,7 +371,7 @@ WebCrypto (X25519、ECDH P-256/384/521、ECDSA、RSA-PSS、RSASSA-PKCS1、HKDF�
 ## 测试
 
 ```bash
-npm test          # 866 offline tests, hermetic, no network
+npm test          # 984 offline tests, hermetic, no network
 npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 ```
 

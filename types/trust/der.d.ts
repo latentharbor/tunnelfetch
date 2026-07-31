@@ -181,6 +181,7 @@ export namespace TAG {
     let OCTET_STRING: number;
     let NULL: number;
     let OID: number;
+    let ENUMERATED: number;
     let UTF8_STRING: number;
     let SEQUENCE: number;
     let SET: number;

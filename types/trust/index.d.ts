@@ -3,29 +3,44 @@
  * @typedef {string | Uint8Array} AnchorInput
  */
 /**
+ * Revocation policy, for the modes that validate chains. Checking is via stapled OCSP only, so
+ * the knob decides what a MISSING staple means: `'staple'` (the default) tolerates absence but
+ * fully verifies any staple that is present; `'require-staple'` makes absence OCSP_REQUIRED.
+ * A verified `revoked` or `unknown` verdict is fatal under both — no value ignores it.
+ * @typedef {'staple' | 'require-staple'} RevocationPolicy
+ */
+/**
  * Verify against the bundled CCADB root store. The default.
- * @typedef {{ mode?: 'system' }} SystemTrust
+ * @typedef {{ mode?: 'system', revocation?: RevocationPolicy }} SystemTrust
  */
 /**
  * Verify against exactly these anchors and nothing else. The bundled store is not consulted.
- * @typedef {{ mode: 'anchors', anchors: AnchorInput[] }} AnchorsTrust
+ * @typedef {{ mode: 'anchors', anchors: AnchorInput[],
+ *             revocation?: RevocationPolicy }} AnchorsTrust
  */
 /**
  * Full path validation, plus a requirement that some certificate in the accepted path (or its
  * anchor) match one of `pins`. Pins are `sha256/` followed by the base64 SHA-256 of a
  * SubjectPublicKeyInfo, the same spelling HPKP used.
- * @typedef {{ mode: 'pinned', pins: string[], anchors?: AnchorInput[] }} PinnedTrust
+ * @typedef {{ mode: 'pinned', pins: string[], anchors?: AnchorInput[],
+ *             revocation?: RevocationPolicy }} PinnedTrust
  */
 /**
  * No path validation at all. `insecureAcceptAnyCertificate` is mandatory and must be `true`, so
  * that this mode can never be reached by a typo in `mode`. Supplying `pins` turns it into
- * pin-only trust: no chain is built, but a pin must still match.
+ * pin-only trust: no chain is built, but a pin must still match. `revocation` is refused here:
+ * without a validated issuer there is no trusted key to verify a staple against, so the check
+ * cannot be performed honestly and pretending otherwise would be worse.
  * @typedef {{ mode: 'none', insecureAcceptAnyCertificate: true, pins?: string[] }} NoTrust
  */
 /**
- * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it.
+ * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it. The third
+ * argument carries the peer's stapled OCSP response (DER, or null) so a custom policy can judge
+ * revocation itself — `verifyOcspStaple` is exported for exactly that.
  * @typedef {{ mode: 'custom',
- *             verify: (chain: Uint8Array[], hostname: string) => void | Promise<void> }} CustomTrust
+ *             verify: (chain: ParsedCertificate[], hostname: string,
+ *                      details?: { ocspResponse: Uint8Array | null })
+ *               => void | Promise<void> }} CustomTrust
  */
 /**
  * The `verify=` knob, in httpx's spirit. Written as a discriminated union so that a TypeScript
@@ -55,13 +70,16 @@
  * @param {string} opts.hostname identity from the request URL (DNS name or IP literal)
  * @param {TrustConfig} [opts.trust] the verification policy; defaults to the bundled roots
  * @param {number} [opts.now] epoch ms, for tests and for callers with a better clock
+ * @param {Uint8Array | null} [opts.ocspResponse] the peer's stapled DER OCSPResponse, when the
+ *   handshake carried one; judged under `trust.revocation` (see the policy comment above)
  * @returns {Promise<ParsedCertificate>} the parsed leaf. Every other outcome throws.
  */
-export function verifyChain({ chain, hostname, trust, now }: {
+export function verifyChain({ chain, hostname, trust, now, ocspResponse, }: {
     chain: Uint8Array[];
     hostname: string;
     trust?: TrustConfig | undefined;
     now?: number | undefined;
+    ocspResponse?: Uint8Array<ArrayBufferLike> | null | undefined;
 }): Promise<ParsedCertificate>;
 export { matchesIdentity } from "./name.js";
 /**
@@ -69,10 +87,18 @@ export { matchesIdentity } from "./name.js";
  */
 export type AnchorInput = string | Uint8Array;
 /**
+ * Revocation policy, for the modes that validate chains. Checking is via stapled OCSP only, so
+ * the knob decides what a MISSING staple means: `'staple'` (the default) tolerates absence but
+ * fully verifies any staple that is present; `'require-staple'` makes absence OCSP_REQUIRED.
+ * A verified `revoked` or `unknown` verdict is fatal under both — no value ignores it.
+ */
+export type RevocationPolicy = "staple" | "require-staple";
+/**
  * Verify against the bundled CCADB root store. The default.
  */
 export type SystemTrust = {
     mode?: "system";
+    revocation?: RevocationPolicy;
 };
 /**
  * Verify against exactly these anchors and nothing else. The bundled store is not consulted.
@@ -80,6 +106,7 @@ export type SystemTrust = {
 export type AnchorsTrust = {
     mode: "anchors";
     anchors: AnchorInput[];
+    revocation?: RevocationPolicy;
 };
 /**
  * Full path validation, plus a requirement that some certificate in the accepted path (or its
@@ -90,11 +117,14 @@ export type PinnedTrust = {
     mode: "pinned";
     pins: string[];
     anchors?: AnchorInput[];
+    revocation?: RevocationPolicy;
 };
 /**
  * No path validation at all. `insecureAcceptAnyCertificate` is mandatory and must be `true`, so
  * that this mode can never be reached by a typo in `mode`. Supplying `pins` turns it into
- * pin-only trust: no chain is built, but a pin must still match.
+ * pin-only trust: no chain is built, but a pin must still match. `revocation` is refused here:
+ * without a validated issuer there is no trusted key to verify a staple against, so the check
+ * cannot be performed honestly and pretending otherwise would be worse.
  */
 export type NoTrust = {
     mode: "none";
@@ -102,11 +132,15 @@ export type NoTrust = {
     pins?: string[];
 };
 /**
- * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it.
+ * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it. The third
+ * argument carries the peer's stapled OCSP response (DER, or null) so a custom policy can judge
+ * revocation itself — `verifyOcspStaple` is exported for exactly that.
  */
 export type CustomTrust = {
     mode: "custom";
-    verify: (chain: Uint8Array[], hostname: string) => void | Promise<void>;
+    verify: (chain: ParsedCertificate[], hostname: string, details?: {
+        ocspResponse: Uint8Array | null;
+    }) => void | Promise<void>;
 };
 /**
  * The `verify=` knob, in httpx's spirit. Written as a discriminated union so that a TypeScript
@@ -156,4 +190,5 @@ export type ParsedCertificate = {
 };
 export { parseCertificate, decodePem } from "./x509.js";
 export { validatePath, anchorFromCertificate } from "./path.js";
+export { verifyOcspStaple, parseOcspResponse } from "./ocsp.js";
 export { systemAnchors, provenance as rootStoreProvenance } from "./roots.js";

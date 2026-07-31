@@ -67,6 +67,18 @@ test('any non-default trust policy disqualifies delegation', () => {
   }
 });
 
+test('a non-default revocation policy disqualifies delegation', () => {
+  // The platform's fetch exposes no OCSP hooks, so 'require-staple' would silently become
+  // no-check if delegated; and an invalid value must reach the trust layer's loud refusal
+  // rather than being swallowed by delegation.
+  const strict = nativeFetchCanServe({ trust: { mode: 'system', revocation: 'require-staple' } });
+  assert.equal(strict.ok, false);
+  assert.match(strict.reason, /require-staple/);
+  assert.equal(nativeFetchCanServe({ trust: { mode: 'system', revocation: 'nonsense' } }).ok, false);
+  // The default posture, spelled out, delegates exactly like the unspelled default.
+  assert.equal(nativeFetchCanServe({ trust: { mode: 'system', revocation: 'staple' } }).ok, true);
+});
+
 test('TLS options disqualify delegation', () => {
   assert.equal(nativeFetchCanServe({ tls: { alpn: ['http/1.1'] } }).ok, false);
   assert.equal(nativeFetchCanServe({ tls: {} }).ok, true, 'an empty options object asks for nothing');

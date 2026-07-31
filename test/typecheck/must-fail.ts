@@ -22,6 +22,12 @@ new Client({ trust: { mode: 'systm', } });
 // @ts-expect-error anchors mode needs anchors
 new Client({ trust: { mode: 'anchors' } });
 
+// @ts-expect-error there is no revocation value that switches the check off
+new Client({ trust: { mode: 'system', revocation: 'off' } });
+
+// @ts-expect-error mode 'none' has no validated issuer, so revocation is not expressible there
+new Client({ trust: { mode: 'none', insecureAcceptAnyCertificate: true, revocation: 'staple' } });
+
 // @ts-expect-error a numeric option is not a string
 new Client({ maxRedirects: 'ten' });
 

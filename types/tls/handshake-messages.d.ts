@@ -142,11 +142,43 @@ export function parseHelloRetryRequest(serverHello: ServerHello, { offeredGroups
     cookie: Uint8Array | null;
 };
 /**
- * TLS 1.3 Certificate (RFC 8446 s4.4.2): context, then entries carrying per-cert extensions.
+ * The CertificateStatus body of RFC 6066 s8: `status_type(1) || opaque OCSPResponse<1..2^24-1>`.
+ * Two carriers share this exact shape — the TLS 1.2 CertificateStatus handshake message, and the
+ * extension_data of a TLS 1.3 status_request CertificateEntry extension (RFC 8446 s4.4.2.1) —
+ * which is why it is one parser and not two.
+ *
  * @param {Uint8Array} body
- * @returns {Uint8Array[]} DER certificates in wire order, leaf first
+ * @param {string} where named in errors
+ * @returns {Uint8Array} the DER OCSPResponse, exactly as sent; its meaning is the trust layer's
+ *   problem, not this layer's
  */
-export function parseCertificate13(body: Uint8Array): Uint8Array[];
+export function parseCertificateStatus(body: Uint8Array, where: string): Uint8Array;
+/**
+ * TLS 1.3 Certificate (RFC 8446 s4.4.2): context, then entries carrying per-cert extensions.
+ *
+ * Entry extensions are policed, not skipped: RFC 8446 s4.4.2 allows a server to send only
+ * extensions the ClientHello offered, and s4.2 confines each type to specific messages — for
+ * CertificateEntry that is status_request and signed_certificate_timestamp. An extension we
+ * cannot attribute to our own offer is either a server confusion or a smuggling attempt, and
+ * both end the handshake.
+ *
+ * Only the LEAF's stapled OCSP response is returned. A server may staple for intermediates too;
+ * those staples are validated structurally (they must still be well-formed CertificateStatus)
+ * but not consumed — this package checks revocation of the identity it is authenticating, and
+ * inventing partial intermediate coverage would imply a guarantee it does not give.
+ *
+ * @param {Uint8Array} body
+ * @param {{ offeredExtensions?: Set<number> }} [opts] extension types our ClientHello offered.
+ *   Omitting it means "nothing was offered", the fail-closed reading.
+ * @returns {{ chain: Uint8Array[], ocspResponse: Uint8Array | null }} DER certificates in wire
+ *   order (leaf first), plus the leaf's stapled DER OCSPResponse if the server sent one
+ */
+export function parseCertificate13(body: Uint8Array, { offeredExtensions }?: {
+    offeredExtensions?: Set<number>;
+}): {
+    chain: Uint8Array[];
+    ocspResponse: Uint8Array | null;
+};
 /**
  * TLS 1.2 Certificate (RFC 5246 s7.4.2): a bare list, no context and no per-cert extensions.
  * @param {Uint8Array} body

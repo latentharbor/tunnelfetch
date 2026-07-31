@@ -395,14 +395,15 @@ test('HelloRetryRequest names a group we offered, or is refused', () => {
 
 // ------------------------------------------------------------------ Certificate messages
 
-test('parseCertificate13 reads the chain and consumes per-entry extensions', () => {
+test('parseCertificate13 reads the chain and tolerates empty per-entry extensions', () => {
   const entry = (der) => new Builder().vector(3, der).vector(2, new Uint8Array(0)).build();
   const body = new Builder()
     .vector(1, new Uint8Array(0))
     .vector(3, concat([entry(fromHex('3082aa')), entry(fromHex('3082bb'))]))
     .build();
-  const chain = parseCertificate13(body);
+  const { chain, ocspResponse } = parseCertificate13(body);
   assert.deepEqual(chain.map(toHex), ['3082aa', '3082bb']);
+  assert.equal(ocspResponse, null);
 });
 
 test('a non-empty certificate_request_context in a server Certificate is refused', () => {

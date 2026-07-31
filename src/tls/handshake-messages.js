@@ -50,8 +50,10 @@ import {
   encodeRenegotiationInfo,
   encodeServerName,
   encodeSignatureAlgorithms,
+  encodeStatusRequest,
   encodeSupportedGroups,
   encodeSupportedVersions,
+  rejectUnofferedExtensions,
   requireSupportedGroup,
 } from './extensions.js';
 
@@ -234,6 +236,9 @@ export function buildClientHello({
 
   const extensionParts = [
     encodeServerName(hostname),
+    // Always offered, for either version: without it a server may not staple (RFC 6066 s8), and
+    // a stapled OCSP response is the only revocation signal this package can consume.
+    encodeStatusRequest(),
     encodeSupportedGroups(groups),
     encodeSignatureAlgorithms(sigSchemes),
     alpn.length ? encodeAlpn(alpn) : null,
@@ -497,11 +502,58 @@ export function parseHelloRetryRequest(serverHello, { offeredGroups }) {
 // ------------------------------------------------------------------ Certificate
 
 /**
- * TLS 1.3 Certificate (RFC 8446 s4.4.2): context, then entries carrying per-cert extensions.
+ * The CertificateStatus body of RFC 6066 s8: `status_type(1) || opaque OCSPResponse<1..2^24-1>`.
+ * Two carriers share this exact shape — the TLS 1.2 CertificateStatus handshake message, and the
+ * extension_data of a TLS 1.3 status_request CertificateEntry extension (RFC 8446 s4.4.2.1) —
+ * which is why it is one parser and not two.
+ *
  * @param {Uint8Array} body
- * @returns {Uint8Array[]} DER certificates in wire order, leaf first
+ * @param {string} where named in errors
+ * @returns {Uint8Array} the DER OCSPResponse, exactly as sent; its meaning is the trust layer's
+ *   problem, not this layer's
  */
-export function parseCertificate13(body) {
+export function parseCertificateStatus(body, where) {
+  const c = new Cursor(body, where);
+  const statusType = c.u8('status_type');
+  if (statusType !== 1) {
+    throw new TlsError(
+      codes.TLS_HANDSHAKE,
+      `${where} carries status_type ${statusType}; only ocsp(1) is defined (RFC 6066 s8) and ` +
+        'nothing else can be consumed',
+      { statusType },
+    );
+  }
+  const response = c.vector(3, 'OCSPResponse');
+  c.end(where);
+  if (response.byteLength === 0) {
+    // opaque OCSPResponse<1..2^24-1>: the zero length is outside the vector's floor, and an
+    // empty "response" pretending to be a staple must not read as one.
+    throw new TlsError(codes.TLS_HANDSHAKE, `${where} carries a zero-length OCSPResponse`);
+  }
+  return response;
+}
+
+/**
+ * TLS 1.3 Certificate (RFC 8446 s4.4.2): context, then entries carrying per-cert extensions.
+ *
+ * Entry extensions are policed, not skipped: RFC 8446 s4.4.2 allows a server to send only
+ * extensions the ClientHello offered, and s4.2 confines each type to specific messages — for
+ * CertificateEntry that is status_request and signed_certificate_timestamp. An extension we
+ * cannot attribute to our own offer is either a server confusion or a smuggling attempt, and
+ * both end the handshake.
+ *
+ * Only the LEAF's stapled OCSP response is returned. A server may staple for intermediates too;
+ * those staples are validated structurally (they must still be well-formed CertificateStatus)
+ * but not consumed — this package checks revocation of the identity it is authenticating, and
+ * inventing partial intermediate coverage would imply a guarantee it does not give.
+ *
+ * @param {Uint8Array} body
+ * @param {{ offeredExtensions?: Set<number> }} [opts] extension types our ClientHello offered.
+ *   Omitting it means "nothing was offered", the fail-closed reading.
+ * @returns {{ chain: Uint8Array[], ocspResponse: Uint8Array | null }} DER certificates in wire
+ *   order (leaf first), plus the leaf's stapled DER OCSPResponse if the server sent one
+ */
+export function parseCertificate13(body, { offeredExtensions = new Set() } = {}) {
   const c = new Cursor(body, 'Certificate');
   const context = c.vector(1, 'certificate_request_context');
   if (context.byteLength !== 0) {
@@ -512,19 +564,38 @@ export function parseCertificate13(body) {
   }
   const list = c.sub(3, 'certificate_list');
   const chain = [];
+  let ocspResponse = null;
   while (!list.done) {
     const der = list.vector(3, 'cert_data');
     if (der.byteLength === 0) {
       throw new TlsError(codes.TLS_HANDSHAKE, 'Certificate entry has zero-length cert_data');
     }
-    list.vector(2, 'certificate extensions'); // OCSP/SCT live here; unused, but must be consumed
+    const entryLabel = `CertificateEntry ${chain.length}`;
+    const exts = decodeExtensionBlock(list.vector(2, 'certificate extensions'), entryLabel);
+    rejectUnofferedExtensions(exts, offeredExtensions, entryLabel);
+    for (const [type, data] of exts) {
+      if (type === EXTENSION.status_request) {
+        const staple = parseCertificateStatus(data, `${entryLabel} status_request`);
+        if (chain.length === 0) ocspResponse = staple;
+      } else if (type !== EXTENSION.signed_certificate_timestamp) {
+        // Offered in the hello, but RFC 8446 s4.2 does not admit it in a Certificate message:
+        // the server answered a question in the wrong room, which s4.2 makes fatal
+        // (illegal_parameter), not ignorable.
+        throw new TlsError(
+          codes.TLS_HANDSHAKE,
+          `${entryLabel} carries extension ${hex16(type)}, which does not belong in a ` +
+            'Certificate message (RFC 8446 s4.2)',
+          { extension: type },
+        );
+      }
+    }
     chain.push(der);
   }
   c.end('Certificate');
   if (chain.length === 0) {
     throw new CertificateError(codes.CERT_CHAIN_INCOMPLETE, 'server sent an empty certificate_list');
   }
-  return chain;
+  return { chain, ocspResponse };
 }
 
 /**

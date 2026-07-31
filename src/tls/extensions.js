@@ -46,6 +46,27 @@ export function encodeServerName(hostname) {
 }
 
 /**
+ * status_request (RFC 6066 s8): ask the server to staple an OCSP response for its certificate.
+ *
+ * The body is a CertificateStatusRequest: status_type ocsp(1), an empty responder_id_list (we
+ * accept whatever responder the CA authorised — a client cannot usefully narrow that), and empty
+ * request_extensions (no nonce: a stapled response is produced before our hello exists, so a
+ * nonce could never be honoured and freshness comes from thisUpdate/nextUpdate instead).
+ *
+ * Offered in every hello, for both versions: it costs 9 bytes, and a server that ignores it
+ * loses nothing. How the answer arrives differs by version — TLS 1.2 echoes the extension and
+ * sends a separate CertificateStatus message (RFC 6066 s8), TLS 1.3 attaches it to the leaf's
+ * CertificateEntry (RFC 8446 s4.4.2.1) — and each driver consumes its own form.
+ * @returns {Uint8Array}
+ */
+export function encodeStatusRequest() {
+  return ext(
+    EXTENSION.status_request,
+    new Builder().u8(1).vector(2, new Uint8Array(0)).vector(2, new Uint8Array(0)).build(),
+  );
+}
+
+/**
  * @param {number[]} versions in preference order
  * @returns {Uint8Array}
  */

@@ -40,6 +40,36 @@
  */
 export function anchorFromCertificate(cert: import("./x509.js").Certificate): TrustAnchor;
 /**
+ * Verify `cert`'s signature over its original to-be-signed bytes with the signer's public key.
+ *
+ * The scheme comes from resolveSignatureScheme (which is where MD5/SHA-1 die, before any
+ * cryptography runs). For ECDSA the curve belongs to the issuer's key, not the OID, so the
+ * WebCrypto import parameters are chosen from the issuer's SPKI and only the hash from the OID —
+ * both looked up in SIG_SCHEME_PARAMS rather than re-declared here.
+ *
+ * Exported (as verifySignedObject) for the OCSP checker: a BasicOCSPResponse is signed exactly
+ * like a certificate — an AlgorithmIdentifier, a BIT STRING over the original DER of a TBS
+ * element — and two implementations of "check an X.509-style signature" is two chances for one
+ * of them to be subtly the weaker. `cert` is therefore the structural subset both callers can
+ * supply: `{ tbsBytes, signature, signatureAlgorithm, subject: { text } }`, which a parsed
+ * Certificate satisfies as-is and the OCSP checker fakes up from response fields.
+ *
+ * @param {{ tbsBytes: Uint8Array, signature: Uint8Array,
+ *           signatureAlgorithm: import('./x509.js').AlgorithmId,
+ *           subject: { text: string } }} cert what was signed, certificate-shaped
+ * @param {Uint8Array} issuerSpkiDer the signer's SubjectPublicKeyInfo, DER
+ * @param {string} issuerText the signer's name, for error messages
+ * @returns {Promise<void>} every failure throws a typed CertificateError
+ */
+export function verifySignedObject(cert: {
+    tbsBytes: Uint8Array;
+    signature: Uint8Array;
+    signatureAlgorithm: import("./x509.js").AlgorithmId;
+    subject: {
+        text: string;
+    };
+}, issuerSpkiDer: Uint8Array, issuerText: string): Promise<void>;
+/**
  * Build and validate a certification path. Every failure throws a typed CertificateError;
  * there is no boolean to forget to check.
  *

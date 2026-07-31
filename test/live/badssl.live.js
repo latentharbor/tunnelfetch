@@ -86,23 +86,50 @@ for (const c of FAIL_CLOSED) {
   });
 }
 
-// ------------------------------------------------------------------ documented non-feature: revocation
+// ------------------------------------------------------------------ revocation, via stapled OCSP
 //
-// Revocation (CRL/OCSP) is deliberately NOT implemented — it needs a network fetch mid-handshake
-// (see README "What this cannot do"). So the revoked host, whose certificate is otherwise valid and
-// chains to a trusted root, VALIDATES here. This test pins that KNOWN GAP rather than pretending
-// otherwise: if it ever starts failing, revocation checking was added and this expectation should
-// flip. It is called out prominently because "we accept a revoked certificate" is a real exposure a
-// consumer must weigh, even though it is by design.
-test(`the revoked host currently VALIDATES — revocation is a documented non-feature (see report)`, async () => {
+// Revocation IS checked now — from a stapled OCSP response only (src/trust/ocsp.js), never by
+// fetching, and the default policy tolerates a missing staple while a present staple must verify
+// and `revoked` is always fatal (src/trust/index.js has the argument).
+//
+// What that means for this host was MEASURED before writing these assertions (2026-07-31, local,
+// therefore advisory — see the header note on the polluted resolver): the revoked host staples
+// nothing on either TLS version (`openssl s_client -status`: "no OCSP response received", against
+// a control host whose staple the same probe does show), and its current certificate carries no
+// OCSP responder URL in its Authority Information Access at all — its CA has retired OCSP in
+// favour of CRLs, so there is no responder anyone could even staple from. The revoked host
+// therefore still VALIDATES under the default policy: this is the soft-fail gap every browser
+// shares, pinned here deliberately rather than left silent. If this test starts failing with
+// OCSP_REVOKED, the host began stapling a revoked response and the stapling path is biting live —
+// flip the expectation gladly.
+test(`the revoked host without a staple VALIDATES under default policy — the documented soft-fail gap`, async () => {
   const r = await attempt(at('revoked'));
   if (r.ok) {
     assert.ok(r.status >= 200 && r.status < 500, 'a validated connection returns an HTTP response');
+  } else if (r.code === 'OCSP_REVOKED') {
+    // The host has started stapling and the verifier read the staple honestly: the gap is
+    // closed for this host. This branch passing is strictly good news.
+    assert.match(r.message, /serial 0x/, 'a revoked verdict names the serial it condemns');
   } else {
-    // If it failed, it must at least have failed for a real reason (e.g. the cert also expired),
-    // never for a fabricated "revoked" check this package does not perform.
+    // Any other failure must be a real typed reason (badssl hosts drift into expiry), never a
+    // fabricated check: absence of a staple is not an error under the default policy.
     assert.notEqual(r.code, undefined);
+    assert.notEqual(r.code, 'OCSP_REQUIRED', 'default policy must not demand a staple');
   }
+});
+
+// The policy knob, live: 'require-staple' turns this same non-stapling host into a hard failure.
+// This is the assertion that CAN hold today — it does not depend on the host stapling, only on
+// it NOT stapling (measured above) — and it proves the whole path: offer sent, no staple back,
+// policy consulted, typed refusal out. OCSP_REVOKED is accepted too: if the host ever staples,
+// its response is a revoked one and that verdict outranks the absence question.
+test(`the revoked host under revocation:'require-staple' fails closed`, async () => {
+  const r = await attempt(at('revoked'), { trust: { mode: 'system', revocation: 'require-staple' } });
+  assert.equal(r.ok, false, `expected NO response under require-staple, got status ${r.status}`);
+  assert.ok(
+    ['OCSP_REQUIRED', 'OCSP_REVOKED', 'CERT_EXPIRED', 'CERT_UNTRUSTED_ROOT', 'CERT_CHAIN_INCOMPLETE'].includes(r.code),
+    `expected a staple-or-revocation failure (or badssl drift), got ${r.code} (${r.message})`,
+  );
 });
 
 // ------------------------------------------------------------------ hostname-only quirks (SAN-based identity)

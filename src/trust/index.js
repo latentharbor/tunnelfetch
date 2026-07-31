@@ -15,17 +15,95 @@ import { CertificateError, ConfigError, codes } from '../errors.js';
 import { timingSafeEqual } from '../util/bytes.js';
 import { parseCertificate, decodePem } from './x509.js';
 import { validatePath, anchorFromCertificate } from './path.js';
+import { verifyOcspStaple } from './ocsp.js';
 import { matchesIdentity } from './name.js';
 import { systemAnchors, provenance } from './roots.js';
 
 export { parseCertificate, decodePem } from './x509.js';
 export { validatePath, anchorFromCertificate } from './path.js';
+export { verifyOcspStaple, parseOcspResponse } from './ocsp.js';
 export { matchesIdentity } from './name.js';
 export { systemAnchors, provenance as rootStoreProvenance } from './roots.js';
 
 const MODES = ['system', 'anchors', 'pinned', 'none', 'custom'];
 
 const invalid = (message) => new ConfigError(codes.CONFIG_INVALID, message);
+
+// ------------------------------------------------------------------ revocation policy
+//
+// Revocation is checked via stapled OCSP only (see src/trust/ocsp.js for why fetching is not an
+// option here), which forces a policy DECISION about the case stapling cannot cover: most
+// servers simply do not staple, and an attacker who holds a revoked-but-otherwise-valid
+// certificate can present it WITHOUT a staple. The choices and their costs:
+//
+//   * Hard-fail (no staple = no connection) is the only stance with teeth against that attacker
+//     — and it breaks the majority of the honest web, which would make this package unusable as
+//     a default and teach every consumer to switch the check off, the worst outcome of all.
+//   * Soft-fail (tolerate absence) is what every browser ships, and it is honestly close to
+//     worthless against an active attacker, who can just omit the staple. Its real value is
+//     against the common non-adversarial case: an honestly-compromised or mis-issued certificate
+//     on a well-run server that DOES staple gets caught.
+//
+// The default here is therefore: ABSENCE of a staple is not a failure, but a staple that IS
+// present must verify completely, and a verified `revoked` (or `unknown`) is always fatal —
+// there is no configuration that ignores a revoked verdict, the same way there is no single
+// flag that disables verification. This asymmetry is principled, not timid: the staple is the
+// server operator's own signed statement about their certificate, so a present-but-invalid one
+// is either misconfiguration worth failing loudly on or an attack, while a missing one is
+// overwhelmingly just a server that never opted in.
+//
+// A caller whose peers are known to staple buys the real guarantee with
+// `revocation: 'require-staple'`, which turns absence into OCSP_REQUIRED — the OCSP equivalent
+// of pinning: opt-in strictness where the deployment can afford it. There is deliberately NO
+// 'off' value: the weakest expressible policy still refuses a revoked certificate, because a
+// caller who wants to talk to a peer the CA has disowned should have to say `mode: 'none'` and
+// own everything that implies.
+const REVOCATION_MODES = ['staple', 'require-staple'];
+
+/** Validate the `revocation` knob for the modes that verify chains. */
+function revocationPolicy(trust, mode) {
+  const value = trust.revocation ?? 'staple';
+  if (!REVOCATION_MODES.includes(value)) {
+    throw invalid(`trust.revocation must be one of ${REVOCATION_MODES.map((m) => `'${m}'`).join(', ')} ` +
+      `with mode '${mode}', got ${JSON.stringify(value)}. There is no value that ignores a ` +
+      'revoked certificate.');
+  }
+  return value;
+}
+
+/**
+ * Enforce the policy above for one validated path: judge the staple when present, and demand one
+ * when the caller opted into 'require-staple'.
+ *
+ * The issuer handed to the OCSP checker comes from the VALIDATED path — the certificate that
+ * actually signed the leaf, or the trust anchor when the leaf sits directly under one — because
+ * a staple's signature is only meaningful against a key that is already trusted to speak for
+ * the leaf's issuer.
+ */
+async function checkRevocation({ ocspResponse, revocation, leaf, path, anchor, hostname, now }) {
+  if (ocspResponse == null) {
+    if (revocation === 'require-staple') {
+      throw new CertificateError(codes.OCSP_REQUIRED,
+        `no OCSP response was stapled for "${hostname}" and trust.revocation is ` +
+          "'require-staple'; without a staple this certificate's revocation status is unknown. " +
+          'Either the server must enable OCSP stapling or this policy must be relaxed',
+        { hostname });
+    }
+    return; // absence tolerated by default; the policy comment above is the argument
+  }
+  const issuer = path.length > 1
+    ? {
+        subjectBytes: path[1].subject.bytes,
+        spkiDer: path[1].spki.spkiDer,
+        subjectText: path[1].subject.text,
+      }
+    : {
+        subjectBytes: anchor.subjectBytes,
+        spkiDer: anchor.spkiDer,
+        subjectText: anchor.subjectText ?? '<anchor>',
+      };
+  await verifyOcspStaple({ staple: ocspResponse, leaf, issuer, now });
+}
 
 /** Refuse config keys that belong to a different mode: a mismatched knob is a misunderstanding. */
 function forbidKeys(trust, mode, keys) {
@@ -123,33 +201,49 @@ function requireSystemStore() {
  */
 
 /**
+ * Revocation policy, for the modes that validate chains. Checking is via stapled OCSP only, so
+ * the knob decides what a MISSING staple means: `'staple'` (the default) tolerates absence but
+ * fully verifies any staple that is present; `'require-staple'` makes absence OCSP_REQUIRED.
+ * A verified `revoked` or `unknown` verdict is fatal under both — no value ignores it.
+ * @typedef {'staple' | 'require-staple'} RevocationPolicy
+ */
+
+/**
  * Verify against the bundled CCADB root store. The default.
- * @typedef {{ mode?: 'system' }} SystemTrust
+ * @typedef {{ mode?: 'system', revocation?: RevocationPolicy }} SystemTrust
  */
 
 /**
  * Verify against exactly these anchors and nothing else. The bundled store is not consulted.
- * @typedef {{ mode: 'anchors', anchors: AnchorInput[] }} AnchorsTrust
+ * @typedef {{ mode: 'anchors', anchors: AnchorInput[],
+ *             revocation?: RevocationPolicy }} AnchorsTrust
  */
 
 /**
  * Full path validation, plus a requirement that some certificate in the accepted path (or its
  * anchor) match one of `pins`. Pins are `sha256/` followed by the base64 SHA-256 of a
  * SubjectPublicKeyInfo, the same spelling HPKP used.
- * @typedef {{ mode: 'pinned', pins: string[], anchors?: AnchorInput[] }} PinnedTrust
+ * @typedef {{ mode: 'pinned', pins: string[], anchors?: AnchorInput[],
+ *             revocation?: RevocationPolicy }} PinnedTrust
  */
 
 /**
  * No path validation at all. `insecureAcceptAnyCertificate` is mandatory and must be `true`, so
  * that this mode can never be reached by a typo in `mode`. Supplying `pins` turns it into
- * pin-only trust: no chain is built, but a pin must still match.
+ * pin-only trust: no chain is built, but a pin must still match. `revocation` is refused here:
+ * without a validated issuer there is no trusted key to verify a staple against, so the check
+ * cannot be performed honestly and pretending otherwise would be worse.
  * @typedef {{ mode: 'none', insecureAcceptAnyCertificate: true, pins?: string[] }} NoTrust
  */
 
 /**
- * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it.
+ * Caller-supplied policy. Returning normally accepts the chain; throwing rejects it. The third
+ * argument carries the peer's stapled OCSP response (DER, or null) so a custom policy can judge
+ * revocation itself — `verifyOcspStaple` is exported for exactly that.
  * @typedef {{ mode: 'custom',
- *             verify: (chain: Uint8Array[], hostname: string) => void | Promise<void> }} CustomTrust
+ *             verify: (chain: ParsedCertificate[], hostname: string,
+ *                      details?: { ocspResponse: Uint8Array | null })
+ *               => void | Promise<void> }} CustomTrust
  */
 
 /**
@@ -182,9 +276,13 @@ function requireSystemStore() {
  * @param {string} opts.hostname identity from the request URL (DNS name or IP literal)
  * @param {TrustConfig} [opts.trust] the verification policy; defaults to the bundled roots
  * @param {number} [opts.now] epoch ms, for tests and for callers with a better clock
+ * @param {Uint8Array | null} [opts.ocspResponse] the peer's stapled DER OCSPResponse, when the
+ *   handshake carried one; judged under `trust.revocation` (see the policy comment above)
  * @returns {Promise<ParsedCertificate>} the parsed leaf. Every other outcome throws.
  */
-export async function verifyChain({ chain, hostname, trust = { mode: 'system' }, now = Date.now() }) {
+export async function verifyChain({
+  chain, hostname, trust = { mode: 'system' }, now = Date.now(), ocspResponse = null,
+}) {
   if (trust === null || typeof trust !== 'object') {
     throw invalid("trust must be an object like { mode: 'system' }");
   }
@@ -206,7 +304,7 @@ export async function verifyChain({ chain, hostname, trust = { mode: 'system' },
       throw invalid("trust mode 'none' additionally requires insecureAcceptAnyCertificate: true; " +
         'refusing to disable certificate verification on a single flag');
     }
-    forbidKeys(trust, 'none', ['anchors', 'verify']);
+    forbidKeys(trust, 'none', ['anchors', 'verify', 'revocation']);
     if (trust.pins !== undefined) {
       // Pin-only trust: no path validation, but the pin check itself must not fail open — a
       // chain we cannot parse cannot be pinned, so it throws.
@@ -239,14 +337,17 @@ export async function verifyChain({ chain, hostname, trust = { mode: 'system' },
   }
 
   if (mode === 'custom') {
-    forbidKeys(trust, 'custom', ['anchors', 'pins']);
+    // `revocation` is refused for the same reason `pins` is: custom mode owns policy entirely.
+    // The staple is handed to the callback instead, with verifyOcspStaple exported so a custom
+    // policy can run the standard check against whichever issuer its own validation blessed.
+    forbidKeys(trust, 'custom', ['anchors', 'pins', 'revocation']);
     if (typeof trust.verify !== 'function') {
       throw invalid("trust mode 'custom' requires a verify(chain, hostname) function");
     }
     const parsed = chain.map((der) => parseCertificate(der));
     // The callback owns policy entirely: throwing rejects the connection, returning accepts it.
     // Its errors propagate untouched so callers see their own diagnostics.
-    await trust.verify(parsed, hostname);
+    await trust.verify(parsed, hostname, { ocspResponse });
     return parsed[0];
   }
 
@@ -263,8 +364,12 @@ export async function verifyChain({ chain, hostname, trust = { mode: 'system' },
     pins = parsePins(trust.pins);
     anchors = trust.anchors !== undefined ? expandAnchors(trust.anchors) : requireSystemStore();
   }
+  // Validated before any network-derived bytes are judged, like every other config error: a
+  // misspelled policy must fail the connection even when the peer stapled nothing.
+  const revocation = revocationPolicy(trust, mode);
 
   const { leaf, path, anchor } = await validatePath({ chain, anchors, hostname, now });
   if (pins) await checkPins(pins, path, anchor);
+  await checkRevocation({ ocspResponse, revocation, leaf, path, anchor, hostname, now });
   return leaf;
 }

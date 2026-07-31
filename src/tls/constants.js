@@ -36,6 +36,7 @@ export const HANDSHAKE_TYPE = {
   certificate_verify: 15,
   client_key_exchange: 16,
   finished: 20,
+  certificate_status: 22,
   key_update: 24,
   message_hash: 254,
 };

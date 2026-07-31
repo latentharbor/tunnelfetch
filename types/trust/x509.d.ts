@@ -46,6 +46,18 @@ export function parseName(bytes: Uint8Array, tlv: import("./der.js").Tlv): Disti
  */
 export function parseNameConstraints(valueBytes: Uint8Array): NameConstraints;
 /**
+ * AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }.
+ *
+ * Exported for the OCSP checker, which meets the same structure in BasicOCSPResponse and CertID
+ * and must read it with the same strictness rather than a second, slightly different walk.
+ *
+ * @param {Uint8Array} bytes
+ * @param {import('./der.js').Tlv} tlv
+ * @param {string} what
+ * @returns {AlgorithmId}
+ */
+export function parseAlgorithmIdentifier(bytes: Uint8Array, tlv: import("./der.js").Tlv, what: string): AlgorithmId;
+/**
  * How to verify one certificate signature. `scheme` indexes SIG_SCHEME_PARAMS where the OID
  * fully determines it; for ECDSA only the hash is known here and path.js completes the plan
  * from the issuer's curve.
@@ -58,16 +70,23 @@ export function parseNameConstraints(valueBytes: Uint8Array): NameConstraints;
 /**
  * Map a certificate's signature algorithm to a verification plan, or throw.
  *
- * Called by path.js exactly when a certificate's signature is about to anchor trust. Weak
- * algorithms (MD2/MD4/MD5, SHA-1) are rejected here by OID, before any cryptography runs — some
- * runtimes' verifiers still accept SHA-1 and this one must provably not be among them. ECDSA
- * returns only the hash: in X.509 (unlike TLS) the curve belongs to the issuer's key, so path.js
- * completes the plan from the issuer's SPKI.
+ * Called by path.js exactly when a certificate's signature is about to anchor trust, and by the
+ * OCSP checker for a response's own signature — the parameter is therefore the structural subset
+ * both can supply, and a full Certificate qualifies as-is. Weak algorithms (MD2/MD4/MD5, SHA-1)
+ * are rejected here by OID, before any cryptography runs — some runtimes' verifiers still accept
+ * SHA-1 and this one must provably not be among them. ECDSA returns only the hash: in X.509
+ * (unlike TLS) the curve belongs to the issuer's key, so path.js completes the plan from the
+ * issuer's SPKI.
  *
- * @param {Certificate} cert
+ * @param {{ signatureAlgorithm: AlgorithmId, subject: { text: string } }} cert
  * @returns {SignaturePlan}
  */
-export function resolveSignatureScheme(cert: Certificate): SignaturePlan;
+export function resolveSignatureScheme(cert: {
+    signatureAlgorithm: AlgorithmId;
+    subject: {
+        text: string;
+    };
+}): SignaturePlan;
 /**
  * Parse a bare SubjectPublicKeyInfo element (as stored for trust anchors, which persist only the
  * SPKI rather than a whole certificate). Same walk as inside a certificate.
@@ -167,7 +186,11 @@ export namespace OID {
     let sctList: "1.3.6.1.4.1.11129.2.4.2";
     let serverAuth: "1.3.6.1.5.5.7.3.1";
     let clientAuth: "1.3.6.1.5.5.7.3.2";
+    let ocspSigning: "1.3.6.1.5.5.7.3.9";
     let anyExtendedKeyUsage: "2.5.29.37.0";
+    let ocspBasic: "1.3.6.1.5.5.7.48.1.1";
+    let ocspNonce: "1.3.6.1.5.5.7.48.1.2";
+    let ocspNocheck: "1.3.6.1.5.5.7.48.1.5";
 }
 /**
  * Extensions this validator understands, or has deliberately judged safe to leave unprocessed

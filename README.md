@@ -221,6 +221,20 @@ lifetime of the isolate.
 { mode: 'none', insecureAcceptAnyCertificate: true } // no verification at all
 ```
 
+Revocation is checked via **stapled OCSP** (RFC 6960 over the TLS `status_request` extension):
+every hello asks the server to staple, and a stapled response must parse strictly, match the
+validated certificate's issuer and serial, carry a verified signature from the issuing CA or an
+authorised responder, and be inside its freshness window — a verified `revoked` (or `unknown`)
+always fails the connection. A *missing* staple is tolerated by default, because most servers do
+not staple and hard-failing would break the majority of the web; callers whose peers do staple
+can demand one:
+
+```js
+{ mode: 'system', revocation: 'require-staple' }    // absence becomes OCSP_REQUIRED
+```
+
+There is deliberately no value that ignores a revoked verdict.
+
 `mode: 'none'` requires the second flag; it cannot be reached by a typo. A pin mismatch reports
 the pins it actually saw, so the right one can be copied out of a log:
 
@@ -296,8 +310,11 @@ Not implemented, and not planned:
   ChaCha20, so offering it would mean a `node:crypto` dependency for zero compatibility gain.
 - **Client certificates (mTLS), session resumption, 0-RTT, renegotiation.** A `HelloRequest` is
   refused rather than honoured.
-- **Certificate revocation (CRL / OCSP).** Checking revocation needs a network fetch mid-handshake;
-  that is not implemented, and pretending otherwise would be worse than saying so.
+- **Revocation fetching (CRL downloads, OCSP responder queries).** Both need network round trips
+  mid-handshake, through the proxy, and an OCSP query tells the CA which origins you visit.
+  Revocation *is* checked from a **stapled** OCSP response when the server sends one (see Trust
+  below); what is not implemented, and not planned, is going to fetch what the server did not
+  staple.
 - **Certificate policy processing** (`policyConstraints`, `inhibitAnyPolicy`). Because they are
   always critical, their presence causes a rejection rather than being mis-validated.
 - **Name constraints beyond dNSName and iPAddress.** A *critical* constraint extension naming an
@@ -465,7 +482,7 @@ and Bun. The only runtime-specific piece is the `connect` function you supply.
 ## Testing
 
 ```bash
-npm test          # 866 offline tests, hermetic, no network
+npm test          # 984 offline tests, hermetic, no network
 npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 ```
 

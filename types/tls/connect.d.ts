@@ -56,9 +56,10 @@
  * @param {object} args
  * @param {ByteDuplex} args.transport
  * @param {string} args.hostname the identity the certificate must prove, and the SNI sent
- * @param {(chain: Uint8Array[], hostname: string) => Promise<{spki: {spkiDer: Uint8Array}}>} args.verifyPeer
+ * @param {import('./handshake.js').VerifyPeer} args.verifyPeer
  *   Must throw to reject. Resolves with the validated leaf; its SPKI is the only key either
- *   driver will accept a handshake signature from.
+ *   driver will accept a handshake signature from. Receives the peer's stapled OCSP response,
+ *   when there is one, as its third argument.
  * @param {TlsOptions} [args.options]
  * @param {TlsDeps} [args.deps]
  * @returns {Promise<TlsSession>}
@@ -66,11 +67,7 @@
 export function connectTls({ transport, hostname, verifyPeer, options, deps }: {
     transport: ByteDuplex;
     hostname: string;
-    verifyPeer: (chain: Uint8Array[], hostname: string) => Promise<{
-        spki: {
-            spkiDer: Uint8Array;
-        };
-    }>;
+    verifyPeer: import("./handshake.js").VerifyPeer;
     options?: TlsOptions | undefined;
     deps?: TlsDeps | undefined;
 }): Promise<TlsSession>;
