@@ -1,0 +1,71 @@
+name: Capability drift
+
+# Two things about this package rot on their own, without anyone touching the code.
+#
+#   * The runtime moves. This package implements TLS in JavaScript because nothing on workerd can
+#     hand a TLS handshake an already-open socket, which is what a proxy CONNECT tunnel is. That is
+#     a statement about a platform Cloudflare is actively filling in, not a law. When it stops being
+#     true, the right response is to reconsider the architecture — and the wrong one is to keep
+#     shipping a userland TLS stack because nobody thought to check.
+#   * The trust anchors go stale. Roots added upstream are ones this package rejects and browsers
+#     accept; roots distrusted upstream are ones this package still trusts. The offline suite
+#     catches the second problem by date, but only if the suite is actually run.
+#
+# So this runs on a schedule rather than on commits: there is no commit to hang it off. A failure
+# here is usually good news, and is never a regression in this package.
+#
+# Never triggered by pull_request: fork PRs cannot read secrets, and a job that appears to check
+# something while silently having no credentials is worse than no job.
+
+on:
+  schedule:
+    # 07:00 UTC on the 1st. Monthly matches how fast the things being watched actually move.
+    - cron: '0 7 1 * *'
+  workflow_dispatch:
+
+jobs:
+  runtime-capabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+
+      # Queries the already-deployed probe rather than deploying one, so this workflow never needs
+      # a Cloudflare token with deploy rights. The cost of that choice is that the deployment can
+      # drift from the source in this checkout — which is exactly what the first assertion in
+      # nodecompat.live.js checks, by comparing a fingerprint baked in at deploy time. If it fails,
+      # run `npm run probe:deploy` locally.
+      - name: node compatibility has not changed under us
+        env:
+          PROBE_URL: ${{ secrets.PROBE_URL }}
+          PROBE_TOKEN: ${{ secrets.PROBE_TOKEN }}
+          PROXY_1: ${{ secrets.PROXY_1 }}
+        run: node --test --test-reporter=spec "test/live/nodecompat.live.js"
+
+  trust-layer:
+    # Separate job so an outage at the misconfigured-TLS test site cannot mask a capability change,
+    # and vice versa. Both must pass; neither may skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+
+      # Real servers that are wrong in exactly one way each — expired, wrong host, self-signed,
+      # untrusted root, incomplete chain. Every one must fail closed with its specific error code.
+      # The suite includes a control that must SUCCEED, so a dead network fails the job instead of
+      # quietly passing it.
+      - name: certificate validation still fails closed against real bad servers
+        env:
+          PROXY_1: ${{ secrets.PROXY_1 }}
+        run: node --test --test-reporter=spec "test/live/badssl.live.js"
+
+      # Dates advance whether or not anyone commits, so the staleness assertion needs a trigger
+      # that is not a commit. Cheap enough to re-run the whole offline suite for.
+      - name: bundled trust anchors are still fresh
+        run: node --test --test-reporter=spec "test/trust/roots-freshness.test.js"

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline:
+    # Everything that can be proven without touching the network. Hermetic by construction:
+    # in-memory duplexes and fixed vectors, no sockets, no fixtures fetched at test time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      # The checked-in declarations must match the JSDoc they were generated from, or consumers
+      # get types describing code that no longer exists. test/types.test.js asserts this too; doing
+      # it here as well means a stale commit fails before anyone reads the test output.
+      - run: npm run types
+      - run: git diff --exit-code types/
+        name: generated declarations are current
+      - run: npm test

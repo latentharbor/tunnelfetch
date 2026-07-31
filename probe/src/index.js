@@ -10,6 +10,11 @@
 // deployed probe is not an open relay.
 
 import { connect } from "cloudflare:sockets";
+import {
+  moduleInventory, nodeCryptoShape, tlsDirect, tlsOptionSupport, tlsOverConnectTunnel,
+  tlsOverFreshSocket,
+  tlsOverTunnelWrongName,
+} from "./nodecompat.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -501,7 +506,7 @@ export default {
     const json = (o) => Response.json(o, { headers: { "cache-control": "no-store" } });
 
     if (url.pathname === "/") {
-      return json({ probe: "tunnelfetch", authed, routes: ["/caps", "/net", "/starttls", "/proxy"] });
+      return json({ probe: "tunnelfetch", authed, routes: ["/caps", "/net", "/starttls", "/proxy", "/socks5", "/nodecompat", "/nodetls"] });
     }
     if (!authed) return new Response("forbidden", { status: 403 });
 
@@ -522,6 +527,31 @@ export default {
         const spec = request.headers.get("x-proxy");
         if (!spec) throw new Error("need x-proxy: host:port:user:pass");
         body = await proxySuite(url, spec);
+      } else if (url.pathname === "/nodecompat") {
+        body = {
+          // Fingerprint of probe/src as it was when this Worker was deployed, injected by
+          // scripts/deploy-probe.mjs. The drift test refuses to draw conclusions from a
+          // deployment that does not match the probe source in the checkout it is running from.
+          srcSha: env.PROBE_SRC_SHA ?? null,
+          modules: await moduleInventory(),
+          crypto: await nodeCryptoShape(),
+        };
+      } else if (url.pathname === "/nodetls") {
+        // Needs a real proxy and a real origin: the whole question is whether node:tls will run a
+        // handshake over a socket it did not dial, and demand the ORIGIN's identity while doing it.
+        const spec = request.headers.get("x-proxy");
+        if (!spec) throw new Error("need x-proxy: host:port:user:pass");
+        const target = url.searchParams.get("target") || "example.com";
+        const [ph, pp] = spec.split(':');
+        body = {
+          options: await tlsOptionSupport(target),
+          freshSocket: await tlsOverFreshSocket(ph, pp),
+          direct: await tlsDirect(target),
+          overTunnel: await tlsOverConnectTunnel(spec, target),
+          // If this ALSO succeeds, the identity gate is decorative and the feature is worse than
+          // absent — a silent downgrade shaped like a working API.
+          overTunnelWrongName: await tlsOverTunnelWrongName(spec, target, "probe.invalid"),
+        };
       } else if (url.pathname === "/socks5") {
         const spec = request.headers.get("x-proxy");
         if (!spec) throw new Error("need x-proxy: host:port:user:pass");

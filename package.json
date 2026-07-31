@@ -45,7 +45,8 @@
     "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
     "test:live": "node --test --test-reporter=spec \"test/live/**/*.live.js\"",
     "roots:refresh": "node scripts/refresh-roots.mjs",
-    "types": "tsc -p tsconfig.json"
+    "types": "tsc -p tsconfig.json",
+    "probe:deploy": "node scripts/deploy-probe.mjs"
   },
   "keywords": [
     "fetch",
