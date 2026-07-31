@@ -427,6 +427,18 @@ async function cryptoBench(op, n, extra = null) {
     return { op, alg, n, verified: sink };
   }
 
+  if (op === 'bodytext') {
+    // The one per-byte cost the platform's own fetch still bills you for: turning a body into a
+    // JS value. Its TLS, HTTP parsing and gunzip all happen in the runtime and never appear in
+    // your CPU, so native fetch's total is roughly a fixed ~1 ms plus this. Measuring it here,
+    // with no socket involved, is what makes the comparison against our per-MB cost meaningful
+    // rather than a comparison of two different things.
+    const bytes = new Uint8Array(n * 1024);
+    bytes.fill(97);
+    sink += (await new Response(bytes).text()).length;
+    return { op, n, bytes: sink };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };
@@ -549,6 +561,33 @@ export default {
         } finally {
           await client.close();
         }
+      }));
+    }
+    if (url.searchParams.get('native')) {
+      // The platform's own fetch against the same origin and the same sizes, so the cost table has
+      // something to be compared against. Not a like-for-like comparison and it must not be
+      // presented as one: native fetch cannot traverse a proxy, so this measures "the cheapest
+      // possible way to get these bytes" against "through a tunnel we terminate ourselves". The
+      // gap is implementation AND proxy hop together, which is exactly the decision a caller makes
+      // when native fetch would have sufficed.
+      const spec = url.searchParams.get('native');
+      const origin = url.searchParams.get('origin');
+      const reps = Number(url.searchParams.get('reuse') ?? 1);
+      results.push(await attempt(`native ${spec}`, async () => {
+        const out = [];
+        for (const n of spec.split(',').map(Number)) {
+          for (let i = 0; i < reps; i++) {
+            const res = await fetch(`https://${origin}/?n=${n}&i=${i}`, { cf: { cacheTtl: 0 } });
+            const body = await res.text();
+            // A short body means the fetch did not reach the origin. Recording the status and a
+            // preview is what turned an apparent 100x win into a discovery that the request was
+            // being short-circuited and never transferred anything.
+            out.push({ n, got: body.length, status: res.status,
+              enc: res.headers.get('content-encoding'),
+              head: body.length < 200 ? body.slice(0, 120) : undefined });
+          }
+        }
+        return { pages: out.length, sample: out[0] };
       }));
     }
     if (url.searchParams.get('poolx')) {
