@@ -149,9 +149,12 @@ export default { async fetch(req, env) { /* ... */ } };
 
 It is opt-in and nothing in this package ever calls it, because the trade is not the same for
 everyone. Standard Workers do not bill startup CPU, so this converts billed request milliseconds
-into unbilled startup ones; deployment modes that *do* bill startup — Cloudflare's dynamic Worker
-loading, for instance — pay for the same work twice over, plus the wall time. A library should not
-make that choice for its consumer.
+into unbilled ones and is free money. Where startup CPU *is* billed — Cloudflare's dynamic Worker
+loading, for instance — it is not free but is usually still worth it: the startup cost is paid once
+per isolate and amortises over every request that isolate serves, so it pays for itself past about
+**7 requests per isolate** and loses below that. It also costs real wall time at isolate start,
+which matters if your startup budget is already tight. A library should not make that choice for
+its consumer.
 
 It caches nothing and holds no state: the replay validates its own synthetic chain against its own
 baked root through an explicit anchors-mode configuration, never consulting the bundled store, and
@@ -396,9 +399,20 @@ the difference between reusing connections and not is $154/month on 16 KB pages.
 billion requests — $367 against $321 — for something the platform's `fetch` cannot do at all.
 
 Cold starts are not in the table because their share depends on how often your traffic lands on a
-fresh isolate. The ramp costs roughly 4.4 ms per request amortised over an isolate's early life, or
-1.1 ms with `warmup({ iterations: 5 })` — about $88 and $22 per month respectively at a billion
-requests.
+fresh isolate. Measured at ~17.8 requests per isolate, the ramp adds roughly 4.4 ms per request
+amortised over an isolate's early life — about **$87/month** at a billion requests. `warmup()`
+removes most of it:
+
+| | Ramp, amortised | At 1B/mo | `warmup()`'s own cost | Net |
+| --- | --- | --- | --- | --- |
+| No `warmup()` | 4.4 ms/req | $87 | — | — |
+| `warmup()` | 2.8 ms/req | $56 | 10 ms of startup | **saves $31** |
+| `warmup({ iterations: 5 })` | 1.1 ms/req | $22 | 22 ms of startup | **saves $65** |
+
+`warmup()`'s own cost is zero in that table because startup CPU is not billed on Workers Standard.
+Where it is billed, the 22 ms is charged once per isolate and spread over the requests that isolate
+serves — $25/month at a billion requests and 17.8 requests per isolate, against $65 saved, so still
+net positive. Below about 7 requests per isolate it stops paying for itself.
 
 ### Where the cost is, and is not
 

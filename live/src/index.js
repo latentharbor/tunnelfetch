@@ -781,6 +781,40 @@ async function cryptoBench(op, n, params = null) {
     return { op, mb, bytes: buf.byteLength };
   }
 
+  if (op === 'codecs') {
+    // Which content codings can this runtime actually decode? The package has been declining to
+    // advertise brotli on the belief that DecompressionStream does not offer it — a belief that
+    // was never tested here, and the whole point of this rig is that beliefs about the runtime
+    // get tested. A constructor that does not throw proves nothing on its own, so each codec is
+    // driven through a real round trip where one is possible.
+    const out = {};
+    for (const fmt of ['gzip', 'deflate', 'deflate-raw', 'br', 'brotli', 'zstd']) {
+      try {
+        const ds = new DecompressionStream(fmt);
+        out[fmt] = { constructs: true, roundTrip: null };
+        try {
+          const cs = new CompressionStream(fmt);
+          const w = cs.writable.getWriter();
+          await w.write(new TextEncoder().encode('round trip me'));
+          await w.close();
+          const packed = await new Response(cs.readable).arrayBuffer();
+          const back = await new Response(
+            new Response(packed).body.pipeThrough(new DecompressionStream(fmt))).text();
+          out[fmt].roundTrip = back === 'round trip me' ? 'ok' : `wrong: ${back.slice(0, 20)}`;
+          out[fmt].packedBytes = packed.byteLength;
+        } catch (e) {
+          // Decompression can exist without the matching compressor; that is still usable for us,
+          // since a server does the compressing.
+          out[fmt].roundTrip = `no compressor: ${e?.message ?? e}`;
+        }
+        try { await ds.readable.cancel(); } catch { /* nothing to release */ }
+      } catch (e) {
+        out[fmt] = { constructs: false, error: String(e?.message ?? e).slice(0, 90) };
+      }
+    }
+    return { op, codecs: out };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };
