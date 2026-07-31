@@ -795,3 +795,39 @@ test('TLS 1.2: full duplex with key_block-style raw keys', async () => {
   await echo;
   eq(echoed, data);
 });
+
+test('plaintextDuplex() does not read the transport until someone reads it', async () => {
+  // A ReadableStream built with the default highWaterMark of 1 pulls EAGERLY at construction, so
+  // merely creating the duplex used to issue a readAppData() — and therefore a transport read —
+  // before the caller had written a request. Two consequences, both observable: a connection
+  // handed back to the pool has a read parked on it, and any caller driving the record layer
+  // directly finds the first post-handshake record already swallowed into the stream's queue.
+  // Constructing a duplex must be inert.
+  let pulls = 0;
+  // The fixture parks rather than enqueues: a pull that produces no bytes would otherwise be
+  // retried forever, and highWaterMark 0 here keeps the fixture from pulling for its own queue,
+  // which would measure this test instead of the code under test.
+  const readable = new ReadableStream({
+    pull() {
+      pulls++;
+      return new Promise(() => {}); // never settles; the count is the whole assertion
+    },
+  }, { highWaterMark: 0 });
+
+  const rl = new RecordLayer({ readable, writable: recordingWritable().stream });
+  // Without receive keys the read path errors out before it ever touches the transport, so the
+  // assertion below would hold for a reason that has nothing to do with the high-water mark.
+  await rl.setReceiveKeys({ cipher: AES128, key: new Uint8Array(16), iv: new Uint8Array(12),
+    secret: new Uint8Array(32) });
+  rl.markHandshakeComplete();
+
+  const duplex = rl.plaintextDuplex();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(pulls, 0, 'creating the duplex must not touch the transport');
+
+  // ...and it must still reach the transport once a consumer actually asks.
+  const reader = duplex.readable.getReader();
+  void reader.read();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(pulls, 1, 'a real read must reach the transport exactly once');
+});

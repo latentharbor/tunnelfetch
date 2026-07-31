@@ -12,6 +12,7 @@
 // Nothing here installs itself. `install()` is explicit and returns its own undo.
 
 export { Client, createFetch, install } from './client.js';
+export { warmup } from './warmup.js';
 export { ConnectionPool, poolKey } from './pool.js';
 export { openConnection, targetFromUrl, nativeFetchCanServe } from './transport.js';
 export { openTunnel, parseProxy } from './proxy/index.js';

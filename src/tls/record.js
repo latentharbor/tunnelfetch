@@ -703,6 +703,11 @@ export class RecordLayer {
   plaintextDuplex() {
     const self = this;
     return {
+      // highWaterMark 0: pull only when a consumer actually reads. The default (1) makes the
+      // stream pull EAGERLY at construction, which parks a readAppData() — and therefore a
+      // transport read — on every connection before the request has even been written, and
+      // steals the first post-handshake record into the stream's queue for any caller that
+      // reads the record layer directly. On-demand is strictly lazier with identical delivery.
       readable: new ReadableStream({
         async pull(controller) {
           const bytes = await self.readAppData();
@@ -712,7 +717,7 @@ export class RecordLayer {
         cancel() {
           return self._r.cancel();
         },
-      }),
+      }, { highWaterMark: 0 }),
       writable: new WritableStream({
         write(chunk) {
           return self.writeAppData(chunk);

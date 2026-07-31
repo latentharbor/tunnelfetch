@@ -353,10 +353,19 @@ export async function continueTls13(ctx) {
   await record.setReceiveKeys({ cipher: suite, secret: appSecrets.server });
   record.markHandshakeComplete();
 
-  const duplex = record.plaintextDuplex();
+  // The duplex is created on first access, not eagerly: consumers that drive the record layer
+  // directly (record.readAppData/writeAppData) never need the platform-stream wrappers, and the
+  // runtime this package targets forbids even CONSTRUCTING platform streams in global scope —
+  // where the opt-in warmup replay runs. Memoized, so every consumer sees one stable pair.
+  let duplex = null;
+  const lazyDuplex = () => (duplex ??= record.plaintextDuplex());
   return {
-    readable: duplex.readable,
-    writable: duplex.writable,
+    get readable() {
+      return lazyDuplex().readable;
+    },
+    get writable() {
+      return lazyDuplex().writable;
+    },
     record,
     peer,
     info: {

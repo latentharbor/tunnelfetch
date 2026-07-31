@@ -1,3 +1,4 @@
+export { warmup } from "./warmup.js";
 export { CookieJar } from "./client/cookies.js";
 /**
  * A ready-made fetch with default options: no proxy, system trust, one connection per call.

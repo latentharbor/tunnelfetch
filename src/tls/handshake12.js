@@ -445,10 +445,17 @@ export async function continueTls12(ctx) {
   checkFinished(sf.body, await verifyData12(hash, master, 'server finished', await transcript.hash()));
 
   record.markHandshakeComplete();
-  const duplex = record.plaintextDuplex();
+  // Lazy for the same reasons as the 1.3 driver: direct record-layer consumers never need the
+  // platform-stream wrappers, and the warmup replay runs where constructing them is forbidden.
+  let duplex = null;
+  const lazyDuplex = () => (duplex ??= record.plaintextDuplex());
   return {
-    readable: duplex.readable,
-    writable: duplex.writable,
+    get readable() {
+      return lazyDuplex().readable;
+    },
+    get writable() {
+      return lazyDuplex().writable;
+    },
     record,
     peer,
     info: {
