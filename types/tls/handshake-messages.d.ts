@@ -28,51 +28,30 @@ export function generateKeyShare(group: number, { generateKeyPair }?: import("./
  * @returns {Promise<Uint8Array>} throws on any degenerate or malformed peer key
  */
 export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey: Uint8Array): Promise<Uint8Array>;
-/**
- * @typedef {object} ClientHelloOptions
- * @property {string} hostname SNI, unless it is an IP literal (then no SNI is sent)
- * @property {Array<{ group: number, keyExchange: Uint8Array }>} keyShares public halves to
- *   offer; empty for a 1.2-only hello, whose wire form must not carry the extension at all
- * @property {Uint8Array} [random] fixed ClientHello.random, for reproducible handshakes
- * @property {Uint8Array} [legacySessionId] fixed legacy_session_id, likewise
- * @property {number[]} [ciphers] default: the union for the offered versions, 1.3 first
- * @property {number[]} [groups] supported_groups, default SUPPORTED_GROUPS
- * @property {number[]} [sigSchemes] default SUPPORTED_SIG_SCHEMES
- * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
- * @property {number[]} [versions] default [TLS13, TLS12]
- * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
- * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
- *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
- *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
- *   `binderOffset` before the hello touches the wire — a zero binder on the wire is a hello
- *   every honest server must reject.
- * @property {(n: number) => Uint8Array} [randomBytes] injectable randomness
- */
-/**
- * The built hello plus everything later steps need to police the server's answer against what
- * was actually offered — negotiation checks must run against this record, never against the
- * defaults they might have come from.
- * @typedef {object} ClientHello
- * @property {Uint8Array} message framed handshake message, ready for the record layer
- * @property {Uint8Array} clientRandom
- * @property {Uint8Array} legacySessionId
- * @property {number[]} offeredCiphers
- * @property {number[]} offeredGroups
- * @property {number[]} offeredSigSchemes
- * @property {Set<number>} offeredExtensions extension types present in the hello
- * @property {string[]} offeredAlpn
- * @property {number} [binderOffset] psk only: where the binder's bytes sit in `message`
- * @property {number} [truncatedLength] psk only: how many leading bytes of `message` the binder
- *   transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
- */
-/**
- * Build a ClientHello. Returns the framed handshake message plus the metadata the rest of the
- * handshake needs to police the server's answer.
- *
- * @param {ClientHelloOptions} opts
- * @returns {ClientHello}
- */
-export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extraExtensions, psk, randomBytes, }: ClientHelloOptions): ClientHello;
+export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, psk, randomBytes, }: {
+    hostname: any;
+    keyShares: any;
+    random: any;
+    legacySessionId: any;
+    ciphers: any;
+    groups?: number[] | undefined;
+    sigSchemes?: number[] | undefined;
+    alpn?: string[] | undefined;
+    versions?: number[] | undefined;
+    extensionOrder?: readonly number[] | undefined;
+    extraExtensions?: never[] | undefined;
+    psk?: null | undefined;
+    randomBytes?: ((n: any) => Uint8Array<any>) | undefined;
+}): {
+    message: Uint8Array<ArrayBufferLike>;
+    clientRandom: any;
+    legacySessionId: any;
+    offeredCiphers: any;
+    offeredGroups: number[];
+    offeredSigSchemes: number[];
+    offeredExtensions: Set<any>;
+    offeredAlpn: string[];
+};
 /**
  * Patch the real binder over the placeholder `buildClientHello` emitted. Separate from the
  * builder because the binder is derived FROM the built message (truncated), so there is no
@@ -308,6 +287,71 @@ export function checkFinished(received: Uint8Array, expected: Uint8Array): true;
  * @returns {string | null} null when the server declined ALPN entirely
  */
 export function checkAlpn(extensions: Map<number, Uint8Array>, offeredAlpn: string[], where: string): string | null;
+/**
+ * @typedef {object} ClientHelloOptions
+ * @property {string} hostname SNI, unless it is an IP literal (then no SNI is sent)
+ * @property {Array<{ group: number, keyExchange: Uint8Array }>} keyShares public halves to
+ *   offer; empty for a 1.2-only hello, whose wire form must not carry the extension at all
+ * @property {Uint8Array} [random] fixed ClientHello.random, for reproducible handshakes
+ * @property {Uint8Array} [legacySessionId] fixed legacy_session_id, likewise
+ * @property {number[]} [ciphers] default: the union for the offered versions, 1.3 first
+ * @property {number[]} [groups] supported_groups, default SUPPORTED_GROUPS
+ * @property {number[]} [sigSchemes] default SUPPORTED_SIG_SCHEMES
+ * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
+ * @property {number[]} [versions] default [TLS13, TLS12]
+ * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
+ * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
+ *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
+ *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
+ *   `binderOffset` before the hello touches the wire — a zero binder on the wire is a hello
+ *   every honest server must reject.
+ * @property {(n: number) => Uint8Array} [randomBytes] injectable randomness
+ */
+/**
+ * The built hello plus everything later steps need to police the server's answer against what
+ * was actually offered — negotiation checks must run against this record, never against the
+ * defaults they might have come from.
+ * @typedef {object} ClientHello
+ * @property {Uint8Array} message framed handshake message, ready for the record layer
+ * @property {Uint8Array} clientRandom
+ * @property {Uint8Array} legacySessionId
+ * @property {number[]} offeredCiphers
+ * @property {number[]} offeredGroups
+ * @property {number[]} offeredSigSchemes
+ * @property {Set<number>} offeredExtensions extension types present in the hello
+ * @property {string[]} offeredAlpn
+ * @property {number} [binderOffset] psk only: where the binder's bytes sit in `message`
+ * @property {number} [truncatedLength] psk only: how many leading bytes of `message` the binder
+ *   transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
+ */
+/**
+ * Build a ClientHello. Returns the framed handshake message plus the metadata the rest of the
+ * handshake needs to police the server's answer.
+ *
+ * @param {ClientHelloOptions} opts
+ * @returns {ClientHello}
+ */
+/**
+ * Extension emission order, by type. This is not cosmetic: JA3 and JA4 hash the extension list in
+ * WIRE ORDER, so the order alone is a large part of what a fingerprinter reads.
+ *
+ * Captured from curl 8.21.0 / OpenSSL 3.6.3, which sends:
+ *   renegotiation_info, server_name, ec_point_formats, supported_groups, ALPN, encrypt_then_mac,
+ *   extended_master_secret, post_handshake_auth, signature_algorithms, supported_versions,
+ *   psk_key_exchange_modes, key_share
+ *
+ * Two of those this package does not send, and the reason is the same in both cases — an extension
+ * is a claim about what we can do. encrypt_then_mac only applies to CBC suites, which are not
+ * offered; post_handshake_auth invites a CertificateRequest after the handshake, which is not
+ * implemented. status_request goes the other way: curl does not send it, this package does,
+ * because a stapled OCSP response is its only revocation signal. It is placed where OpenSSL puts
+ * it when it does send one, right after server_name.
+ *
+ * Anything not named here keeps its natural position at the end, and pre_shared_key is forced last
+ * whatever the caller asks for, because RFC 8446 s4.2.11 defines the binder transcript as the hello
+ * truncated just before the binders — a range that only exists if nothing follows them.
+ */
+export const CURL_EXTENSION_ORDER: readonly number[];
 export { GROUP_PARAMS };
 /**
  * An ephemeral key share: the public half as sent in key_share, plus the private key the
@@ -323,6 +367,18 @@ export type KeyShare = {
      * non-extractable
      */
     privateKey: CryptoKey;
+};
+/**
+ * A parsed ServerHello. `isHelloRetryRequest` is decided by the random alone (RFC 8446 s4.1.3);
+ * everything else is exactly what the wire carried, judged later by the negotiate* functions.
+ */
+export type ServerHello = {
+    legacyVersion: number;
+    random: Uint8Array;
+    legacySessionIdEcho: Uint8Array;
+    cipherSuite: number;
+    extensions: Map<number, Uint8Array>;
+    isHelloRetryRequest: boolean;
 };
 export type ClientHelloOptions = {
     /**
@@ -414,17 +470,5 @@ export type ClientHello = {
      * transcript covers (RFC 8446 s4.2.11.2 truncation — everything except the binders list)
      */
     truncatedLength?: number | undefined;
-};
-/**
- * A parsed ServerHello. `isHelloRetryRequest` is decided by the random alone (RFC 8446 s4.1.3);
- * everything else is exactly what the wire carried, judged later by the negotiate* functions.
- */
-export type ServerHello = {
-    legacyVersion: number;
-    random: Uint8Array;
-    legacySessionIdEcho: Uint8Array;
-    cipherSuite: number;
-    extensions: Map<number, Uint8Array>;
-    isHelloRetryRequest: boolean;
 };
 import { GROUP_PARAMS } from './constants.js';

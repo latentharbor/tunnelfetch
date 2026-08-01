@@ -250,3 +250,18 @@ test('a registered decoder is advertised and applied over h2 as well as h1', asy
   assert.equal(server.requests.get(1).headers.get('accept-encoding'), 'gzip, deflate, br');
   await client.close();
 });
+
+test('a Client can set the HTTP/2 SETTINGS flight, so both halves of the fingerprint are reachable', () => {
+  // The TLS half is configurable through `tls.extensionOrder` and friends; this is the h2 half.
+  // Asserted at the Client boundary because that is where a user actually configures it — the
+  // option existing on Http2Connection says nothing about whether it can be reached.
+  const flight = [
+    [0x1, 65536],
+    [0x2, 0],
+    [0x4, 6291456],
+  ];
+  const client = new Client({ http2Settings: flight });
+  assert.deepEqual(client.options.http2Settings, flight);
+  // Frozen with the rest of the security-relevant config, so it cannot change under a live pool.
+  assert.equal(Object.isFrozen(client.options), true);
+});

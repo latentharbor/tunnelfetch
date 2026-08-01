@@ -251,6 +251,38 @@ TLS 指纹塑形不是这里的门槛——但 curl 的 **HTTP/2** 指纹能过 
 curl（8.7.1 / nghttp2），照线上抓包原样复刻。这么做是实证需要，不是讲究：一个想当然的 h2
 指纹，可能恰好败在 curl 能过的地方——那这整件事就白做了。
 
+### 指纹
+
+两侧都对齐 **curl 8.21.0 / OpenSSL 3.6.3**，且全部可自定义。TLS 后端比 curl 版本更要紧——同一个 curl 用 SecureTransport 编译出来的 ClientHello 完全不同——所以参照物是从线上抓下来的，不是凭记忆写的，并且钉死在 `test/tls/fingerprint.test.js` 与 `test/http2/fingerprint.test.js` 里。
+
+| 层 | 默认 | 配置项 |
+|---|---|---|
+| ClientHello 扩展**顺序** | 与 curl 完全一致（就双方都发的那些而言） | `tls.extensionOrder` |
+| 密码套件 | 本包实现的 AEAD 套件，按 curl 的相对顺序 | `tls.ciphers` |
+| supported_groups | `x25519, secp256r1, secp384r1, secp521r1` | `tls.groups` |
+| 签名算法 | SHA-256/384/512 上的 ECDSA 与 RSA-PSS/PKCS#1 | `tls.sigSchemes` |
+| ALPN | `h2, http/1.1` | `tls.alpn` |
+| HTTP/2 `SETTINGS` 的 id **与顺序** | curl 的：`MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
+| h2 前导、`WINDOW_UPDATE`、伪头顺序、HPACK 表示 | curl 的，逐字节一致 | 固定 |
+| `Accept-Encoding` | `gzip, deflate`——curl 的 | `decoders` 会追加 |
+
+扩展顺序之所以要紧，是因为 JA3 和 JA4 哈希的正是**线上顺序**的扩展列表，那是指纹识别读到的主要内容。`pre_shared_key` 无论你怎么配都强制排最后：RFC 8446 §4.2.11 把 binder 的转录定义为"截到 binder 之前的那段 hello"，只有后面不跟东西时这个范围才成立。
+
+**默认值刻意与 curl 不同的地方**，以及为什么不能照抄：ClientHello 是一份**要约**，服务器可以接受其中任何一项。声明你做不到的事，等于拿指纹不一致换一次握手失败——后者更糟，而且是静默的。
+
+| curl 发送 | 本包 | 原因 |
+|---|---|---|
+| 30 个套件，含 RSA 密钥交换与 CBC | 6 个 AEAD 套件 | 有意不实现。服务器选中 `TLS_RSA_WITH_AES_256_CBC_SHA` 会得到一条死连接 |
+| `X25519MLKEM768` 群及 1216 字节 key share | 不提供 | 未实现 ML-KEM |
+| SHA-1 签名方案 | 不提供 | 明确拒绝 |
+| `encrypt_then_mac` | 不发 | 只对 CBC 套件有意义，而 CBC 不提供 |
+| `post_handshake_auth` | 不发 | 会招来握手后的 `CertificateRequest`，未实现 |
+| — | `status_request` | curl 不索要 OCSP staple；本包必须要，因为 staple 是它唯一的吊销信号 |
+
+要抹平这个差距，得先实现 ML-KEM、RSA 密钥交换和 CBC 套件——那是另一个项目，而且后两者是本包**故意**不做的。`tls.ciphers` 和 `tls.groups` 允许你照样把它们报出去；服务器一旦选中握手就会失败，后果由你自己承担。
+
+有一个测试断言这张差异表**恰好**就是上面这些，所以哪天获得了其中某项能力却没更新这张表，构建会直接失败。
+
 HTTP/1.1 的 body 有的，HTTP/2 的 body 全都保留：流式（SSE 原样可用）、trailer、gzip 解码、
 以及在任何解码之前先包住原始 body 的 idle 截止线。结构上唯一不同的在水面之下——一条 h2 连接把
 发往同一源站的所有并发请求复用在一起，而不是一次签出、一次只服务一个请求。`install()`、重定向、

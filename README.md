@@ -311,9 +311,52 @@ behaviour — measure your own targets, and expect the answer to change. Our TLS
 identical outcomes on every reachable host in that sample, so JA3-style TLS shaping is not what
 gates access here — but curl's **HTTP/2** fingerprint passed where HTTP/1.1 was challenged. So the
 `SETTINGS` frame values, the initial window sizes, the connection `WINDOW_UPDATE`, and the
-pseudo-header order are matched byte-for-byte to curl (8.7.1 / nghttp2), captured off the wire.
+pseudo-header order are matched byte-for-byte to curl (nghttp2 1.69.0), captured off the wire.
 This is empirical: a naïve h2 fingerprint can fail exactly where curl's succeeds, which would waste
 the whole exercise.
+
+### Fingerprints
+
+Both halves are matched to **curl 8.21.0 / OpenSSL 3.6.3** and both are fully configurable. The TLS
+backend matters more than the curl version — the same curl built against SecureTransport produces a
+completely different ClientHello — so the reference is captured off the wire, not recalled, and
+pinned in `test/tls/fingerprint.test.js` and `test/http2/fingerprint.test.js`.
+
+| Layer | Default | Configure with |
+|---|---|---|
+| ClientHello extension **order** | curl's, exactly, for every extension both send | `tls.extensionOrder` |
+| Cipher suites | the AEAD suites this package implements, in curl's relative order | `tls.ciphers` |
+| Supported groups | `x25519, secp256r1, secp384r1, secp521r1` | `tls.groups` |
+| Signature algorithms | ECDSA and RSA-PSS/PKCS#1 over SHA-256/384/512 | `tls.sigSchemes` |
+| ALPN | `h2, http/1.1` | `tls.alpn` |
+| HTTP/2 `SETTINGS` ids **and order** | curl's: `MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
+| h2 preface, `WINDOW_UPDATE`, pseudo-header order, HPACK representation | curl's, byte-for-byte | fixed |
+| `Accept-Encoding` | `gzip, deflate` — curl's | `decoders` appends |
+
+Extension order matters because JA3 and JA4 hash the extension list **in wire order**, so it is most
+of what a fingerprinter reads. `pre_shared_key` is forced last whatever you ask for: RFC 8446
+§4.2.11 defines the binder transcript as the hello truncated just before the binders, which is a
+well-defined byte range only if nothing follows them.
+
+**Where the default deliberately differs from curl**, and why it cannot simply be copied: a
+ClientHello is an *offer*, and a server may take you up on any of it. Advertising what you cannot do
+trades a fingerprint mismatch for a broken handshake, which is worse and fails silently.
+
+| curl sends | This package | Why |
+|---|---|---|
+| 30 cipher suites, incl. RSA key exchange and CBC | 6 AEAD suites | Not implemented, by design. A server selecting `TLS_RSA_WITH_AES_256_CBC_SHA` would get a dead connection |
+| `X25519MLKEM768` group and a 1216-byte key share | not offered | ML-KEM is not implemented |
+| SHA-1 signature schemes | not offered | Refused deliberately |
+| `encrypt_then_mac` | not sent | Applies only to CBC suites, which are not offered |
+| `post_handshake_auth` | not sent | Invites a post-handshake `CertificateRequest`, which is not implemented |
+| — | `status_request` | curl does not ask for a stapled OCSP response; this package must, because a staple is its only revocation signal |
+
+Closing that gap means implementing ML-KEM, RSA key exchange and CBC suites — a different project,
+and the last two are things this package refuses on purpose. `tls.ciphers` and `tls.groups` will let
+you offer them anyway; the handshake will then fail if a server picks one, and that is yours to own.
+
+A test asserts this delta is exactly the list above, so gaining one of these capabilities without
+updating the table fails the build.
 
 Everything an HTTP/1.1 body has, an HTTP/2 body keeps: streaming (SSE works unchanged), trailers,
 gzip decoding, and the idle deadline wrapping the raw body before any decode. The one thing that is

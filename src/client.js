@@ -82,6 +82,11 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
+ *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
+ *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
+ *   TLS half of the fingerprint is configured through `tls` (`ciphers`, `groups`, `sigSchemes`,
+ *   `alpn`, `versions`, `extensionOrder`).
  * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
  *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
  *   on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
@@ -436,6 +441,11 @@ function registerHttp2(client, key, conn) {
     { readable: conn.readable, writable: conn.writable, close: conn.close },
     {
       info: conn.info,
+      // The h2 half of the fingerprint. Passed through so a caller can present some client other
+      // than curl without reaching past the Client for it — the TLS half is configurable through
+      // `tls`, and one being reachable while the other was not made "the fingerprint is
+      // configurable" only half true.
+      ...(client.options.http2Settings ? { settings: client.options.http2Settings } : {}),
       onClose: () => {
         client._h2conns.delete(h2);
         // Only drop the keyed entry if it is still this connection; a newer one may have replaced it.

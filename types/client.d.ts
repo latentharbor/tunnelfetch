@@ -65,6 +65,11 @@ export function install(options?: ClientOptions): () => void;
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
+ *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
+ *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
+ *   TLS half of the fingerprint is configured through `tls` (`ciphers`, `groups`, `sigSchemes`,
+ *   `alpn`, `versions`, `extensionOrder`).
  * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
  *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
  *   on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
@@ -222,6 +227,14 @@ export type ClientOptions = {
      * default true.
      */
     keepAlive?: boolean | undefined;
+    /**
+     * the HTTP/2 SETTINGS flight, as [id, value]
+     * pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
+     * are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
+     * TLS half of the fingerprint is configured through `tls` (`ciphers`, `groups`, `sigSchemes`,
+     * `alpn`, `versions`, `extensionOrder`).
+     */
+    http2Settings?: [number, number][] | undefined;
     /**
      * offer HTTP/2 via ALPN and speak it when the server selects it.
      * Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and

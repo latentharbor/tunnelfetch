@@ -210,6 +210,65 @@ export async function deriveSharedSecret(group, privateKey, peerKey) {
  * @param {ClientHelloOptions} opts
  * @returns {ClientHello}
  */
+/**
+ * Extension emission order, by type. This is not cosmetic: JA3 and JA4 hash the extension list in
+ * WIRE ORDER, so the order alone is a large part of what a fingerprinter reads.
+ *
+ * Captured from curl 8.21.0 / OpenSSL 3.6.3, which sends:
+ *   renegotiation_info, server_name, ec_point_formats, supported_groups, ALPN, encrypt_then_mac,
+ *   extended_master_secret, post_handshake_auth, signature_algorithms, supported_versions,
+ *   psk_key_exchange_modes, key_share
+ *
+ * Two of those this package does not send, and the reason is the same in both cases — an extension
+ * is a claim about what we can do. encrypt_then_mac only applies to CBC suites, which are not
+ * offered; post_handshake_auth invites a CertificateRequest after the handshake, which is not
+ * implemented. status_request goes the other way: curl does not send it, this package does,
+ * because a stapled OCSP response is its only revocation signal. It is placed where OpenSSL puts
+ * it when it does send one, right after server_name.
+ *
+ * Anything not named here keeps its natural position at the end, and pre_shared_key is forced last
+ * whatever the caller asks for, because RFC 8446 s4.2.11 defines the binder transcript as the hello
+ * truncated just before the binders — a range that only exists if nothing follows them.
+ */
+export const CURL_EXTENSION_ORDER = Object.freeze([
+  EXTENSION.renegotiation_info,
+  EXTENSION.server_name,
+  EXTENSION.status_request,
+  EXTENSION.ec_point_formats,
+  EXTENSION.supported_groups,
+  EXTENSION.alpn,
+  EXTENSION.extended_master_secret,
+  EXTENSION.signature_algorithms,
+  EXTENSION.supported_versions,
+  EXTENSION.psk_key_exchange_modes,
+  EXTENSION.key_share,
+]);
+
+/**
+ * Put the encoded extensions into the requested order.
+ *
+ * @param {Array<Uint8Array|null>} parts encoded extensions, nulls for the ones not offered
+ * @param {number[]} order extension types, most significant first
+ * @returns {Array<Uint8Array>}
+ */
+function orderExtensions(parts, order) {
+  const present = parts.filter(Boolean);
+  const typeOf = (e) => (e[0] << 8) | e[1];
+  // pre_shared_key is not the caller's to place.
+  const psk = present.filter((e) => typeOf(e) === EXTENSION.pre_shared_key);
+  const rest = present.filter((e) => typeOf(e) !== EXTENSION.pre_shared_key);
+  const rank = new Map(order.map((t, i) => [t, i]));
+  // A stable sort on rank, with unranked extensions after every ranked one in the order they were
+  // built. Array.prototype.sort is required to be stable, so equal ranks keep their relative order.
+  return [
+    ...rest
+      .map((e, i) => ({ e, i, r: rank.get(typeOf(e)) ?? Number.MAX_SAFE_INTEGER }))
+      .sort((x, y) => x.r - y.r || x.i - y.i)
+      .map((x) => x.e),
+    ...psk,
+  ];
+}
+
 export function buildClientHello({
   hostname,
   keyShares,
@@ -220,6 +279,7 @@ export function buildClientHello({
   sigSchemes = SUPPORTED_SIG_SCHEMES,
   alpn = [ALPN_HTTP11],
   versions = [TLS13, TLS12],
+  extensionOrder = CURL_EXTENSION_ORDER,
   extraExtensions = [],
   psk = null,
   randomBytes = defaultRandom,
@@ -285,7 +345,7 @@ export function buildClientHello({
     .vector(1, sessionId)
     .vector(2, suiteBytes.build())
     .vector(1, Uint8Array.from([0])) // legacy_compression_methods: null only
-    .push(encodeExtensionBlock(extensionParts))
+    .push(encodeExtensionBlock(orderExtensions(extensionParts, extensionOrder)))
     .build();
 
   const message = handshakeMessage(HANDSHAKE_TYPE.client_hello, body);
