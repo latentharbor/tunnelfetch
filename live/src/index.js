@@ -7,6 +7,7 @@
 // the internet.
 
 import { connect } from 'cloudflare:sockets';
+import { CORPUS } from './corpus.js';
 import { Client } from '../../src/client.js';
 import { verifyChain, rootStoreProvenance } from '../../src/trust/index.js';
 import { openConnection } from '../../src/transport.js';
@@ -321,21 +322,32 @@ const SIGKEYS = new Map();
  */
 const BODYFIX = new Map();
 
-async function bodyFixture(mb) {
-  if (BODYFIX.has(mb)) return BODYFIX.get(mb);
-  const line = enc.encode('The quick brown fox jumps over the lazy dog 0123456789 abcdef.\n');
+async function bodyFixture(mb, src = 'real') {
+  const cacheKey = `${src}:${mb}`;
+  if (BODYFIX.has(cacheKey)) return BODYFIX.get(cacheKey);
+  // `real` is the SAME 154 KiB of minified JavaScript the size origin serves, so a decomposition
+  // measured here is differencing against the same bytes the end-to-end sweep timed. `line` is the
+  // old fixture — a 63-byte phrase tiled — kept ONLY so the two can be compared inside one isolate.
+  //
+  // They are not interchangeable and the difference is not small. `line` compresses ~200:1, so its
+  // gzip stream is a handful of long matches: inflating it is nearly free and the wire side costs
+  // nothing. Real content is 2.76:1 and mostly literals. Any per-byte figure taken on `line` is a
+  // floor for a body no origin will ever send.
+  const period = src === 'line'
+    ? enc.encode('The quick brown fox jumps over the lazy dog 0123456789 abcdef.\n')
+    : CORPUS;
   const n = Math.round(mb * 1048576);
   const text = new Uint8Array(n);
-  for (let o = 0; o < n; o += line.length) {
-    text.set(line.subarray(0, Math.min(line.length, n - o)), o);
+  for (let o = 0; o < n; o += period.length) {
+    text.set(period.subarray(0, Math.min(period.length, n - o)), o);
   }
   const gz = new Uint8Array(
     await new Response(
       new Response(text).body.pipeThrough(new CompressionStream('gzip')),
     ).arrayBuffer(),
   );
-  const fix = { text, gz };
-  BODYFIX.set(mb, fix);
+  const fix = { text, gz, src };
+  BODYFIX.set(cacheKey, fix);
   return fix;
 }
 
@@ -497,6 +509,10 @@ async function cryptoBench(op, n, params = null) {
   // Body-path decomposition knobs: size in MB and JS-source chunk size in bytes.
   const mb = Number(params?.get?.('mb') ?? 4);
   const ck = Number(params?.get?.('ck') ?? 16384);
+  // Which corpus the body fixtures use. It CHANGES every per-byte number, so it is a
+  // discriminating field and must reach markPath — grouping two corpora into one bucket
+  // is the same omission that has already spoiled two sweeps.
+  const src = params?.get?.('src') ?? 'real';
   let sink = 0;
 
   if (op === 'aead-records') {
@@ -665,13 +681,13 @@ async function cryptoBench(op, n, params = null) {
 
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     return { op, mb, textBytes: fix.text.byteLength, gzBytes: fix.gz.byteLength };
   }
 
   if (op === 'native-collect') {
     // Floor: materialise mb MB from a native body with no stream of ours anywhere.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const buf = await new Response(fix.text).arrayBuffer();
     assertBytes(buf.byteLength, fix.text.byteLength, op);
     return { op, mb, bytes: buf.byteLength };
@@ -680,7 +696,7 @@ async function cryptoBench(op, n, params = null) {
   if (op === 'js-collect') {
     // A JS-backed ReadableStream of `ck`-byte subarray chunks, collected natively by Response.
     // Differenced against native-collect this prices the per-chunk JS<->runtime boundary.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const buf = await new Response(fixedSource(fix.text, ck)).arrayBuffer();
     assertBytes(buf.byteLength, fix.text.byteLength, op);
     return { op, mb, ck, chunks: Math.ceil(fix.text.byteLength / ck), bytes: buf.byteLength };
@@ -689,7 +705,7 @@ async function cryptoBench(op, n, params = null) {
   if (op === 'idle-wrap') {
     // Same JS source, wrapped the way the client wraps every raw body. Differenced against
     // js-collect this prices withIdleDeadline: one race()d read, one touch() per chunk.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const dl = new DeadlineController({ idleMs: 60000 }, {});
     const buf = await new Response(withIdleDeadline(fixedSource(fix.text, ck), dl)).arrayBuffer();
     dl.dispose();
@@ -699,7 +715,7 @@ async function cryptoBench(op, n, params = null) {
 
   if (op === 'gz-native') {
     // Inflate floor: native body -> native DecompressionStream -> native collection.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const buf = await new Response(
       new Response(fix.gz).body.pipeThrough(new DecompressionStream('gzip')),
     ).arrayBuffer();
@@ -710,7 +726,7 @@ async function cryptoBench(op, n, params = null) {
   if (op === 'gz-jsread') {
     // Same inflate, but the decompressed side is drained by a JS reader loop. The report also
     // says how the decompressor chunks its output, which sets the N in every per-chunk cost.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const ds = new DecompressionStream('gzip');
     const pump = new Response(fix.gz).body.pipeTo(ds.writable);
     pump.catch(() => {});
@@ -738,7 +754,7 @@ async function cryptoBench(op, n, params = null) {
     // Can the decompressed side be drained in LARGE reads? A BYOB read returns as soon as at
     // least one byte is available, so this cannot add latency — the question is whether the
     // runtime supports it on a DecompressionStream readable, and what it does to chunk count.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const ds = new DecompressionStream('gzip');
     const pump = new Response(fix.gz).body.pipeTo(ds.writable);
     pump.catch(() => {});
@@ -763,6 +779,103 @@ async function cryptoBench(op, n, params = null) {
     return { op, mb, ck, byob: true, reads, bytes };
   }
 
+  if (op === 'gz-byob-alloc') {
+    // gz-byob, but allocating a FRESH view per read instead of recycling the returned buffer —
+    // which is what src/client/decode.js actually does. The two differ by exactly one line, and
+    // if a BYOB read resolves on partial fill (it does, by design: gz-byob-partial proves it)
+    // then the shipped stage allocates one `ck`-byte buffer per OUTPUT CHUNK, not per view-full.
+    // At the runtime's 4 KiB output chunking and a 64 KiB view that is 16x the body in throwaway
+    // buffers. Differencing this against gz-byob at the same ck prices that allocation alone.
+    const fix = await bodyFixture(mb, src);
+    const ds = new DecompressionStream('gzip');
+    const pump = new Response(fix.gz).body.pipeTo(ds.writable);
+    pump.catch(() => {});
+    let r;
+    try {
+      r = ds.readable.getReader({ mode: 'byob' });
+    } catch (e) {
+      return { op, mb, byob: false, error: String(e?.message ?? e) };
+    }
+    let bytes = 0;
+    let reads = 0;
+    let short = 0; // reads that came back with less than the view: the coalescing that did NOT happen
+    for (;;) {
+      const { value, done } = await r.read(new Uint8Array(ck));
+      if (done) break;
+      reads++;
+      if (value.byteLength < ck) short++;
+      bytes += value.byteLength;
+    }
+    await pump;
+    assertBytes(bytes, fix.text.byteLength, op);
+    return { op, mb, ck, byob: true, reads, short, allocBytes: reads * ck, bytes };
+  }
+
+  if (op === 'gz-stagex') {
+    // A faithful replica of src/client/decode.js's wiring — JS input pump, pull-driven BYOB output
+    // — instrumented to report how many reads it takes and how many came back SHORT.
+    //
+    // This exists because gz-byob answered a different question than the one that matters. It fed
+    // the decompressor with a native pipeTo, which runs ahead, so every 64 KiB read found 64 KiB
+    // waiting and returned full: 16 reads per MB. The shipped stage pumps input from a JS task on
+    // the same event loop as the puller, so the decompressor may hold only one 4 KiB output chunk
+    // when the read arrives — and a BYOB read resolves on partial fill BY DESIGN (that property is
+    // what keeps an SSE body from stalling; gz-byob-partial proves it). Same code path, 16x the
+    // reads, and a fresh 64 KiB view allocated for each one.
+    //
+    // variant=asis      allocate a new view per read, as shipped
+    // variant=recycle   reuse the returned buffer; identical delivery, identical partial-fill
+    //                   semantics, no allocation churn
+    const variant = params?.get?.('variant') ?? 'asis';
+    // The BYOB view size, swept rather than assumed: fills average ~11 KiB in this wiring, so the
+    // shipped 64 KiB is mostly allocation that is never used.
+    const view = Number(params?.get?.('view') ?? 65536);
+    const fix = await bodyFixture(mb, src);
+    const source = new Response(fix.gz).body;
+    const srcReader = source.getReader();
+    const ds = new DecompressionStream('gzip');
+    const dsWriter = ds.writable.getWriter();
+    const pump = (async () => {
+      for (;;) {
+        const { value, done } = await srcReader.read();
+        if (done) break;
+        if (value?.byteLength) await dsWriter.write(value);
+      }
+      await dsWriter.close();
+    })();
+    pump.catch(() => {});
+    const useDefault = variant === 'default';
+    const out = useDefault ? null : ds.readable.getReader({ mode: 'byob' });
+    const outDefault = useDefault ? ds.readable.getReader() : null;
+    let reads = 0, short = 0, bytes = 0, inChunks = 0;
+    let buf = new ArrayBuffer(view);
+    const stream = new ReadableStream({
+      async pull(c) {
+        for (;;) {
+          // default: no BYOB at all — the runtime hands us its own buffer, so zero allocation,
+          // at the cost of its own 4 KiB output chunking. small: a view sized near the fill that
+          // actually arrives (measured ~11 KiB) rather than 64 KiB that never fills.
+          const { value, done } = variant === 'default'
+            ? await outDefault.read()
+            : await out.read(
+                variant === 'recycle' ? new Uint8Array(buf)
+                : new Uint8Array(view));
+          if (done) { await pump; c.close(); return; }
+          if (value.byteLength === 0) continue;
+          reads++;
+          if (value.byteLength < view) short++;
+          if (variant === 'recycle') buf = value.buffer;
+          bytes += value.byteLength;
+          c.enqueue(variant === 'recycle' ? value.slice() : value);
+          return;
+        }
+      },
+    });
+    const buf2 = await new Response(stream).arrayBuffer();
+    assertBytes(buf2.byteLength, fix.text.byteLength, op);
+    return { op, mb, variant, reads, short, inChunks, view, allocBytes: variant === 'recycle' ? view : variant === 'default' ? 0 : reads * view, bytes: buf2.byteLength };
+  }
+
   if (op === 'gz-byob-partial') {
     // The property a BYOB drain must have before it can sit on a streaming path: a read into a
     // large view must resolve with a PARTIAL fill when the decompressor has some output but the
@@ -770,7 +883,7 @@ async function cryptoBench(op, n, params = null) {
     // SSE-shaped bodies. No clocks: the proof is that the read resolves while the tail of the
     // gzip stream is provably unwritten, racing a generous timer only so a failure reports
     // 'stalled' instead of hanging the request.
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const gz = fix.gz;
     // A short prefix of the compressed stream, chosen so the decodable output it carries is far
     // smaller than the `ck`-byte view — a full view therefore PROVES the read waited for more
@@ -818,7 +931,7 @@ async function cryptoBench(op, n, params = null) {
   }
 
   if (op === 'gz-stage-old' || op === 'gz-stage-old-text') {
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const out = oldDecompressionStage(new Response(fix.gz).body, 'gzip');
     if (op === 'gz-stage-old-text') {
       const s = await new Response(out).text();
@@ -833,7 +946,7 @@ async function cryptoBench(op, n, params = null) {
   if (op === 'gz-stage' || op === 'gz-stage-text') {
     // The package's actual decode stage (decodeBody -> decompressionStage), fed and collected
     // exactly the way client.js feeds and Response collects it. gz-stage-text adds .text().
-    const fix = await bodyFixture(mb);
+    const fix = await bodyFixture(mb, src);
     const out = decodeBody(new Response(fix.gz).body, 'gzip');
     if (op === 'gz-stage-text') {
       const s = await new Response(out).text();
@@ -1110,6 +1223,7 @@ export default {
         fixed: [...BODYFIX.keys()].join('+') || null,
         mb: url.searchParams.get('mb') ?? null,
         ck: url.searchParams.get('ck') ?? null,
+        src: url.searchParams.get('src') ?? 'real',
       });
       return Response.json(await cryptoBench(op, n, url.searchParams));
     }
