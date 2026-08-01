@@ -93,12 +93,14 @@ export const CIPHER = {
 export const CIPHER_NAME = Object.fromEntries(Object.entries(CIPHER).map(([k, v]) => [v, k]));
 
 /** Offered in ClientHello, in preference order. */
-// KNOWN NOT TO MATCH curl, which offers AES-256-GCM first (`0x1302 0x1303 0x1301`, captured off
-// the wire). The extension order and the header order were matched to curl and this was never
-// checked, though JA3 hashes it just as directly. Correcting it changes the suite negotiated on
-// every connection and a dozen tests pin the current one, so it is deliberately a separate change
-// rather than a quiet one — see the fingerprint delta table in the README.
-export const TLS13_CIPHERS = [CIPHER.TLS_AES_128_GCM_SHA256, CIPHER.TLS_AES_256_GCM_SHA384];
+// curl's order, captured off the wire: `0x1302 0x1303 0x1301`, AES-256 before AES-128. Everything
+// through 1.3.0 offered the reverse — the extension order and the header order were matched to curl
+// and the CIPHER order was never checked, though JA3 hashes it just as directly.
+//
+// Client preference is advisory: most servers impose their own, so what this mainly changes is the
+// fingerprint. Where a server does follow the client it now picks AES-256, which on this runtime
+// costs a little more CPU per byte than AES-128 and is what curl asks for.
+export const TLS13_CIPHERS = [CIPHER.TLS_AES_256_GCM_SHA384, CIPHER.TLS_AES_128_GCM_SHA256];
 
 /**
  * curl 8.21.0 / OpenSSL 3.6.3 offers its TLS 1.3 suites in this exact order — AES-256-GCM,
@@ -117,11 +119,13 @@ export const TLS13_CIPHERS_WITH_CHACHA = [
   CIPHER.TLS_AES_128_GCM_SHA256,
 ];
 
+// Likewise curl's relative order among the four suites this package implements: of its full list,
+// `0xc02c 0xc030 ... 0xc02b 0xc02f` — ECDSA before RSA within each strength, AES-256 before AES-128.
 export const TLS12_CIPHERS = [
-  CIPHER.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-  CIPHER.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
   CIPHER.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
   CIPHER.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  CIPHER.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+  CIPHER.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 ];
 
 /**

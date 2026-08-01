@@ -71,11 +71,13 @@ export const curl = Object.freeze({
 export const chrome = Object.freeze({
   name: 'chrome/150',
   tls: Object.freeze({
-    // 16 suites, GREASE excluded — it is added by the grease option, not carried in the list.
-    ciphers: Object.freeze([
-      0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9,
-      0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
-    ]),
+    // Chromium's list, in Chromium's order, RESTRICTED to what this package can perform. It offers
+    // sixteen; the eight left out are TLS 1.2 CBC, RSA key exchange and the 1.2 ChaCha20 suites,
+    // none of which this package implements. Listing them would have been the exact dishonesty the
+    // requires-check exists to prevent: in a 1.3 handshake they are ignored, but a 1.2 server can
+    // select one and get a dead connection. 0x1303 is present because ChaCha20 is injectable and
+    // this profile requires it.
+    ciphers: Object.freeze([0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030]),
     groups: Object.freeze([0x11ec, 0x001d, 0x0017, 0x0018]),
     // Chrome sends real key_shares for X25519MLKEM768 and X25519 (a GREASE entry leads, added by
     // the grease option). Both must be generated, so both are named here; the hybrid entry is
