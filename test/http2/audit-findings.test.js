@@ -207,6 +207,102 @@ test('a body that matches its content-length is delivered', async () => {
 // RFC 9113 s6.1: DATA is always associated with a stream, and a zero stream id MUST be a
 // connection error. Absorbing it silently gave a peer a way to push bytes with no stream to charge
 // them to.
+// The content-length check above lived inline in the DATA/END_STREAM handler, so it guarded the one
+// route a proof-of-concept had walked. Three other routes reach the same end state — the response
+// half is over — and none of them had it. Each turned a declared length into a suggestion.
+//
+// These three are the bypasses. They now go through one door, `_endRecv`.
+
+test('END_STREAM on the response HEADERS is checked against content-length', async () => {
+  // "content-length: 500" with END_STREAM on the HEADERS frame declares a 500-byte body and
+  // delivers none. It used to arrive as a complete, empty 200.
+  const { conn, server } = connect();
+  const reqP = conn.request(GET);
+  reqP.catch(() => {});
+  await awaitRequest(server, 1);
+  await server.sendResponse(
+    1,
+    [{ name: ':status', value: '200' }, { name: 'content-length', value: '500' }],
+    { endStream: true },
+  );
+
+  await assert.rejects(
+    reqP,
+    (e) => e.code === 'HTTP2_PROTOCOL' && /content-length/.test(e.message),
+    'an empty body was accepted as a complete 500-byte response',
+  );
+  await conn.close();
+});
+
+test('a body terminated by trailers is checked against content-length', async () => {
+  // Trailers are a normal, server-controlled way to end a body, so the bypass was one frame:
+  // declare 64, send 5 without END_STREAM, then close the stream with a trailing HEADERS.
+  const { conn, server } = connect();
+  const reqP = conn.request(GET);
+  await awaitRequest(server, 1);
+  await server.sendResponse(1, [
+    { name: ':status', value: '200' },
+    { name: 'content-length', value: '64' },
+  ]);
+  const res = await reqP;
+  await server.sendData(1, enc.encode('short'), false);
+  await server.sendTrailers(1, [{ name: 'x-trailer', value: '1' }]);
+
+  await assert.rejects(
+    () => readBodyText(res.body),
+    (e) => e.code === 'HTTP2_PROTOCOL' && /content-length/.test(e.message),
+    'a truncated body ended by trailers was accepted as complete',
+  );
+  await conn.close();
+});
+
+test('conflicting repeated content-length fields are refused, not read as absent', async () => {
+  // `Headers.get()` joins repeated fields with ", ", so two of them read back as "10, 20". That
+  // failed the digits test and returned null — "no declared length" — which switched the check OFF
+  // for exactly the response most likely to be probing for it. The docblock claimed some earlier
+  // layer refused this. Nothing did.
+  const { conn, server } = connect();
+  const reqP = conn.request(GET);
+  reqP.catch(() => {});
+  await awaitRequest(server, 1);
+  await server.sendResponse(1, [
+    { name: ':status', value: '200' },
+    { name: 'content-length', value: '10' },
+    { name: 'content-length', value: '20' },
+  ]);
+
+  await assert.rejects(
+    reqP,
+    (e) => e.code === 'HTTP2_PROTOCOL' && /content-length/.test(e.message),
+    'a response declaring two different lengths was accepted',
+  );
+  await conn.close();
+});
+
+test('HEAD and the bodiless statuses keep their content-length, as RFC 9110 s8.6 requires', async () => {
+  // The exemptions, asserted so that closing the bypasses above cannot have broken them. For a
+  // HEAD response content-length describes the body the request WOULD have produced, and 204/304
+  // carry no body at all — in all three a zero-length arrival is correct, not a mismatch.
+  for (const [req, status, cl] of [
+    [{ ...GET, method: 'HEAD' }, '200', '4096'],
+    [GET, '204', '0'],
+    [GET, '304', '1234'],
+  ]) {
+    const { conn, server } = connect();
+    const reqP = conn.request(req);
+    await awaitRequest(server, 1);
+    await server.sendResponse(
+      1,
+      [{ name: ':status', value: status }, { name: 'content-length', value: cl }],
+      { endStream: true },
+    );
+    const res = await reqP;
+    assert.equal(res.status, Number(status), `${req.method} ${status} was not delivered`);
+    assert.equal(await readBodyText(res.body), '');
+    await conn.close();
+  }
+});
+
 test('DATA on stream 0 is a connection error', async () => {
   const { conn, server } = connect();
   const reqP = conn.request(GET);
