@@ -34,19 +34,6 @@ export function buildRequestFields({ method, scheme, authority, path, headers }:
  */
 export class Http2Retryable extends Http2Error {
 }
-/**
- * @typedef {object} Http2ConnectionOptions
- * @property {import('../transport.js').ConnectionInfo} [info] provenance attached to responses
- * @property {number} [initialWindowSize] our SETTINGS_INITIAL_WINDOW_SIZE (receive window per
- *   stream). Defaults to curl's 10 MiB; tests lower it to exercise flow control.
- * @property {number} [connectionWindow] the connection receive window we open with a WINDOW_UPDATE
- *   right after SETTINGS. Defaults to curl's 1000 MiB.
- * @property {number} [maxConcurrentStreams] our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
- * @property {number} [maxHeaderTableSize] our advertised SETTINGS_HEADER_TABLE_SIZE.
- * @property {number} [maxHeaderListSize] self-protection cap on a decoded response header list.
- * @property {(err: Error | null) => void} [onClose] called once when the connection dies, so a
- *   registry can drop it.
- */
 export class Http2Connection {
     /**
      * @param {import('../tls/connect.js').ByteDuplex | { readable: ReadableStream<Uint8Array>,
@@ -83,8 +70,10 @@ export class Http2Connection {
     _continuation: {
         streamId: any;
         fragments: Uint8Array<ArrayBuffer>[];
+        bytes: number;
         endStream: boolean;
     } | null;
+    _maxHeaderBlockBytes: number;
     _expectFirstSettings: boolean;
     _fatal: any;
     _goaway: {
@@ -137,6 +126,9 @@ export class Http2Connection {
         /** @type {Uint8Array[]} */
         recvQueue: Uint8Array[];
         recvEnded: boolean;
+        /** @type {number | null} declared content-length, null when absent */
+        declaredLength: number | null;
+        receivedLength: number;
         /** @type {Error | null} */
         bodyError: Error | null;
         /** @type {(() => void) | null} */
@@ -187,6 +179,14 @@ export class Http2Connection {
     _dispatchFrame(frame: any): void;
     _onSettings(flags: any, streamId: any, payload: any): void;
     _onHeaders(flags: any, streamId: any, payload: any): void;
+    /**
+     * Enforce the raw header-block cap, killing the connection when it is passed.
+     * Connection-level rather than stream-level on purpose: the fragments are HPACK input, and
+     * abandoning a partial block would leave the shared decoder desynchronised for every other
+     * stream — which RFC 9113 s4.3 makes a connection error in its own right.
+     * @returns {boolean} true when assembly may continue
+     */
+    _headerBlockWithinCap(): boolean;
     _onContinuation(flags: any, payload: any): void;
     /** A full header block has been assembled: HPACK-decode it (connection-fatal on failure, since
      *  HPACK state is shared) and route it to the stream as a response head or as trailers. */
@@ -225,24 +225,6 @@ export class Http2Connection {
     _settleResolve(d: any, value: any): void;
     _settleReject(d: any, err: any): void;
 }
-export type BodyStream = ReadableStream<Uint8Array> & {
-    completed: Promise<boolean>;
-    trailers: Promise<Headers | null>;
-};
-export type Http2ResponseHead = {
-    status: number;
-    /**
-     * always '' — HTTP/2 has no reason phrase
-     */
-    statusText: string;
-    headers: Headers;
-    /**
-     * one entry per set-cookie field, kept separate like the h1 path
-     */
-    setCookie: string[];
-    httpVersion: "2";
-    body: BodyStream;
-};
 export type Http2ConnectionOptions = {
     /**
      * provenance attached to responses
@@ -271,10 +253,35 @@ export type Http2ConnectionOptions = {
      */
     maxHeaderListSize?: number | undefined;
     /**
+     * cap on the RAW bytes of one HEADERS+CONTINUATION run,
+     * before HPACK decoding. Default 262144, matching the decoded cap. This is the bound that stops
+     * a CONTINUATION flood; `maxHeaderListSize` cannot, because it is only reachable once the whole
+     * block has been assembled in memory.
+     */
+    maxHeaderBlockBytes?: number | undefined;
+    /**
      * called once when the connection dies, so a
      * registry can drop it.
      */
     onClose?: ((err: Error | null) => void) | undefined;
+};
+export type BodyStream = ReadableStream<Uint8Array> & {
+    completed: Promise<boolean>;
+    trailers: Promise<Headers | null>;
+};
+export type Http2ResponseHead = {
+    status: number;
+    /**
+     * always '' — HTTP/2 has no reason phrase
+     */
+    statusText: string;
+    headers: Headers;
+    /**
+     * one entry per set-cookie field, kept separate like the h1 path
+     */
+    setCookie: string[];
+    httpVersion: "2";
+    body: BodyStream;
 };
 import { Http2Error } from '../errors.js';
 import { ByteReader } from '../util/bytes.js';

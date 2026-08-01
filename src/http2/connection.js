@@ -117,9 +117,24 @@ export class Http2Retryable extends Http2Error {}
  * @property {number} [maxConcurrentStreams] our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
  * @property {number} [maxHeaderTableSize] our advertised SETTINGS_HEADER_TABLE_SIZE.
  * @property {number} [maxHeaderListSize] self-protection cap on a decoded response header list.
+ * @property {number} [maxHeaderBlockBytes] cap on the RAW bytes of one HEADERS+CONTINUATION run,
+ *   before HPACK decoding. Default 262144, matching the decoded cap. This is the bound that stops
+ *   a CONTINUATION flood; `maxHeaderListSize` cannot, because it is only reachable once the whole
+ *   block has been assembled in memory.
  * @property {(err: Error | null) => void} [onClose] called once when the connection dies, so a
  *   registry can drop it.
  */
+
+/**
+ * The declared content-length, or null when absent. A list with conflicting values is refused by
+ * the header layer before this is reached; a malformed single value is treated as absent rather
+ * than as zero, because guessing a length is the failure mode being closed here.
+ */
+function contentLengthOf(headers) {
+  const raw = headers.get?.('content-length') ?? null;
+  if (raw === null) return null;
+  return /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : null;
+}
 
 export class Http2Connection {
   /**
@@ -169,7 +184,18 @@ export class Http2Connection {
     // Header-block continuation state: while assembling a HEADERS+CONTINUATION run, no other frame
     // may interleave (RFC 9113 s6.10). Non-null means "the next frame must be CONTINUATION on this
     // stream id".
-    this._continuation = null; // { streamId, fragments: Uint8Array[], endStream, kind }
+    this._continuation = null; // { streamId, fragments: Uint8Array[], bytes, endStream, kind }
+    // A header block arrives as a HEADERS frame plus any number of CONTINUATION frames, and it is
+    // only decodable once the last one lands — so the fragments must be held. `maxHeaderListSize`
+    // bounds the DECODED list and is checked in _completeHeaderBlock, which is to say after the
+    // whole block is already in memory: a peer that simply never sets END_HEADERS never reaches
+    // it. That is the CONTINUATION flood (the class behind CVE-2024-27316 and its siblings), and
+    // it is bounded here instead, on the raw bytes, as they arrive.
+    //
+    // 262144 by default, the same figure as the decoded cap. HPACK does not expand — an indexed
+    // reference makes a small input decode LARGER, never the reverse — so a block whose raw size
+    // exceeds the decoded cap could not have produced an acceptable header list anyway.
+    this._maxHeaderBlockBytes = opts.maxHeaderBlockBytes ?? 262144;
     this._expectFirstSettings = true;
 
     this._fatal = null; // set once; rejects every stream and every future request
@@ -306,6 +332,9 @@ export class Http2Connection {
       /** @type {Uint8Array[]} */
       recvQueue: [],
       recvEnded: false,
+      /** @type {number | null} declared content-length, null when absent */
+      declaredLength: null,
+      receivedLength: 0,
       /** @type {Error | null} */
       bodyError: null,
       /** @type {(() => void) | null} */
@@ -368,7 +397,13 @@ export class Http2Connection {
       this._connSendWindow -= n;
       const end = offset >= body.byteLength;
       await this._write(dataFrame(streamId, slice, end));
-      if (end) stream.localEnded = true;
+      if (end) {
+        stream.localEnded = true;
+        // The remote half may have ended long ago — a server is free to answer before the upload
+        // finishes — in which case nothing else will ever re-check, and the stream stays in the
+        // map for the life of the connection. Every other place that ends a half calls this.
+        this._maybeCloseStream(stream);
+      }
     }
   }
 
@@ -673,12 +708,43 @@ export class Http2Connection {
     if (flags & FLAG.END_HEADERS) {
       this._completeHeaderBlock(streamId, fragment, endStream);
     } else {
-      this._continuation = { streamId, fragments: [fragment.slice()], endStream };
+      this._continuation = {
+        streamId,
+        fragments: [fragment.slice()],
+        bytes: fragment.length,
+        endStream,
+      };
+      // The opening frame alone can exceed the cap when SETTINGS_MAX_FRAME_SIZE is large.
+      if (!this._headerBlockWithinCap()) return;
     }
+  }
+
+  /**
+   * Enforce the raw header-block cap, killing the connection when it is passed.
+   * Connection-level rather than stream-level on purpose: the fragments are HPACK input, and
+   * abandoning a partial block would leave the shared decoder desynchronised for every other
+   * stream — which RFC 9113 s4.3 makes a connection error in its own right.
+   * @returns {boolean} true when assembly may continue
+   */
+  _headerBlockWithinCap() {
+    const { bytes, streamId } = this._continuation;
+    if (bytes <= this._maxHeaderBlockBytes) return true;
+    this._continuation = null;
+    this._die(
+      new Http2Error(
+        codes.HTTP2_PROTOCOL,
+        `header block on stream ${streamId} reached ${bytes} bytes across HEADERS and ` +
+          `CONTINUATION frames, over the ${this._maxHeaderBlockBytes} byte cap`,
+        { streamId, bytes, cap: this._maxHeaderBlockBytes },
+      ),
+    );
+    return false;
   }
 
   _onContinuation(flags, payload) {
     this._continuation.fragments.push(payload.slice());
+    this._continuation.bytes += payload.length;
+    if (!this._headerBlockWithinCap()) return;
     if (flags & FLAG.END_HEADERS) {
       const { streamId, fragments, endStream } = this._continuation;
       this._continuation = null;
@@ -734,6 +800,13 @@ export class Http2Connection {
       return;
     }
     stream.responseReceived = true;
+    // RFC 9113 s8.1.1: a message with a content-length that disagrees with the DATA delivered is
+    // malformed. h1 enforces this through its framing; h2 declares the length in a header and
+    // delimits with END_STREAM, so the two can disagree — and a body that silently differs from
+    // its declared length is exactly the ambiguity this package refuses everywhere else. Held on
+    // the stream and checked as DATA arrives and again at END_STREAM.
+    stream.declaredLength = contentLengthOf(head.headers);
+    stream.receivedLength = 0;
     if (endStream) {
       // No body and no trailers: the completion contract is satisfiable now, exactly like the h1
       // "complete at creation" case, so a caller that never reads the (empty) body still lets the
@@ -777,6 +850,13 @@ export class Http2Connection {
   }
 
   _onData(flags, streamId, payload) {
+    if (streamId === 0) {
+      // RFC 9113 s6.1: DATA is always associated with a stream, and a zero id MUST be a connection
+      // error. Absorbing it silently was letting a peer push bytes with no stream to charge them
+      // to, which is the shape of a smuggling primitive as much as a resource one.
+      this._die(new Http2Error(codes.HTTP2_PROTOCOL, 'DATA frame on stream 0'));
+      return;
+    }
     const stream = this._streams.get(streamId);
     // Flow control is accounted at the connection level for EVERY DATA frame, even one for a
     // stream we have already closed — the peer spent connection window to send it, and not
@@ -824,11 +904,40 @@ export class Http2Connection {
     if (overhead > 0) this._replenishConn(overhead);
     // The stream window was debited by flowLen; credit the overhead back on the stream too.
     if (overhead > 0) this._replenish(stream, overhead);
+    stream.receivedLength += data.byteLength;
+    // Caught on the way past rather than only at END_STREAM, so an over-long body is refused
+    // before the excess is queued for the caller.
+    if (stream.declaredLength !== null && stream.receivedLength > stream.declaredLength) {
+      this._resetStream(
+        stream,
+        H2_ERROR.PROTOCOL_ERROR,
+        new Http2Error(
+          codes.HTTP2_PROTOCOL,
+          `response body is longer than its content-length: ${stream.receivedLength} bytes so ` +
+            `far against a declared ${stream.declaredLength}`,
+          { declared: stream.declaredLength, received: stream.receivedLength },
+        ),
+      );
+      return;
+    }
     if (data.byteLength > 0) {
       stream.recvQueue.push(data.slice());
       this._wakePull(stream);
     }
     if (flags & FLAG.END_STREAM) {
+      if (stream.declaredLength !== null && stream.receivedLength !== stream.declaredLength) {
+        this._resetStream(
+          stream,
+          H2_ERROR.PROTOCOL_ERROR,
+          new Http2Error(
+            codes.HTTP2_PROTOCOL,
+            `response body ended at ${stream.receivedLength} bytes against a declared ` +
+              `content-length of ${stream.declaredLength}`,
+            { declared: stream.declaredLength, received: stream.receivedLength },
+          ),
+        );
+        return;
+      }
       stream.recvEnded = true;
       this._wakePull(stream);
       this._maybeCloseStream(stream);
