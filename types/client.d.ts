@@ -65,10 +65,20 @@ export function install(options?: ClientOptions): () => void;
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {import('./profiles.js').FingerprintProfile} [profile] one coherent network identity
+ *   instead of a dozen knobs that can disagree — TLS, HTTP/2, header order and default headers
+ *   together. Explicit options win over it. A profile that declares capabilities this package
+ *   cannot perform is REFUSED rather than silently reduced: see `profiles.chrome`.
  * @property {readonly string[]} [headerOrder] request header names, lowercased, in the order to
  *   emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
  *   to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
  *   without this a request goes out with `user-agent` last, which no real client does.
+ * @property {string[]} [http2PseudoHeaderOrder] request pseudo-headers in the order to emit them.
+ *   Defaults to curl's. Any of the four omitted is appended rather than dropped: RFC 9113 s8.3.1
+ *   makes all four mandatory, so a request missing one is malformed rather than merely unusual.
+ * @property {Record<string, 'incremental'|'without'|'never'>} [http2HpackIndexing] per-field HPACK
+ *   indexing. Which fields enter the dynamic table is read by an Akamai-style h2 fingerprint.
+ *   Defaults to curl's: everything incremental except `:path`.
  * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
  *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
  *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
@@ -232,12 +242,31 @@ export type ClientOptions = {
      */
     keepAlive?: boolean | undefined;
     /**
+     * one coherent network identity
+     * instead of a dozen knobs that can disagree — TLS, HTTP/2, header order and default headers
+     * together. Explicit options win over it. A profile that declares capabilities this package
+     * cannot perform is REFUSED rather than silently reduced: see `profiles.chrome`.
+     */
+    profile?: import("./profiles.js").FingerprintProfile | undefined;
+    /**
      * request header names, lowercased, in the order to
      * emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
      * to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
      * without this a request goes out with `user-agent` last, which no real client does.
      */
     headerOrder?: readonly string[] | undefined;
+    /**
+     * request pseudo-headers in the order to emit them.
+     * Defaults to curl's. Any of the four omitted is appended rather than dropped: RFC 9113 s8.3.1
+     * makes all four mandatory, so a request missing one is malformed rather than merely unusual.
+     */
+    http2PseudoHeaderOrder?: string[] | undefined;
+    /**
+     * per-field HPACK
+     * indexing. Which fields enter the dynamic table is read by an Akamai-style h2 fingerprint.
+     * Defaults to curl's: everything incremental except `:path`.
+     */
+    http2HpackIndexing?: Record<string, "without" | "incremental" | "never"> | undefined;
     /**
      * the HTTP/2 SETTINGS flight, as [id, value]
      * pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they

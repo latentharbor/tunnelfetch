@@ -13,7 +13,7 @@ export function buildRequestFields({ method, scheme, authority, path, headers }:
     authority: string;
     path: string;
     headers: Array<[string, string]>;
-}): import("./hpack.js").HpackField[];
+}, opts?: {}): import("./hpack.js").HpackField[];
 /**
  * @typedef {ReadableStream<Uint8Array> & { completed: Promise<boolean>,
  *   trailers: Promise<Headers | null> }} BodyStream
@@ -76,6 +76,8 @@ export class Http2Connection {
     _maxHeaderBlockBytes: number;
     /** @type {Array<[number, number]> | null} the SETTINGS flight, ids and order included */
     _settingsFlight: Array<[number, number]> | null;
+    _pseudoHeaderOrder: string[] | null;
+    _hpackIndexing: Record<string, "without" | "incremental" | "never"> | null;
     _expectFirstSettings: boolean;
     _fatal: any;
     _goaway: {
@@ -254,6 +256,19 @@ export type Http2ConnectionOptions = {
      * self-protection cap on a decoded response header list.
      */
     maxHeaderListSize?: number | undefined;
+    /**
+     * request pseudo-headers in the order to emit them.
+     * Defaults to curl's `[':method', ':scheme', ':authority', ':path']`. Any of the four left out is
+     * appended rather than dropped — RFC 9113 s8.3.1 makes all four mandatory and a request missing
+     * one is malformed, which is not a fingerprint choice anyone should be able to make by accident.
+     */
+    pseudoHeaderOrder?: string[] | undefined;
+    /**
+     * per-field HPACK
+     * indexing. Which fields enter the dynamic table is part of the fingerprint. Defaults to curl's:
+     * everything incremental except `:path`, which is sent without indexing.
+     */
+    hpackIndexing?: Record<string, "without" | "incremental" | "never"> | undefined;
     /**
      * the SETTINGS flight sent in the connection
      * preface, as [id, value] pairs. Order is significant — an Akamai-style HTTP/2 fingerprint reads
