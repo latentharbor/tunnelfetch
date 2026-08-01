@@ -219,6 +219,26 @@ const client = new Client({ connect, proxy, decoders: { br: brotli } });
 
 brotli 本身落在原生 inflate 的 1.9 倍。这个差价就是这个编码的成本，而它省下的线上字节买不回来——见[这个包做不到什么](#这个包做不到什么为什么)。解码器名字会按 HTTP token 校验；解码器抛错时响应体 fail closed，而不是被截断；未注册的编码依然会被拒绝。
 
+### 一行 import 得到 Chrome 身份
+
+```js
+import { Client } from 'tunnelfetch';
+import { chrome } from 'tunnelfetch/profile/chrome';
+
+const client = new Client({ profile: chrome, connect, proxy, decoders: { br, zstd } });
+```
+
+这个子路径带着运行时没有原生实现的两个原语——`X25519MLKEM768` 密钥交换要的 ML-KEM-768,以及记录层要的 ChaCha20-Poly1305,都编译成无依赖的 WASM,并且都在本仓库里有已知答案测试。**导入即 opt-in**:打包器只为走这条路径的代码拉入它们,默认身份一个字节都不背。
+
+`br` 和 `zstd` 仍然要你自己带。它们不是密码学、没有唯一正解,所以 profile 会一直拒绝到你提供为止——**一个声称支持 br 却读不了的 Chrome,比一个老实说不支持的更糟**。
+
+不是「能构造出来」,是端到端验证过:
+
+| 源站 | | TLS | 群 | HTTP |
+|---|---|---|---|---|
+| `blog.cloudflare.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
+| `www.shopify.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
+
 ### HTTP/2 — 要的是访问，不是速度
 
 客户端默认在 ALPN 中同时报出 `h2` 与 `http/1.1`，服务器选中哪个就说哪个。没有单独的 API：
@@ -516,6 +536,24 @@ inflate 本身（约 2 ms/MB）加上把 body 物化成 JS 字符串（约 1.7 m
 
 导入这个包是免费的。121 个内置锚是以主题 DN 哈希为索引的 base64 字符串，只有链实际落到的那一个会被解码，所以
 380 KB 打包（gzip 后 133 KB）的启动时间保持在约 2 ms，而一个导入了但没使用本包的请求是 0 ms。
+
+### 可选开关各自的成本
+
+上面所有数字都是默认身份:curl 指纹、gzip 与 deflate、无后量子、无 GREASE。下面每个开关默认都关着,这张表是「打开它要付什么」。测法与其余部分一致——差分两个工作量、取样本最小值。
+
+| 开关 | 成本 | 何时付 |
+|---|---|---|
+| `grease: true` | 测不出来 | 一次 hello 里多几个字节 |
+| `tls.extensionOrder: 'shuffle'` | 测不出来 | 每次握手洗牌约 11 个元素 |
+| `headerOrder` | 测不出来——有序列表比平台的 `Headers` **更快**(1.6 µs 对 3.8 µs) | 每请求 |
+| `groups: { x25519mlkem768 }` | 用内置 WASM **+0.15 ms**,用纯 JS 的 ML-KEM **+1.35 ms** | **每连接**,不是每请求——复用该连接的所有请求共同摊薄 |
+| `ciphers: { chacha20 }` | **+2.0 ms/MB**,而且只有服务器**选中**它时才付 | 每字节。有 AES 硬件加速的服务器通常偏好 AES-GCM,所以实际成本往往是零,真正起作用的是"出现在 offer 里" |
+| `decoders: { br }` | **+4.4 ms/MB** | 每字节,只要源站发 brotli。压得越狠越亏:quality 11 线上小 16%,解码贵 46% |
+| `profile: chrome` | 上面三项之和 | |
+
+1.4.0 里有两个默认值变了,而它们都没有出现在上面那张表里:套件顺序对齐 curl 之后,原本协商 AES-128-GCM 的地方现在协商 AES-256-GCM,实测**贵 4%**(1.50 对 1.45 ms/MB——硬件 AES 让多出来的轮次很便宜);有序 header 列表取代了平台 `Headers`,反而**略微更便宜**。两者都落在上面数字本来就带的 ±1.5× 波动之内。
+
+体积:`import 'tunnelfetch/profile/chrome'` 会为两个 WASM 原语增加约 **22 KB(gzip)**。没有其它地方引用它们,所以走默认身份的使用者一个字节都不背。
 
 ### 计划限制
 

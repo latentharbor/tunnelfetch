@@ -929,6 +929,22 @@ async function cryptoBench(op, n, params = null) {
     return { op, n, bytes: sink, perDecode: RAW_BYTES };
   }
 
+  if (op === 'aes128' || op === 'aes256') {
+    // The default cipher moved from AES-128 to AES-256 when the offer order was matched to curl.
+    // Both are WebCrypto; this is the per-byte cost of that change, on 16 KiB TLS records.
+    const RECORD = 16384;
+    const records = Math.max(1, Math.round((n * 1048576) / RECORD));
+    const plain = new Uint8Array(RECORD);
+    const iv = new Uint8Array(12);
+    const k = await crypto.subtle.importKey(
+      'raw', new Uint8Array(op === 'aes256' ? 32 : 16), 'AES-GCM', false, ['encrypt']);
+    for (let i = 0; i < records; i++) {
+      iv[11] = i & 0xff;
+      sink += (await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, k, plain)).byteLength;
+    }
+    return { op, n, records, bytes: sink };
+  }
+
   if (op === 'pq-caps') {
     // Feature-detection, on the runtime that matters. Whether ChaCha20 or ML-KEM exist natively
     // decides whether these are a wiring job or a userland crypto implementation, and the answer
