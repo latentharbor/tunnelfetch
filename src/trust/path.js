@@ -568,6 +568,27 @@ export async function validatePath(
         addConstraints(state, cert.nameConstraints, subject,
           cert.extensions.get(OID.nameConstraints)?.critical ?? false);
       }
+      // EKU chaining. RFC 5280 s6.1 does NOT process extendedKeyUsage during path validation, so
+      // this is deliberately beyond the RFC floor — it is the CA/Browser Forum rule and what
+      // mozilla::pkix, Chrome and Safari all do, and it is the entire mechanism that makes a
+      // "technically constrained" sub-CA constrained. A real CA may delegate a sub-CA restricted
+      // to id-kp-clientAuth or id-kp-emailProtection instead of putting it through a full audit,
+      // relying on this rule so that compromising that key cannot mint TLS server certificates.
+      // Checking only the leaf, as this did, meant such a sub-CA could issue a serverAuth leaf for
+      // any hostname and be believed — by this client and by nothing else.
+      //
+      // An ABSENT extendedKeyUsage is unconstrained and stays accepted; that is both the RFC
+      // reading and what browsers do. Only a stated purpose list that excludes serverAuth is a
+      // refusal.
+      if (cert.extendedKeyUsage &&
+          !cert.extendedKeyUsage.includes(OID.serverAuth) &&
+          !cert.extendedKeyUsage.includes(OID.anyExtendedKeyUsage)) {
+        throw constraintError(
+          `intermediate "${subject}" has an extendedKeyUsage (${cert.extendedKeyUsage.join(', ')}) ` +
+            'that does not include serverAuth or anyExtendedKeyUsage, so it may not issue a ' +
+            'certificate used for TLS server authentication',
+          { subject, eku: [...cert.extendedKeyUsage] });
+      }
     } else {
       // End-entity role checks. A leaf that is also a CA is legal (s6.1 has no prohibition);
       // what matters is that its stated purposes include TLS server authentication.
