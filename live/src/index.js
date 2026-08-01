@@ -929,6 +929,46 @@ async function cryptoBench(op, n, params = null) {
     return { op, n, bytes: sink, perDecode: RAW_BYTES };
   }
 
+  if (op === 'pq-caps') {
+    // Feature-detection, on the runtime that matters. Whether ChaCha20 or ML-KEM exist natively
+    // decides whether these are a wiring job or a userland crypto implementation, and the answer
+    // cannot be read off Node's behaviour or anyone's documentation.
+    const probe = async (label, fn) => {
+      try { return [label, { ok: true, v: await fn() }]; }
+      catch (e) { return [label, { ok: false, err: String(e?.message ?? e).slice(0, 90) }]; }
+    };
+    const nodeCrypto = await import('node:crypto').catch(() => null);
+    const results = await Promise.all([
+      probe('webcrypto.ChaCha20-Poly1305.importKey', async () => {
+        const k = await crypto.subtle.importKey('raw', new Uint8Array(32), 'ChaCha20-Poly1305', false, ['encrypt']);
+        return k.algorithm?.name ?? 'imported';
+      }),
+      probe('webcrypto.AES-GCM.importKey', async () => {
+        await crypto.subtle.importKey('raw', new Uint8Array(32), 'AES-GCM', false, ['encrypt']);
+        return 'imported';
+      }),
+      probe('webcrypto.ML-KEM-768.generateKey', async () => {
+        const k = await crypto.subtle.generateKey({ name: 'ML-KEM-768' }, true, ['encapsulateBits']);
+        return Object.keys(k).join(',');
+      }),
+      probe('webcrypto.X25519MLKEM768.generateKey', async () => {
+        await crypto.subtle.generateKey({ name: 'X25519MLKEM768' }, true, ['deriveBits']);
+        return 'generated';
+      }),
+      probe('node:crypto.getCiphers has chacha20-poly1305', async () =>
+        nodeCrypto?.getCiphers?.().includes('chacha20-poly1305') ?? 'no getCiphers'),
+      probe('node:crypto.createCipheriv chacha20-poly1305', async () => {
+        const c = nodeCrypto.createCipheriv('chacha20-poly1305', new Uint8Array(32), new Uint8Array(12), { authTagLength: 16 });
+        c.update(new Uint8Array(16)); c.final();
+        return 'works';
+      }),
+      probe('node:crypto ML-KEM keygen', async () =>
+        nodeCrypto.generateKeyPairSync('ml-kem-768') ? 'works' : 'no'),
+      probe('node:crypto.getCurves count', async () => nodeCrypto?.getCurves?.().length ?? 'none'),
+    ]);
+    return { op, caps: Object.fromEntries(results) };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };

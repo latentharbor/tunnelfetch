@@ -1,0 +1,66 @@
+# Copyright (c) The mlkem-native project authors
+# SPDX-License-Identifier: Apache-2.0 OR ISC OR MIT
+
+name: CBMC
+description: Run CBMC proofs for mlkem-native
+
+inputs:
+  nix-shell:
+    description: Run in the specified Nix environment if exists
+    default: "cbmc"
+  nix-cache:
+    description: Determine whether to enable nix cache
+    default: 'true'
+  nix-verbose:
+    description: Determine wether to suppress nix log or not
+    default: 'false'
+  custom_shell:
+    description: The shell to use. Only relevant if use-nix is 'false'
+    default: "bash"
+  mlkem_k:
+    description: "Security level for ML-KEM (2,3,4)"
+    default: "2"
+  gh_token:
+    description: Github access token to use
+    required: true
+runs:
+  using: composite
+  steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: ./.github/actions/setup-shell
+        with:
+          nix-shell: ${{ inputs.nix-shell }}
+          nix-cache: ${{ inputs.nix-cache }}
+          nix-verbose: ${{ inputs.nix-verbose }}
+          gh_token: ${{ inputs.gh_token }}
+          custom_shell: ${{ inputs.custom_shell }}
+          script: |
+
+            if [[ ${{ inputs.nix-shell }} != '' ]]; then
+              nix-collect-garbage
+            fi
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+              ## Setup
+              Architecture: $(uname -m)
+              - $(nix --version)
+              - $(cbmc --version)
+              - litani Version $(litani --version)
+              - $(bash --version | grep -m1 "")
+            EOF
+      - name: Run CBMC proofs (MLKEM_K=${{ inputs.mlkem_k }})
+        shell: ${{ env.SHELL }}
+        env:
+          GH_TOKEN: ${{ inputs.gh_token }}
+        run: |
+          echo "::group::cbmc_${{ inputs.mlkem_k }}"
+          tests cbmc --mlkem-parameter-set ${{ inputs.mlkem_k }} --per-proof-timeout 1800 --output-result-json ${{ github.workspace }}/cbmc_result_k${{ inputs.mlkem_k }}.json || cbmc_failed=true
+          echo "::endgroup::"
+          python3 ${{ github.action_path }}/report.py \
+            --results-json "${{ github.workspace }}/cbmc_result_k${{ inputs.mlkem_k }}.json" \
+            --mlkem-k "${{ inputs.mlkem_k }}" \
+            --min-runtime 20 \
+            --regression-threshold 1.5 \
+            --gh-pages-branch gh-pages \
+            --data-dir dev/cbmc
+          if [ "$cbmc_failed" = "true" ]; then exit 1; fi
