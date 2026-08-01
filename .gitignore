@@ -12,3 +12,7 @@ probe/results/*.local.json
 
 # c8 output, produced by `npx c8 npm test`
 coverage/
+
+# Scratch space for the WASM crypto build (libsodium/liboqs sources, emscripten output).
+# Not part of the package: `files` in package.json publishes src/ and types/ only.
+wasmcrypto/
