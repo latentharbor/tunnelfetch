@@ -43,8 +43,9 @@ export const chrome = Object.freeze({
   ciphers: Object.freeze({ chacha20: chacha20poly1305 }),
   groups: Object.freeze({ x25519mlkem768: mlkem768 }),
   // Chrome advertises `gzip, deflate, br, zstd`, so the identity is not presentable without these.
-  // Each bounds its own output — `decodeBody` deliberately does not cap a caller-supplied decoder,
-  // and a decoder that did not self-limit would reopen the gzip-bomb hole closed in 1.4.1.
+  // `decodeBody` now bounds a registered decoder's output by the client's `maxBodyBytes` too (not
+  // just the built-in gzip/deflate path), so these honour the caller's cap. Each ALSO self-limits
+  // (256 MiB) as defence-in-depth for callers who leave `maxBodyBytes` at Infinity.
   decoders: Object.freeze({ br, zstd }),
 });
 

@@ -539,6 +539,68 @@ test('a decoder that throws fails the body closed rather than truncating it', as
   await assert.rejects(() => collect(out), /corrupt brotli stream/);
 });
 
+// A stand-in for a decompressor: a few coded bytes in, a lot of decoded bytes out — the shape of a
+// decompression bomb, without pulling a real WASM codec into the offline suite. The package ships
+// `br`/`zstd` as exactly this kind of registered decoder in `tunnelfetch/profile/chrome`.
+const expandingDecoder = (outBytes, chunk = 64 * 1024) => (stream) =>
+  new ReadableStream({
+    async start(c) {
+      const r = stream.getReader();
+      for (;;) {
+        const { done } = await r.read();
+        if (done) break;
+      }
+      for (let sent = 0; sent < outBytes; sent += chunk) {
+        c.enqueue(new Uint8Array(Math.min(chunk, outBytes - sent)));
+      }
+      c.close();
+    },
+  });
+
+test("a registered decoder's OUTPUT is bounded by maxBodyBytes, not just the coded body", async () => {
+  // A registered decoder decompresses, so a few coded bytes can inflate far past the cap inside it —
+  // the package ships br/zstd this way, and a ~50-byte brotli bomb decoded to tens of MB under a
+  // 1 MB cap because the decoded side of a registered decoder was left unbounded. It must honour
+  // maxBodyBytes exactly like the built-in gzip path, refusing before the excess is delivered.
+  const out = decodeBody(
+    readableFrom([utf8('seed')]),
+    'br',
+    { br: expandingDecoder(8 * 1024 * 1024) },
+    1024 * 1024,
+  );
+  const reader = out.getReader();
+  let total = 0;
+  await assert.rejects(
+    async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+      }
+    },
+    (e) => e.code === 'LIMIT_BODY',
+    'a registered decoder inflated past maxBodyBytes without being stopped',
+  );
+  assert.ok(total <= 1024 * 1024, `${total} bytes reached the consumer past a 1 MiB cap`);
+});
+
+test("without a finite cap a registered decoder's full output still flows (not a truncation)", async () => {
+  // The dangerous fix is one that quietly stops early: an unbounded cap must deliver every byte.
+  const out = decodeBody(readableFrom([utf8('seed')]), 'br', { br: expandingDecoder(2 * 1024 * 1024) });
+  assert.equal((await collect(out)).byteLength, 2 * 1024 * 1024);
+});
+
+test("a registered decoder's own error surfaces unchanged even under a finite cap", async () => {
+  // The cap guard must not mask the decoder's failure with a LIMIT_BODY of its own.
+  const out = decodeBody(
+    readableFrom([PAYLOAD]),
+    'br',
+    { br: (s) => s.pipeThrough(new TransformStream({ transform() { throw new Error('corrupt brotli stream'); } })) },
+    1024 * 1024,
+  );
+  await assert.rejects(() => collect(out), /corrupt brotli stream/);
+});
+
 test('an unregistered coding is still refused, so the pluggability cannot fail open', async () => {
   await rejectsWithCode(
     () => decodeBody(readableFrom([PAYLOAD]), 'zstd', { br: upperDecoder }),
