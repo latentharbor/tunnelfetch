@@ -831,6 +831,55 @@ async function cryptoBench(op, n, params = null) {
     // shipped 64 KiB is mostly allocation that is never used.
     const view = Number(params?.get?.('view') ?? 65536);
     const fix = await bodyFixture(mb, src);
+    // Candidate wirings for the real decompressionStage, fed by a JS ReadableStream (fixedSource) —
+    // NOT a native Response body. This is the whole point: the product's source is always a JS
+    // stream (readResponseBody -> withIdleDeadline), and a native-body pipeTo "runs ahead" and
+    // measures a different program (the trap the brief names). `ick` sets the input chunk size.
+    //   input:  jspump = JS pump loop | jspipe = source.pipeTo(ds.writable)
+    //   output: native (hand ds.readable to Response) | byob (BYOB `view` drain + count) |
+    //           cap (counting TransformStream)
+    // variant = <input>-<output>, e.g. jspipe-native, jspump-native, jspipe-byob, jspipe-cap.
+    if (variant.includes('-')) {
+      const ick = Number(params?.get?.('ick') ?? 65536);
+      const [inMode, outMode] = variant.split('-');
+      const source = fixedSource(fix.gz, ick);
+      const ds = new DecompressionStream('gzip');
+      if (inMode === 'jspipe') {
+        source.pipeTo(ds.writable).catch(() => {});
+      } else {
+        const rdr = source.getReader();
+        const w = ds.writable.getWriter();
+        (async () => {
+          for (;;) { const { value, done } = await rdr.read(); if (done) break; if (value?.byteLength) await w.write(value); }
+          await w.close();
+        })().catch(() => {});
+      }
+      let produced = 0;
+      const maxBytes = 16 << 20; // finite but not tripped by 4 MB; prices the counting only
+      let out;
+      if (outMode === 'native') {
+        out = ds.readable;
+      } else if (outMode === 'cap') {
+        out = ds.readable.pipeThrough(new TransformStream({
+          transform(chunk, c) { produced += chunk.byteLength; if (produced > maxBytes) throw new Error('cap'); c.enqueue(chunk); },
+        }));
+      } else { // byob: coarse BYOB drain that counts per read (few, large reads when input runs ahead)
+        const r = ds.readable.getReader({ mode: 'byob' });
+        out = new ReadableStream({
+          async pull(c) {
+            const { value, done } = await r.read(new Uint8Array(view));
+            if (done) { c.close(); return; }
+            if (value.byteLength === 0) return;
+            produced += value.byteLength;
+            if (produced > maxBytes) { c.error(new Error('cap')); return; }
+            c.enqueue(value);
+          },
+        });
+      }
+      const buf2 = await new Response(out).arrayBuffer();
+      assertBytes(buf2.byteLength, fix.text.byteLength, op);
+      return { op, mb, variant, view, ick, bytes: buf2.byteLength };
+    }
     const source = new Response(fix.gz).body;
     const srcReader = source.getReader();
     const ds = new DecompressionStream('gzip');
@@ -956,6 +1005,54 @@ async function cryptoBench(op, n, params = null) {
     const buf = await new Response(out).arrayBuffer();
     assertBytes(buf.byteLength, fix.text.byteLength, op);
     return { op, mb, bytes: buf.byteLength };
+  }
+
+  if (op === 'gz-stage-js' || op === 'gz-stage-js-text') {
+    // decodeBody fed a JS ReadableStream (fixedSource) — the FAITHFUL input, since the product's
+    // source is always a JS stream, never a native body. `cap` (bytes; 0 = Infinity) exercises the
+    // maxBytes path; `ick` is the input chunk size. This is the honest before/after for src changes.
+    const fix = await bodyFixture(mb, src);
+    const ick = Number(params?.get?.('ick') ?? 65536);
+    const capRaw = Number(params?.get?.('cap') ?? 0);
+    const maxBytes = capRaw > 0 ? capRaw : Infinity;
+    const out = decodeBody(fixedSource(fix.gz, ick), 'gzip', null, maxBytes);
+    if (op === 'gz-stage-js-text') {
+      const s = await new Response(out).text();
+      assertBytes(s.length, fix.text.byteLength, op);
+      return { op, mb, ick, cap: capRaw, bytes: s.length };
+    }
+    const buf = await new Response(out).arrayBuffer();
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, ick, cap: capRaw, bytes: buf.byteLength };
+  }
+
+  if (op === 'gz-trunc-safety') {
+    // Does the runtime's DecompressionStream FAIL CLOSED on a truncated/corrupt gzip when drained
+    // natively (pipeThrough + Response), or silently yield a partial body? This is the safety
+    // precondition for any "native-collect" decode path: if it fails open here, native collection
+    // would deliver a truncated body as if complete — unacceptable — and the JS BYOB drain that
+    // wraps errors must stay. Node fails closed (throws); this checks workerd, which need not agree.
+    const fix = await bodyFixture(1, src);
+    const enc2 = new TextEncoder();
+    const cases = {
+      truncated: fix.gz.subarray(0, fix.gz.byteLength - 8), // drop CRC32+ISIZE trailer
+      garbage: enc2.encode('this is definitely not gzip at all'),
+      full: fix.gz,
+    };
+    const out = {};
+    for (const [name, wire] of Object.entries(cases)) {
+      try {
+        const got = (await new Response(
+          new Response(wire.slice()).body.pipeThrough(new DecompressionStream('gzip')),
+        ).arrayBuffer()).byteLength;
+        out[name] = { errored: false, bytes: got,
+          complete: name === 'full' ? got === fix.text.byteLength : null,
+          verdict: name === 'full' ? 'ok' : 'FAILS OPEN (yielded a partial body silently)' };
+      } catch (e) {
+        out[name] = { errored: true, error: e?.constructor?.name ?? String(e), verdict: 'fails closed' };
+      }
+    }
+    return { op, cases: out };
   }
 
   if (op === 'codecs') {
@@ -1224,6 +1321,13 @@ export default {
         mb: url.searchParams.get('mb') ?? null,
         ck: url.searchParams.get('ck') ?? null,
         src: url.searchParams.get('src') ?? 'real',
+        // variant/view/alg change the answer for gz-stagex, aead-*, sigverify — they MUST reach
+        // the mark or two variants land in one cpuTime bucket (the omission the brief names).
+        variant: url.searchParams.get('variant') ?? null,
+        view: url.searchParams.get('view') ?? null,
+        alg: url.searchParams.get('alg') ?? null,
+        ick: url.searchParams.get('ick') ?? null,
+        cap: url.searchParams.get('cap') ?? null,
       });
       return Response.json(await cryptoBench(op, n, url.searchParams));
     }
@@ -1238,7 +1342,13 @@ export default {
     // The sweep's size must be in the mark: cpuTime comes from the tail event, and without it
     // every body size lands in one undifferentiated bucket.
     markPath('run', { sizes: url.searchParams.get('sizes') ?? null,
-                      reuse: url.searchParams.get('reuse') ?? null });
+                      reuse: url.searchParams.get('reuse') ?? null,
+                      // dc/ae/h1/sockshape all change the end-to-end cpuTime; they MUST reach the
+                      // mark or a decode-on and decode-off run land in one bucket.
+                      dc: url.searchParams.get('dc') ?? null,
+                      ae: url.searchParams.get('ae') ?? null,
+                      h1: url.searchParams.get('h1') ?? null,
+                      sockshape: url.searchParams.get('sockshape') ?? null });
     const targets = (url.searchParams.get('targets') || '').split(',').filter(Boolean);
     const results = [];
 
