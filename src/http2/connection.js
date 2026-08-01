@@ -156,14 +156,34 @@ export class Http2Retryable extends Http2Error {}
  */
 
 /**
- * The declared content-length, or null when absent. A list with conflicting values is refused by
- * the header layer before this is reached; a malformed single value is treated as absent rather
- * than as zero, because guessing a length is the failure mode being closed here.
+ * The declared content-length, or null when absent.
+ *
+ * @returns {number | null | 'malformed'} `'malformed'` when the field cannot be trusted to mean
+ *   one length, which the caller must refuse rather than treat as absent.
+ *
+ * The docblock here used to assert that "a list with conflicting values is refused by the header
+ * layer before this is reached". No such refusal existed anywhere, and the consequence was worse
+ * than a stale comment: `Headers.get()` joins repeated fields with ", ", so two content-length
+ * fields arrive as "10, 20", which fails the digits test and returned null — "no declared length",
+ * i.e. the length check silently switched itself OFF for exactly the response most likely to be
+ * trying something. A documented precondition that does not hold, whose violation opens the guard.
+ *
+ * Now the duplicate case is handled here instead of being assumed away. RFC 9110 s8.6 lets a
+ * recipient treat repeated identical values as the single value they agree on, and requires
+ * treating disagreement as malformed. A single unparseable value is malformed too: it used to be
+ * read as "absent", which is the same fail-open by another route.
  */
 function contentLengthOf(headers) {
   const raw = headers.get?.('content-length') ?? null;
   if (raw === null) return null;
-  return /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : null;
+  const parts = raw.split(',').map((s) => s.trim());
+  if (!parts.every((p) => /^\d+$/.test(p))) return 'malformed';
+  const distinct = new Set(parts);
+  if (distinct.size !== 1) return 'malformed';
+  const n = Number(parts[0]);
+  // Beyond 2^53 the comparison against a received byte count stops being exact, and no body this
+  // runtime can hold comes close, so an absurd declaration is refused rather than approximated.
+  return Number.isSafeInteger(n) ? n : 'malformed';
 }
 
 export class Http2Connection {
@@ -336,7 +356,7 @@ export class Http2Connection {
     const id = this._nextStreamId;
     this._nextStreamId += 2;
 
-    const stream = this._createStream(id);
+    const stream = this._createStream(id, method);
     if (signal) {
       if (signal.aborted) {
         this._resetStream(stream, H2_ERROR.CANCEL, signal.reason ?? new Http2Error(codes.HTTP2_PROTOCOL, 'aborted'));
@@ -368,9 +388,14 @@ export class Http2Connection {
     return stream.head.promise;
   }
 
-  _createStream(id) {
+  _createStream(id, method = 'GET') {
     const stream = {
       id,
+      // The request method, kept because RFC 9110 s8.6 makes content-length mean something
+      // different for a HEAD response — the length the body WOULD have had — so the arrived-length
+      // check must not run against it. Same for the bodiless 204 and 304, tracked via `status`.
+      method,
+      status: 0,
       // response head
       head: deferred(),
       responseReceived: false,
@@ -775,6 +800,43 @@ export class Http2Connection {
    * stream — which RFC 9113 s4.3 makes a connection error in its own right.
    * @returns {boolean} true when assembly may continue
    */
+  /**
+   * The ONE place the receive half of a stream ends. Checks the arrived length against the declared
+   * one, resets the stream when they disagree, and only then marks the half ended.
+   *
+   * Centralised because the previous shape is what let three bypasses through: the check lived
+   * inline in the DATA/END_STREAM handler, and the two other routes to the same end state — a
+   * response whose HEADERS carried END_STREAM, and a body terminated by trailing HEADERS — simply
+   * did not have it. Either one turned `content-length: 1000` plus ten delivered bytes into a
+   * complete 200, which is precisely the "short body ending cleanly reached the caller as a
+   * complete response" failure the check was added to close. A fourth route added later would have
+   * missed it too. Now there is one door.
+   *
+   * RFC 9110 s8.6 exemptions: for a HEAD response content-length describes the body the request
+   * would have produced, and 204/304 carry no body at all, so no arrived length can be compared.
+   *
+   * @returns {boolean} true when the half ended cleanly; false when the stream was reset
+   */
+  _endRecv(stream) {
+    const exempt =
+      stream.method === 'HEAD' || stream.status === 204 || stream.status === 304;
+    if (!exempt && stream.declaredLength !== null && stream.receivedLength !== stream.declaredLength) {
+      this._resetStream(
+        stream,
+        H2_ERROR.PROTOCOL_ERROR,
+        new Http2Error(
+          codes.HTTP2_PROTOCOL,
+          `response body ended at ${stream.receivedLength} bytes against a declared ` +
+            `content-length of ${stream.declaredLength}`,
+          { declared: stream.declaredLength, received: stream.receivedLength },
+        ),
+      );
+      return false;
+    }
+    stream.recvEnded = true;
+    return true;
+  }
+
   _headerBlockWithinCap() {
     const { bytes, frames, streamId } = this._continuation;
     if (bytes <= this._maxHeaderBlockBytes) return true;
@@ -850,18 +912,37 @@ export class Http2Connection {
       return;
     }
     stream.responseReceived = true;
+    stream.status = head.status;
     // RFC 9113 s8.1.1: a message with a content-length that disagrees with the DATA delivered is
     // malformed. h1 enforces this through its framing; h2 declares the length in a header and
     // delimits with END_STREAM, so the two can disagree — and a body that silently differs from
     // its declared length is exactly the ambiguity this package refuses everywhere else. Held on
-    // the stream and checked as DATA arrives and again at END_STREAM.
+    // the stream and checked at every route out, in _endRecv.
     stream.declaredLength = contentLengthOf(head.headers);
+    if (stream.declaredLength === 'malformed') {
+      this._resetStream(
+        stream,
+        H2_ERROR.PROTOCOL_ERROR,
+        new Http2Error(
+          codes.HTTP2_PROTOCOL,
+          'response carries a content-length that does not name one length: conflicting repeated ' +
+            'values, or a value that is not a plain integer. RFC 9110 s8.6 makes that malformed, ' +
+            'and reading it as "no declared length" would turn the length check off for exactly ' +
+            'the response most likely to be probing for that.',
+          { contentLength: head.headers.get?.('content-length') ?? null },
+        ),
+      );
+      return;
+    }
     stream.receivedLength = 0;
     if (endStream) {
+      // END_STREAM here declares a zero-length body, so a non-zero content-length is malformed and
+      // _endRecv resets the stream. This route used to skip the check entirely, which turned
+      // "content-length: 500" plus END_STREAM into an empty body delivered as a complete 200.
+      if (!this._endRecv(stream)) return;
       // No body and no trailers: the completion contract is satisfiable now, exactly like the h1
       // "complete at creation" case, so a caller that never reads the (empty) body still lets the
       // deadline dispose.
-      stream.recvEnded = true;
       this._settleResolve(stream.completed, true);
       this._settleResolve(stream.trailers, null);
       this._wakePull(stream);
@@ -894,7 +975,10 @@ export class Http2Connection {
       this._resetStream(stream, H2_ERROR.PROTOCOL_ERROR, err);
       return;
     }
-    stream.recvEnded = true;
+    // Trailers end the body, so the declared length must be satisfied here as well. This route
+    // used to skip the check, making a trailing HEADERS the one-frame way to deliver a truncated
+    // body as a complete response.
+    if (!this._endRecv(stream)) return;
     this._wakePull(stream);
     this._maybeCloseStream(stream);
   }
@@ -975,20 +1059,7 @@ export class Http2Connection {
       this._wakePull(stream);
     }
     if (flags & FLAG.END_STREAM) {
-      if (stream.declaredLength !== null && stream.receivedLength !== stream.declaredLength) {
-        this._resetStream(
-          stream,
-          H2_ERROR.PROTOCOL_ERROR,
-          new Http2Error(
-            codes.HTTP2_PROTOCOL,
-            `response body ended at ${stream.receivedLength} bytes against a declared ` +
-              `content-length of ${stream.declaredLength}`,
-            { declared: stream.declaredLength, received: stream.receivedLength },
-          ),
-        );
-        return;
-      }
-      stream.recvEnded = true;
+      if (!this._endRecv(stream)) return;
       this._wakePull(stream);
       this._maybeCloseStream(stream);
     }

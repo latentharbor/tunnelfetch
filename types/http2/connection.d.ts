@@ -119,8 +119,10 @@ export class Http2Connection {
         body?: Uint8Array<ArrayBufferLike> | null | undefined;
         signal?: AbortSignal | undefined;
     }): Promise<Http2ResponseHead>;
-    _createStream(id: any): {
+    _createStream(id: any, method?: string): {
         id: any;
+        method: string;
+        status: number;
         head: {
             promise: Promise<any>;
             resolve: undefined;
@@ -191,6 +193,24 @@ export class Http2Connection {
      * stream — which RFC 9113 s4.3 makes a connection error in its own right.
      * @returns {boolean} true when assembly may continue
      */
+    /**
+     * The ONE place the receive half of a stream ends. Checks the arrived length against the declared
+     * one, resets the stream when they disagree, and only then marks the half ended.
+     *
+     * Centralised because the previous shape is what let three bypasses through: the check lived
+     * inline in the DATA/END_STREAM handler, and the two other routes to the same end state — a
+     * response whose HEADERS carried END_STREAM, and a body terminated by trailing HEADERS — simply
+     * did not have it. Either one turned `content-length: 1000` plus ten delivered bytes into a
+     * complete 200, which is precisely the "short body ending cleanly reached the caller as a
+     * complete response" failure the check was added to close. A fourth route added later would have
+     * missed it too. Now there is one door.
+     *
+     * RFC 9110 s8.6 exemptions: for a HEAD response content-length describes the body the request
+     * would have produced, and 204/304 carry no body at all, so no arrived length can be compared.
+     *
+     * @returns {boolean} true when the half ended cleanly; false when the stream was reset
+     */
+    _endRecv(stream: any): boolean;
     _headerBlockWithinCap(): boolean;
     _onContinuation(flags: any, payload: any): void;
     /** A full header block has been assembled: HPACK-decode it (connection-fatal on failure, since
