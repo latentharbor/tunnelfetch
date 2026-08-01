@@ -56,7 +56,14 @@ jobs:
       - run: npm ci
 
       - name: generate a per-run rig token
-        run: echo "PROBE_TOKEN=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+        # ::add-mask:: because a value put into $GITHUB_ENV is not a repository secret and GitHub
+        # will not redact it — the first run printed this token in cleartext in the step's env
+        # dump. It guards a Worker that lives for a few minutes, but the log outlives it, and if
+        # cleanup ever fails it guards a live one.
+        run: |
+          T=$(openssl rand -hex 16)
+          echo "::add-mask::$T"
+          echo "PROBE_TOKEN=$T" >> "$GITHUB_ENV"
 
       # deploy-probe.mjs bakes a hash of the rig's own source into the deployment, which the drift
       # test asserts against the checkout. Here it always matches — the point of deploying per run —
@@ -74,6 +81,21 @@ jobs:
             --var "PROBE_TOKEN:$PROBE_TOKEN" | tee /tmp/live.log
           grep -oP '(?<=DEPLOYED_URL=).*' /tmp/live.log | tail -1 \
             | sed 's/^/LIVE_URL=/' >> "$GITHUB_ENV"
+
+      # A deploy is not serving the instant wrangler returns. The first run of this workflow failed
+      # because a request went out 125 ms later and got a 404, while everything six seconds on
+      # passed. Poll for the deployment rather than racing it — and fail loudly if it never comes
+      # up, since a silent sleep would just move the race.
+      - name: wait for both deployments to serve
+        run: |
+          for url in "$PROBE_URL" "$LIVE_URL"; do
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$url/" || echo 000)
+              if [ "$code" = "200" ]; then echo "$url is serving after ${i}s"; break; fi
+              if [ "$i" = "30" ]; then echo "$url never served (last $code)"; exit 1; fi
+              sleep 1
+            done
+          done
 
       # Has the runtime started doing natively what this package does in JavaScript?
       - name: node compatibility has not changed under us
