@@ -106,7 +106,12 @@ const DECOMPRESS_READ_BYTES = 65536;
  * consumes many input chunks before producing output, so tying input progress to output
  * pulls would deadlock.
  */
-function decompressionStage(source, coding) {
+function decompressionStage(source, coding, maxBytes = Infinity) {
+  // Bytes this stage has produced. `maxBodyBytes` bounded only the COMPRESSED wire body, so a
+  // caller asking for at most 1 MB received 20 MB from a 20 KB gzip bomb — the cap was applied to
+  // the wrong side of the decompressor. gzip reaches roughly 1000:1, so the gap was not bounded in
+  // any useful sense. Counted here, per stage, so a chain like `br, gzip` cannot exceed it either.
+  let produced = 0;
   const srcReader = source.getReader();
   /** Rejections here surface through the output stream; pre-observed like chunked.js does. */
   let pumpDone = null;
@@ -207,6 +212,18 @@ function decompressionStage(source, coding) {
             return;
           }
           if (value.byteLength === 0) continue; // legal, carries nothing; keep reading
+          produced += value.byteLength;
+          if (produced > maxBytes) {
+            // Refused BEFORE the over-long chunk is handed on, so the caller never holds more than
+            // it asked for. Fail closed: a truncated body delivered as if complete would be worse.
+            throw new HttpError(
+              codes.LIMIT_BODY,
+              `decoded body exceeded maxBodyBytes: ${produced} bytes of "${coding}" output past a ` +
+                `${maxBytes} byte cap. The compressed body was within the cap; the decompressed ` +
+                'one is what a gzip bomb inflates.',
+              { coding, produced, maxBytes },
+            );
+          }
           c.enqueue(value);
           return;
         }
@@ -263,9 +280,11 @@ function firstBytes(chunks, i) {
  *   comma-separated list names codings in the order the SERVER applied them, so decoding
  *   applies them in reverse.
  * @param {Record<string, BodyDecoder> | null} [decoders] caller-supplied codings
+ * @param {number} [maxBytes] cap on DECODED output, per stage. `maxBodyBytes` alone bounded the
+ *   compressed body, which a gzip bomb walks straight past.
  * @returns {ReadableStream<Uint8Array>} decoded bytes
  */
-export function decodeBody(stream, contentEncoding, decoders = null) {
+export function decodeBody(stream, contentEncoding, decoders = null, maxBytes = Infinity) {
   /** Look a coding up among the caller's decoders, case-insensitively as the header is. */
   const custom = (coding) => {
     if (!decoders) return null;
@@ -311,6 +330,8 @@ export function decodeBody(stream, contentEncoding, decoders = null) {
     // point can be reached with the other's assumption.
     const fn = BUILT_IN.has(coding) ? null : custom(coding);
     if (fn) {
+      // A caller-supplied decoder is not wrapped by the cap: it is their code producing their
+      // bytes, and silently truncating its output would be worse than leaving the bound to them.
       const staged = fn(out);
       // A decoder that returns something unreadable would surface far downstream as a confusing
       // stream error; name it here, where the caller can see which coding misbehaved.
@@ -324,7 +345,7 @@ export function decodeBody(stream, contentEncoding, decoders = null) {
       out = staged;
       continue;
     }
-    out = decompressionStage(out, coding === 'x-gzip' ? 'gzip' : coding);
+    out = decompressionStage(out, coding === 'x-gzip' ? 'gzip' : coding, maxBytes);
   }
   return out;
 }

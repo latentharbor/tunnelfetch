@@ -72,7 +72,9 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  * @property {import('./client/cookies.js').CookieJar} [jar] supply a jar directly, e.g. to share
  *   one across Clients or to persist it.
  * @property {number} [maxRedirects] default 20.
- * @property {number} [maxBodyBytes] enforced from Content-Length before a byte is read.
+ * @property {number} [maxBodyBytes] the most body this client will produce. Checked against
+ *   Content-Length before a byte is read, enforced on the raw stream, and enforced again on the
+ *   DECODED output — a compressed body within the cap can decompress far past it.
  * @property {boolean} [decompress] gzip/deflate. Default true.
  * @property {Record<string, import('./client/decode.js').BodyDecoder>} [decoders] extra
  *   content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
@@ -825,7 +827,7 @@ function decodeResponseBody(body, headers, options) {
   if (options.decompress === false) return body;
   const encoding = headers.get('content-encoding');
   if (!encoding) return body;
-  return decodeBody(body, encoding, options.decoders ?? null);
+  return decodeBody(body, encoding, options.decoders ?? null, options.maxBodyBytes ?? Infinity);
 }
 
 function buildResponse(headInfo, body, framing, conn) {

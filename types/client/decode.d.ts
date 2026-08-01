@@ -23,9 +23,11 @@ export function acceptEncodingFor(decoders: Record<string, BodyDecoder> | null |
  *   comma-separated list names codings in the order the SERVER applied them, so decoding
  *   applies them in reverse.
  * @param {Record<string, BodyDecoder> | null} [decoders] caller-supplied codings
+ * @param {number} [maxBytes] cap on DECODED output, per stage. `maxBodyBytes` alone bounded the
+ *   compressed body, which a gzip bomb walks straight past.
  * @returns {ReadableStream<Uint8Array>} decoded bytes
  */
-export function decodeBody(stream: ReadableStream<Uint8Array>, contentEncoding: string | null | undefined, decoders?: Record<string, BodyDecoder> | null): ReadableStream<Uint8Array>;
+export function decodeBody(stream: ReadableStream<Uint8Array>, contentEncoding: string | null | undefined, decoders?: Record<string, BodyDecoder> | null, maxBytes?: number): ReadableStream<Uint8Array>;
 /**
  * Extract the charset parameter from a Content-Type value, handling quoting and other
  * parameters: `text/html; boundary=x; charset="ISO-8859-4"` -> 'iso-8859-4'.
