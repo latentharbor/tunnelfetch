@@ -82,18 +82,26 @@ jobs:
           grep -oP '(?<=DEPLOYED_URL=).*' /tmp/live.log | tail -1 \
             | sed 's/^/LIVE_URL=/' >> "$GITHUB_ENV"
 
-      # A deploy is not serving the instant wrangler returns. The first run of this workflow failed
-      # because a request went out 125 ms later and got a 404, while everything six seconds on
-      # passed. Poll for the deployment rather than racing it — and fail loudly if it never comes
-      # up, since a silent sleep would just move the race.
-      - name: wait for both deployments to serve
+      # A deploy is not serving the instant wrangler returns, and it does not become available
+      # everywhere at once: workers.dev propagates across the edge node by node. The first run
+      # failed on a request sent 125 ms after deploying; the second failed differently and more
+      # instructively — alternating passes and 404s, every 404 answered in under 20 ms because
+      # there was no Worker at that node to run, every success taking hundreds. Waiting for ONE
+      # 200 only proves the node that happened to answer has it.
+      #
+      # So require a run of consecutive successes, which is weak evidence per probe but strong
+      # evidence in a row, and fail loudly rather than sleeping a guessed interval.
+      - name: wait for both deployments to serve everywhere
         run: |
+          need=5
           for url in "$PROBE_URL" "$LIVE_URL"; do
-            for i in $(seq 1 30); do
+            ok=0
+            for i in $(seq 1 60); do
               code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$url/" || echo 000)
-              if [ "$code" = "200" ]; then echo "$url is serving after ${i}s"; break; fi
-              if [ "$i" = "30" ]; then echo "$url never served (last $code)"; exit 1; fi
-              sleep 1
+              if [ "$code" = "200" ]; then ok=$((ok+1)); else ok=0; fi
+              if [ "$ok" -ge "$need" ]; then echo "$url served $need consecutive probes after ${i}s"; break; fi
+              if [ "$i" = "60" ]; then echo "$url never settled (last $code, streak $ok)"; exit 1; fi
+              sleep 2
             done
           done
 
