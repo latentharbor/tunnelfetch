@@ -14,7 +14,7 @@ Zero dependencies. ESM. No build step. No `node:` imports anywhere in `src/`.
 
 > **Maturity.** This is a new implementation, not a battle-tested one. It implements TLS 1.2/1.3 and
 > certificate validation in userland — a category where good tests are necessary and not sufficient.
-> It has 1132 hermetic tests, RFC vectors, byte-by-byte fragmentation, live edge interop, seeded
+> It has over 1100 hermetic tests, RFC vectors, byte-by-byte fragmentation, live edge interop, seeded
 > fuzzing of every peer-facing parser, and 95% line coverage. It has **not** had an external
 > security audit. Treat it as a high-quality implementation worth trying, not as something proven
 > in production. Please report anything you find — see [SECURITY.md](SECURITY.md).
@@ -343,7 +343,8 @@ res.tunnelfetch.httpVersion; // '2' if the server chose h2, '1.1' otherwise
 | `cookies` | `false` | Enable a per-Client cookie jar. |
 | `maxRedirects` | `20` | |
 | `maxBodyBytes` | `Infinity` | Enforced from `Content-Length` before a byte is read. |
-| `decompress` | `true` | gzip/deflate. Never `br` — see limits. |
+| `decompress` | `true` | Decode `Content-Encoding` at all. gzip and deflate are built in. |
+| `decoders` | `{}` | Extra codings, e.g. `{ br: fn }`. Each is added to `Accept-Encoding`. See [`br`, `zstd`](#br-zstd-and-other-codings). |
 | `keepAlive` | `true` | |
 | `http2` | `true` | Offer `h2` in ALPN and speak it if the server selects it. See [HTTP/2](#http2--access-not-speed). |
 | `forceTunnel` | `false` | Never delegate to the platform's `fetch`. |
@@ -675,11 +676,11 @@ WHATWG Streams including BYOB readers, `TextEncoder`/`TextDecoder`, `Decompressi
 
 | Runtime | Offline suite | Notes |
 |---|---|---|
-| Node 22, 24 | **1132 / 1132** | what CI gates on |
+| Node 22, 24 | **all pass** | what CI gates on |
 | Node 20 | not supported | `TextDecoder` treats `iso-8859-1` as true ISO-8859-1 instead of aliasing it to windows-1252 as WHATWG requires, so bodies in that charset decode differently. Left maintenance April 2026 |
 | workerd | live edge suite passes | the target runtime; exercised end to end by the scheduled edge job rather than by the offline suite |
-| Deno 2.9 | 999 / 1001 | both failures are in the TLS 1.2 test server's secp521r1 path, not in the package; WebCrypto ECDSA and ECDH on P-521 both work standalone under Deno. Unresolved, so support is not claimed |
-| Bun 1.3 | 1079 / 1082 | a module-resolution difference in one repo-hygiene test, one timing-sensitive deadline test, and the same TLS 1.2 suite test. Unresolved, so support is not claimed |
+| Deno 2.9 | 2 failures | both failures are in the TLS 1.2 test server's secp521r1 path, not in the package; WebCrypto ECDSA and ECDH on P-521 both work standalone under Deno. Unresolved, so support is not claimed |
+| Bun 1.3 | 3 failures | a module-resolution difference in one repo-hygiene test, one timing-sensitive deadline test, and the same TLS 1.2 suite test. Unresolved, so support is not claimed |
 
 Node 22 and workerd are the supported pair. Deno and Bun very nearly work and are not tested in CI
 — running the suite there is a good first contribution.
@@ -710,8 +711,9 @@ against independently written test servers — the 1.2 server is built on `node:
 on this package's own primitives, so a client bug cannot be cancelled out by the same bug on the
 server side.
 
-Every parser that consumes bytes a peer controls — X.509, OCSP, HTTP/1.1 heads, chunked bodies,
-HTTP/2 frames, HPACK — is fuzzed against one property: **any input either parses or throws a
+Every parser that consumes bytes a peer controls — the TLS record layer and handshake messages,
+X.509, OCSP, HTTP/1.1 heads, chunked bodies, HTTP/2 frames, HPACK — is fuzzed against one
+property: **any input either parses or throws a
 `TunnelFetchError`.** An untyped throw, a `TypeError` from a missing null check or a `RangeError`
 from a bad offset, is a finding: it means a check is missing and every caller relying on the typed
 contract to fail closed will not catch it.

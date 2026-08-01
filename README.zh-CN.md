@@ -11,7 +11,7 @@
 
 零依赖。ESM。无构建步骤。`src/` 中没有任何 `node:` 导入。
 
-> **成熟度。** 这是一个新实现，不是久经沙场的实现。它在用户态实现了 TLS 1.2/1.3 与证书校验——在这个领域，好的测试是必要条件，但不是充分条件。它有 1132 个离线测试、RFC 向量、逐字节分片、真实边缘互操作测试、对每一个面向对端的解析器做种子化 fuzzing，行覆盖率 95%；但它**没有**经过外部安全审计。请把它当作一个值得一试的高质量实现，而不是一个已被生产验证的东西。发现任何问题都欢迎报告——见 [SECURITY.md](SECURITY.md)。
+> **成熟度。** 这是一个新实现，不是久经沙场的实现。它在用户态实现了 TLS 1.2/1.3 与证书校验——在这个领域，好的测试是必要条件，但不是充分条件。它有一千一百多个离线测试、RFC 向量、逐字节分片、真实边缘互操作测试、对每一个面向对端的解析器做种子化 fuzzing，行覆盖率 95%；但它**没有**经过外部安全审计。请把它当作一个值得一试的高质量实现，而不是一个已被生产验证的东西。发现任何问题都欢迎报告——见 [SECURITY.md](SECURITY.md)。
 
 ```js
 import { Client } from 'tunnelfetch';
@@ -278,7 +278,8 @@ res.tunnelfetch.httpVersion; // 服务器选了 h2 就是 '2'，否则是 '1.1'
 | `cookies` | `false` | 启用该 Client 专属的 cookie jar。 |
 | `maxRedirects` | `20` | |
 | `maxBodyBytes` | `Infinity` | 在读入任何字节之前就按 `Content-Length` 强制执行。 |
-| `decompress` | `true` | gzip/deflate。永远不含 `br`——见限制一节。 |
+| `decompress` | `true` | 是否解码 `Content-Encoding`。gzip 与 deflate 内置。 |
+| `decoders` | `{}` | 额外的编码，如 `{ br: fn }`；每一个都会被加进 `Accept-Encoding`。见 [`br`、`zstd`](#brzstd-与其它编码)。 |
 | `keepAlive` | `true` | |
 | `http2` | `true` | 在 ALPN 中报出 `h2`，服务器选中即使用。见 [HTTP/2](#http2--要的是访问不是速度)。 |
 | `forceTunnel` | `false` | 永不委托给平台的 `fetch`。 |
@@ -501,11 +502,11 @@ WebCrypto (X25519、ECDH P-256/384/521、ECDSA、RSA-PSS、RSASSA-PKCS1、HKDF�
 
 | 运行时 | 离线测试 | 说明 |
 |---|---|---|
-| Node 22、24 | **1132 / 1132** | CI 把关的组合 |
+| Node 22、24 | **全部通过** | CI 把关的组合 |
 | Node 20 | 不支持 | `TextDecoder` 把 `iso-8859-1` 当作真正的 ISO-8859-1，而没有按 WHATWG 要求别名到 windows-1252，该字符集的响应体解码结果不同。已于 2026 年 4 月结束维护 |
 | workerd | live 边缘测试全过 | 目标运行时；由定时边缘任务端到端验证，不在离线套件里 |
-| Deno 2.9 | 999 / 1001 | 两个失败都落在 TLS 1.2 测试服务器的 secp521r1 路径上，不在包内；Deno 的 WebCrypto ECDSA 与 ECDH 在 P-521 上单独测试都正常。原因未定位，因此不宣称支持 |
-| Bun 1.3 | 1079 / 1082 | 一个 repo-hygiene 测试的模块解析差异、一个对时序敏感的 deadline 测试，以及同一个 TLS 1.2 套件测试。原因未定位，因此不宣称支持 |
+| Deno 2.9 | 2 个失败 | 两个失败都落在 TLS 1.2 测试服务器的 secp521r1 路径上，不在包内；Deno 的 WebCrypto ECDSA 与 ECDH 在 P-521 上单独测试都正常。原因未定位，因此不宣称支持 |
+| Bun 1.3 | 3 个失败 | 一个 repo-hygiene 测试的模块解析差异、一个对时序敏感的 deadline 测试，以及同一个 TLS 1.2 套件测试。原因未定位，因此不宣称支持 |
 
 受支持的组合是 Node 22 与 workerd。Deno 和 Bun 已经非常接近可用，但没有进 CI——把这套测试在那两个运行时上跑通，是一个很好的首次贡献。
 
@@ -524,7 +525,7 @@ npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 
 TLS 密钥调度与记录层逐字节钉死在 **RFC 8448** "Example Handshake Traces for TLS 1.3" 上：AEAD 复现出 RFC 里一模一样的密文记录，记录层把 RFC 的完整线上字节在两个方向上原样重放。两个 TLS 驱动都对着独立编写的测试服务器测试——1.2 的服务器建在 `node:crypto` 上，而不是本包自己的原语上，这样客户端的 bug 就不可能被服务器端的同一个 bug 抵消掉。
 
-每一个消费对端字节的解析器——X.509、OCSP、HTTP/1.1 响应头、分块体、HTTP/2 帧、HPACK——都会被 fuzz，断言的属性只有一条：**任意输入，要么解析成功，要么抛出 `TunnelFetchError`。** 抛出未类型化的错误（少了空值检查的 `TypeError`、越界的 `RangeError`）就是一个发现：它意味着某处检查缺失，而所有依赖类型化契约来 fail closed 的调用方都接不住它。
+每一个消费对端字节的解析器——TLS 记录层与握手消息、X.509、OCSP、HTTP/1.1 响应头、分块体、HTTP/2 帧、HPACK——都会被 fuzz，断言的属性只有一条：**任意输入，要么解析成功，要么抛出 `TunnelFetchError`。** 抛出未类型化的错误（少了空值检查的 `TypeError`、越界的 `RangeError`）就是一个发现：它意味着某处检查缺失，而所有依赖类型化契约来 fail closed 的调用方都接不住它。
 
 fuzzer 自带种子、零依赖，失败时会打印种子、迭代序号和 base64 的输入——可以精确复现，而无法复现失败的 fuzzer 算不上 fuzzer。目标从 `test/fuzz/targets/` 自动发现，新增一个就是放一个文件进去。这套测试还会 fuzz **它自己**：两个合成目标分别证明引擎能报出未类型化的抛出、且不会误报类型化的抛出——否则一次全绿的 fuzz 只能证明 fuzzer 从来没睁眼。
 

@@ -483,15 +483,63 @@ function registerHttp2(client, key, conn) {
  */
 function snapshotOptions(options) {
   const o = { ...options };
-  if (o.trust && typeof o.trust === 'object') {
-    const t = { ...o.trust };
-    if (Array.isArray(t.pins)) t.pins = Object.freeze([...t.pins]);
-    if (Array.isArray(t.anchors)) t.anchors = Object.freeze([...t.anchors]);
-    o.trust = Object.freeze(t);
-  }
-  if (o.tls && typeof o.tls === 'object') o.tls = Object.freeze({ ...o.tls });
+  if (o.trust && typeof o.trust === 'object') o.trust = deepCopyConfig(o.trust);
+  if (o.tls && typeof o.tls === 'object') o.tls = deepCopyConfig(o.tls);
   if (o.timeouts && typeof o.timeouts === 'object') o.timeouts = Object.freeze({ ...o.timeouts });
   return Object.freeze(o);
+}
+
+/**
+ * Recursively copy and freeze a configuration value so nothing the caller still holds can change
+ * what this Client trusts.
+ *
+ * A shallow freeze is not enough, and the gap was found in review: `Object.freeze([...anchors])`
+ * gives a frozen ARRAY whose elements are still the caller's `Uint8Array`s, and freezing a typed
+ * array does not freeze its bytes. Writing into the DER of a trust anchor after the first request
+ * therefore changed the certificate material this Client validated against — while the pool key
+ * stayed put, because `anchorDigest` memoises per array object. The same shape applies to `tls`,
+ * where `groups`, `ciphers` and `clientRandom` are all caller-owned mutable buffers.
+ *
+ * Only plain objects, arrays and byte arrays are copied. Everything else is passed through by
+ * REFERENCE, deliberately: `trust.verify` is a function whose identity is what distinguishes one
+ * custom policy from another in the pool key (see `customCounter`), and an AbortSignal or a
+ * CookieJar is a live object, not data. Copying either would break them.
+ *
+ * @template T
+ * @param {T} value
+ * @param {number} [depth]
+ * @returns {T}
+ */
+function deepCopyConfig(value, depth = 0) {
+  // Certificate material is not deeply nested; a bound turns a pathological input into an error
+  // rather than a stack overflow, and nothing legitimate comes close to it.
+  if (depth > 8) {
+    throw new ConfigError(
+      codes.CONFIG_INVALID,
+      'trust or tls configuration nests more than 8 levels deep; refusing to copy it',
+    );
+  }
+  if (ArrayBuffer.isView(value)) {
+    // Not frozen: V8 refuses to freeze a typed array that has elements. Immutability here comes
+    // from the copy being PRIVATE — the caller has no reference to it — rather than from
+    // Object.freeze. Copying the underlying buffer slice rather than the view also detaches it
+    // from any sibling view over the same memory.
+    const Ctor = /** @type {any} */ (value.constructor);
+    return new Ctor(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((v) => deepCopyConfig(v, depth + 1)));
+  }
+  if (value && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    // Only plain objects. A class instance is a live thing with behaviour, and rebuilding it from
+    // its own enumerable properties would produce something that merely looks like it.
+    if (proto !== Object.prototype && proto !== null) return value;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = deepCopyConfig(v, depth + 1);
+    return Object.freeze(out);
+  }
+  return value;
 }
 
 /**

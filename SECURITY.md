@@ -53,7 +53,7 @@ The properties worth attacking:
 
 ## Fuzzing
 
-Every peer-facing parser is fuzzed against the property above — any input either parses or throws a
+Every peer-facing parser — the TLS record layer and handshake messages, X.509, OCSP, HTTP/1.1 heads, chunked bodies, HTTP/2 frames, HPACK — is fuzzed against the property above — any input either parses or throws a
 `TunnelFetchError`. To search a corner nobody has:
 
 ```bash

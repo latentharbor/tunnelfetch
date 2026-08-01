@@ -15,6 +15,7 @@ import {
   response,
   sequenceServer,
 } from './_fakenet.js';
+import { CookieJar } from '../src/client/cookies.js';
 import { latin1, utf8 } from '../src/util/bytes.js';
 import { rejectsWithCode } from './_harness.js';
 
@@ -572,4 +573,57 @@ test('without a decoder a br body is refused rather than handed back as garbage'
     (e) => e.code === 'HTTP_CONTENT_ENCODING',
   );
   await client.close();
+});
+
+test('a Client copies the BYTES of its trust anchors, not just the array holding them', async () => {
+  // Found in review, and the gap in an earlier fix: freezing `[...anchors]` gives a frozen array
+  // whose elements are still the caller's Uint8Arrays, and freezing a typed array does not freeze
+  // its bytes. Writing into an anchor's DER after construction therefore changed the certificate
+  // material the Client validated against — while the pool key stayed put, because anchorDigest
+  // memoises per array object and never saw a new one.
+  const { poolKey } = await import('../src/pool.js');
+  const der = Uint8Array.from([0x30, 0x82, 0x01, 0x00, 0xaa, 0xbb, 0xcc]);
+  const client = new Client({ trust: { mode: 'anchors', anchors: [der] } });
+
+  const keyOf = () =>
+    poolKey({
+      scheme: 'https:', hostname: 'a.example', port: 443,
+      proxy: null, tls: null, trust: client.options.trust,
+    });
+  const before = keyOf();
+  const seen = Array.from(client.options.trust.anchors[0]);
+
+  der[4] = 0x00;
+  der[5] = 0x11;
+  der[6] = 0x22;
+
+  assert.deepEqual(
+    Array.from(client.options.trust.anchors[0]),
+    seen,
+    'mutating the caller\'s DER changed what this Client trusts',
+  );
+  assert.equal(keyOf(), before, 'the pool key moved when nothing the Client owns had changed');
+});
+
+test('the config copy leaves live objects and function identity alone', () => {
+  // The copy must not be indiscriminate. `trust.verify` is what distinguishes one custom policy
+  // from another in the pool key, via a WeakMap on the function itself — a copy would make every
+  // Client look like a different policy. A CookieJar and an AbortSignal are behaviour, not data.
+  const verify = async () => {};
+  const jar = new CookieJar();
+  const ac = new AbortController();
+  const client = new Client({ trust: { mode: 'custom', verify }, cookies: true, jar, signal: ac.signal });
+  assert.equal(client.options.trust.verify, verify);
+  assert.equal(client.jar, jar);
+  assert.equal(client.options.signal, ac.signal);
+});
+
+test('mutable tls options are copied too, not only trust', () => {
+  const groups = [0x001d, 0x0017];
+  const clientRandom = Uint8Array.from({ length: 32 }, (_, i) => i);
+  const client = new Client({ tls: { groups, clientRandom } });
+  groups.push(0x0018);
+  clientRandom[0] = 0xff;
+  assert.deepEqual(client.options.tls.groups, [0x001d, 0x0017]);
+  assert.equal(client.options.tls.clientRandom[0], 0);
 });
