@@ -40,7 +40,10 @@ test('a plain GET goes out well formed and comes back parsed', async () => {
   assert.equal(req.headers.get('host'), 'origin.example', 'default port is omitted from Host');
   assert.equal(req.order[0], 'host', 'Host must be the first header field');
   assert.equal(req.headers.get('accept-encoding'), 'gzip, deflate');
-  assert.ok(!/\bbr\b|zstd/.test(req.headers.get('accept-encoding')), 'never advertise a coding we cannot decode');
+  assert.ok(
+    !/\bbr\b|zstd/.test(req.headers.get('accept-encoding')),
+    'never advertise a coding we cannot decode',
+  );
   assert.deepEqual(net.calls[0].addr, { hostname: 'origin.example', port: 80 });
   await client.close();
 });
@@ -510,5 +513,63 @@ test('a header carrying a high octet is decoded as latin-1, not mangled as UTF-8
   assert.equal(await res.text(), 'ok');
   assert.equal(res.headers.get('x-note'), `caf${latin1(new Uint8Array([0xe9]))}`);
   assert.ok(!res.headers.get('x-note').includes('�'), 'the octet must not become a replacement char');
+  await client.close();
+});
+
+test('a Client keeps its own copy of the trust policy, so later mutation cannot cross the pool', () => {
+  // `{ ...options }` was a shallow copy, so `client.options.trust` stayed the caller's object: a
+  // caller could flip revocation or swap pins after construction and the next request would run
+  // under the new policy over connections verified under the old one. The pool key covers every
+  // field the verifier reads, but a key computed from a mutable object is only as stable as it is.
+  const pins = ['sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='];
+  const trust = { mode: 'pinned', pins };
+  const client = new Client({ trust });
+
+  trust.revocation = 'require-staple';
+  trust.mode = 'none';
+  pins.push('sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=');
+
+  assert.equal(client.options.trust.mode, 'pinned');
+  assert.equal(client.options.trust.revocation, undefined);
+  assert.equal(client.options.trust.pins.length, 1);
+  assert.equal(Object.isFrozen(client.options), true);
+});
+
+test('a registered decoder reaches both the advertisement and the body, end to end', async () => {
+  // Proves the wiring, not just the unit: `decoders` must reach the Accept-Encoding the request
+  // layer writes AND the decode stage the response body passes through. Those are two separate
+  // call sites and a change to one without the other silently breaks the invariant that we only
+  // ask for codings we can read.
+  //
+  // The stand-in "brotli" is a byte-reversal, so a body that came back right cannot have skipped
+  // the decoder or run it twice.
+  const reverse = (stream) =>
+    stream.pipeThrough(
+      new TransformStream({
+        transform(chunk, c) {
+          c.enqueue(chunk.slice().reverse());
+        },
+      }),
+    );
+  const server = sequenceServer([
+    response({ body: 'olleh', headers: { 'content-encoding': 'br' } }),
+  ]);
+  const { client } = clientFor(server.handler, { decoders: { br: reverse } });
+
+  const res = await client.fetch('http://origin.example/');
+  assert.equal(await res.text(), 'hello');
+  assert.equal(server.seen[0].headers.get('accept-encoding'), 'gzip, deflate, br');
+  await client.close();
+});
+
+test('without a decoder a br body is refused rather than handed back as garbage', async () => {
+  const server = sequenceServer([
+    response({ body: 'not really brotli', headers: { 'content-encoding': 'br' } }),
+  ]);
+  const { client } = clientFor(server.handler);
+  await assert.rejects(
+    () => client.fetch('http://origin.example/'),
+    (e) => e.code === 'HTTP_CONTENT_ENCODING',
+  );
   await client.close();
 });

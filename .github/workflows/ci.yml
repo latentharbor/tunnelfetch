@@ -9,12 +9,26 @@ jobs:
   offline:
     # Everything that can be proven without touching the network. Hermetic by construction:
     # in-memory duplexes and fixed vectors, no sockets, no fixtures fetched at test time.
+    #
+    # Every version in `engines` is tested, because a floor nobody runs is a guess. This was found
+    # by an external audit: CI ran only Node 24 while package.json claimed >=20, and on Node 20 two
+    # tests failed and `npm test` did not run at all — its glob needs the test runner's own glob
+    # support, which landed in Node 21. Node 20 also decodes `iso-8859-1` as true ISO-8859-1 rather
+    # than aliasing it to windows-1252 the way WHATWG requires, so response bodies in that charset
+    # differ there. Node 20 left maintenance in April 2026; the floor moved rather than the code.
+    #
+    # test/repo-hygiene.test.js asserts this matrix and `engines` agree, so raising one without the
+    # other fails rather than drifting.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
       - run: npm ci
       # The checked-in declarations must match the JSDoc they were generated from, or consumers
       # get types describing code that no longer exists. test/types.test.js asserts this too; doing
@@ -23,3 +37,23 @@ jobs:
       - run: git diff --exit-code types/
         name: generated declarations are current
       - run: npm test
+
+  fuzz:
+    # A deterministic soak on every commit. The parsers here consume bytes chosen by a peer, and
+    # the property under test is the one the whole design rests on: any input either parses or
+    # throws a TunnelFetchError. An untyped throw means a bounds check is missing and callers
+    # relying on the typed contract to fail closed will not catch it.
+    #
+    # Fixed seed, so this is a gate and not a lottery — a red build here is reproducible from the
+    # seed and the base64 case in the failure message. The rotating-seed exploration that actually
+    # searches new ground runs on a schedule, in capability-drift.yml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: node --test test/fuzz/fuzz.test.js
+        env:
+          FUZZ_ITERATIONS: 50000

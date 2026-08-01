@@ -12,6 +12,13 @@ runtimes that expose only raw TCP — principally Cloudflare Workers (`workerd`)
 
 Zero dependencies. ESM. No build step. No `node:` imports anywhere in `src/`.
 
+> **Maturity.** This is a new implementation, not a battle-tested one. It implements TLS 1.2/1.3 and
+> certificate validation in userland — a category where good tests are necessary and not sufficient.
+> It has 1132 hermetic tests, RFC vectors, byte-by-byte fragmentation, live edge interop, seeded
+> fuzzing of every peer-facing parser, and 95% line coverage. It has **not** had an external
+> security audit. Treat it as a high-quality implementation worth trying, not as something proven
+> in production. Please report anything you find — see [SECURITY.md](SECURITY.md).
+
 ```js
 import { Client } from 'tunnelfetch';
 import { connect } from 'cloudflare:sockets';
@@ -208,6 +215,69 @@ duration — raise it above your feed's heartbeat interval, or a quiet-but-alive
 Abandoning a stream part-way never returns the connection to the pool: its position is unknown,
 and reusing it would splice the remains of one response onto the next request.
 
+### `br`, `zstd`, and other codings
+
+`gzip` and `deflate` are built in because the runtime decompresses them natively. Anything else is
+pluggable: give `decoders` a function per coding and it is appended to `Accept-Encoding` and applied
+to matching responses. Registering is what makes advertising honest — asking for a coding you cannot
+read turns every such response into garbage, so the two move together and cannot drift.
+
+```js
+import { Client } from 'tunnelfetch';
+import { connect } from 'cloudflare:sockets';
+import { BrotliDecStream, BrotliStreamResultCode, initSync } from 'brotli-dec-wasm/web';
+import wasm from 'brotli-dec-wasm/web/bg.wasm';
+
+// Module scope, so instantiation lands in isolate startup, which this runtime does not bill.
+// Measured on the edge: it costs nothing detectable (12 ms startup with it, 12 ms without).
+initSync({ module: wasm });
+
+const brotli = (stream) => {
+  const dec = new BrotliDecStream();
+  return stream.pipeThrough(new TransformStream({
+    transform(chunk, c) {
+      let r = dec.dec(chunk, 1 << 20);
+      if (r.buf.length) c.enqueue(r.buf);
+      while (r.code === BrotliStreamResultCode.NeedsMoreOutput) {
+        r = dec.dec(new Uint8Array(0), 1 << 20);
+        if (r.buf.length) c.enqueue(r.buf);
+      }
+    },
+  }));
+};
+
+const client = new Client({ connect, proxy, decoders: { br: brotli } });
+// Now sends `Accept-Encoding: gzip, deflate, br` and decodes `Content-Encoding: br`.
+```
+
+Order is registration order after the built-ins, so `{ br, zstd }` produces exactly the
+`gzip, deflate, br, zstd` a Chrome sends — which is the actual reason to do this. This client
+presents curl's TLS and HTTP/2 fingerprints by default, and `gzip, deflate` is what curl sends, so
+the default is already consistent. It stops being consistent the moment you dress the handshake up
+as a browser and leave the header behind.
+
+It is not a saving. Measured on the edge, decoding the same 256 KB page to the same bytes:
+
+| Implementation | Algorithm | ms/MB |
+|---|---|---|
+| `DecompressionStream` — the runtime's own C++ | inflate | **2.5** |
+| WASM brotli (`brotli-dec-wasm`) | brotli | 4.7 |
+| JS inflate (`fflate` / `pako`) | inflate | 7.5 / 8.2 |
+| JS brotli (`brotli`) | brotli | 19.7 |
+
+Two things fall out, and both are worth knowing before reaching for WebAssembly anywhere else in a
+Worker. **WASM is about 4x faster than JavaScript at the same algorithm** (brotli: 4.7 against
+19.7) — so if a coding has no native path, WASM is the right way to add one. And **native is about
+3x faster than JavaScript at the same algorithm** (inflate: 2.5 against 7.5–8.2) — so where a
+native path already exists, nothing in userland improves on it. That is why `gzip` and `deflate`
+are not overridable: replacing them could only ever be slower, and doing it silently is the kind of
+quiet downgrade this package refuses everywhere else.
+
+Brotli itself lands at 1.9x native inflate. That gap is the price of the coding, and the wire bytes
+it saves do not pay it back — see [What this cannot do](#what-this-cannot-do-and-why). Decoder names
+are validated as HTTP tokens, a decoder that throws fails the body closed rather than truncating it,
+and an unregistered coding is still refused.
+
 ### HTTP/2 — access, not speed
 
 The client offers `h2` and `http/1.1` in ALPN by default and speaks whichever the server selects.
@@ -398,14 +468,29 @@ Not implemented, and not planned:
 - **A public-suffix list for cookies.** Only the "no dot in the domain" guard is implemented, so
   `Domain=com` is refused but `Domain=co.uk` is not. Documented rather than faked.
 - **IDNA.** Pass A-labels (punycode); a non-ASCII hostname is rejected with a message saying so.
-- **`br` and `zstd` content encodings.** The runtime's `DecompressionStream` accepts gzip, deflate
-  and deflate-raw only — measured, not assumed; `br` and `zstd` are rejected outright. The client
-  therefore never advertises `br`, and a well-behaved server never sends what was not asked for:
-  fetching a Brotli-serving origin returns identical content as gzip. What it costs is bandwidth,
-  and not a little — the same page measured 290 KB as gzip against 99 KB as `br`. What it would
-  cost to fix is worse on the axis that is billed. Brotli would have to come from WebAssembly, and
-  decompressing in WASM is far more CPU than the runtime's native gzip; on a platform that bills
-  CPU and not bytes, adding `br` would trade an unbilled cost for a billed one.
+- **`br` and `zstd` out of the box.** The runtime's `DecompressionStream` accepts gzip, deflate and
+  deflate-raw only — measured, not assumed. Neither is *unreachable*, though: register a decoder
+  with [`decoders`](#br-zstd-and-other-codings) and the coding is advertised and decoded. Nothing
+  ships built in, because the only way to get Brotli here is WebAssembly, and a 208 KB binary blob
+  would cost this package both its zero dependencies and its ability to be imported without a
+  bundler. Bringing your own makes that cost, and that supply chain, yours and visible.
+
+  Leaving it off is safe rather than lossy: content negotiation means a server never sends what was
+  not asked for, so a Brotli-serving origin simply returns gzip. What it costs is bandwidth — the
+  same page measured 290 KB as gzip against 99 KB as `br` — and bandwidth is not what this platform
+  bills. Measured on the edge, the trade runs the wrong way: WASM Brotli decodes at about
+  **1.9x** the CPU of the runtime's native inflate, and even on the page with the largest wire
+  saving in a 14-site survey, the 186 KB saved bought back ~1.2 ms while the extra decoding cost
+  several times that. Harder compression makes it worse, not better — brotli quality 11, which is
+  what a CDN serves from cache, is 16% smaller on the wire than quality 5 and **46% more expensive
+  to decode**, because decompression work scales with the OUTPUT bytes and a denser encoding means
+  more work per byte produced. The reason to turn `br` on is matching a browser's
+  `Accept-Encoding`, not saving CPU.
+- **Streaming request bodies.** A request body is read fully into memory before the request is
+  sent, because the framing has to be declared in a `Content-Length` this client can stand behind
+  and because a body may have to be replayed on a redirect. Fine for the JSON an SDK sends; wrong
+  for a large upload, and it means `duplex: 'half'` streaming uploads are not supported. Response
+  bodies are streamed throughout and are never buffered on your behalf.
 - **HTTP/3.** ALPN offers `h2` and `http/1.1` (see [HTTP/2](#http2--access-not-speed)); it does
   not offer `h3`, which is QUIC over UDP and unreachable from a runtime that exposes only raw TCP.
   A server selecting anything the client did not offer fails closed — there is no fallback-and-retry
@@ -585,8 +670,22 @@ sustained average rather than trusting either the documented number or the burst
 
 WebCrypto (X25519, ECDH P-256/384/521, ECDSA, RSA-PSS, RSASSA-PKCS1, HKDF, HMAC, AES-GCM),
 WHATWG Streams including BYOB readers, `TextEncoder`/`TextDecoder`, `DecompressionStream`, `URL`,
-`Headers`, `Request`, `Response`, `AbortSignal`, `btoa`. All present on workerd, Node ≥ 20, Deno
-and Bun. The only runtime-specific piece is the `connect` function you supply.
+`Headers`, `Request`, `Response`, `AbortSignal`, `btoa`. The only runtime-specific piece is the
+`connect` function you supply.
+
+| Runtime | Offline suite | Notes |
+|---|---|---|
+| Node 22, 24 | **1132 / 1132** | what CI gates on |
+| Node 20 | not supported | `TextDecoder` treats `iso-8859-1` as true ISO-8859-1 instead of aliasing it to windows-1252 as WHATWG requires, so bodies in that charset decode differently. Left maintenance April 2026 |
+| workerd | live edge suite passes | the target runtime; exercised end to end by the scheduled edge job rather than by the offline suite |
+| Deno 2.9 | 999 / 1001 | both failures are in the TLS 1.2 test server's secp521r1 path, not in the package; WebCrypto ECDSA and ECDH on P-521 both work standalone under Deno. Unresolved, so support is not claimed |
+| Bun 1.3 | 1079 / 1082 | a module-resolution difference in one repo-hygiene test, one timing-sensitive deadline test, and the same TLS 1.2 suite test. Unresolved, so support is not claimed |
+
+Node 22 and workerd are the supported pair. Deno and Bun very nearly work and are not tested in CI
+— running the suite there is a good first contribution.
+
+CI runs every version in `engines`, and a repo-hygiene test fails if the two ever disagree — an
+untested support floor is a claim, not a fact.
 
 ## Testing
 
@@ -610,6 +709,26 @@ record layer replays the RFC's full wire images in both directions. Both TLS dri
 against independently written test servers — the 1.2 server is built on `node:crypto` rather than
 on this package's own primitives, so a client bug cannot be cancelled out by the same bug on the
 server side.
+
+Every parser that consumes bytes a peer controls — X.509, OCSP, HTTP/1.1 heads, chunked bodies,
+HTTP/2 frames, HPACK — is fuzzed against one property: **any input either parses or throws a
+`TunnelFetchError`.** An untyped throw, a `TypeError` from a missing null check or a `RangeError`
+from a bad offset, is a finding: it means a check is missing and every caller relying on the typed
+contract to fail closed will not catch it.
+
+The fuzzer is seeded and dependency-free, so a failure prints the seed, the iteration and the case
+in base64 — reproducible exactly, which a fuzzer whose failures cannot be replayed is not. Targets
+are auto-discovered from `test/fuzz/targets/`; adding one is dropping a file in. The suite also
+fuzzes *itself*: two synthetic targets prove the engine reports an untyped throw and does not report
+a typed one, because a green fuzz run otherwise only proves the fuzzer never looked.
+
+```bash
+FUZZ_ITERATIONS=1000000 node --test test/fuzz/fuzz.test.js   # a soak
+FUZZ_SEED=12345 node --test test/fuzz/fuzz.test.js           # a different corner
+```
+
+CI runs a fixed seed on every commit, as a gate; the scheduled workflow runs three million
+iterations with the run id as the seed, which is the half that searches new ground.
 
 `probe/` holds a reproducible capability probe that emits machine-readable JSON, and
 `probe/results/` the measurements this design rests on. `live/` is the edge interop rig.

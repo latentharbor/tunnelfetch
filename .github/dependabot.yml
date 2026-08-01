@@ -1,0 +1,32 @@
+# There are no runtime dependencies to update — `src/` imports nothing but the platform, and a
+# repo-hygiene test fails if that ever changes. So this covers the two supply chains that do exist.
+#
+# GitHub Actions first, and it is the one that matters: a workflow here can read repository secrets
+# and, in release.yml, mint an OIDC token that publishes to npm as this package. A compromised
+# action version is a compromised release. Pinning by tag and updating deliberately beats floating.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+
+  # Dev-only: the type generator and the test runner's helpers. These never ship to a consumer —
+  # `files` in package.json publishes src/ and types/ and nothing else — but they do run in CI with
+  # access to the checkout.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The edge measurement rig. Not published and not part of the package, but it is deployed to
+  # Cloudflare by CI with an API token, so its wrangler version is worth keeping current.
+  - package-ecosystem: npm
+    directory: /live
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
