@@ -13,4 +13,6 @@ export const chrome: import("../profiles.js").FingerprintProfile & {
 };
 import { chacha20poly1305 } from './vendor/chacha20poly1305.js';
 import { mlkem768 } from './vendor/mlkem768.js';
-export { chacha20poly1305, mlkem768 };
+import { br } from './vendor/brotli-dec.js';
+import { zstd } from './vendor/zstd-dec.js';
+export { chacha20poly1305, mlkem768, br, zstd };

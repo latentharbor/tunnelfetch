@@ -112,3 +112,46 @@ test('ML-KEM-768 implicit rejection is deterministic and silent, as FIPS 203 req
   assert.deepEqual(first, second, 'implicit rejection is not deterministic');
   assert.notDeepEqual(first, sharedSecret, 'a modified ciphertext recovered the real secret');
 });
+
+// ---------------------------------------------------------------- the two codecs
+
+test('brotli and zstd decode real streams and fail closed on truncation', async () => {
+  const { br } = await import('../../../src/profile/vendor/brotli-dec.js');
+  const { zstd } = await import('../../../src/profile/vendor/zstd-dec.js');
+  const { brotliCompressSync, zstdCompressSync } = await import('node:zlib');
+
+  const text = 'the quick brown fox jumps over the lazy dog. '.repeat(4000);
+  const raw = new TextEncoder().encode(text);
+  const cases = [
+    ['br', br, new Uint8Array(brotliCompressSync(raw))],
+    ['zstd', zstd, new Uint8Array(zstdCompressSync(raw))],
+  ];
+
+  for (const [name, decode, packed] of cases) {
+    const out = await new Response(decode(new Response(packed).body)).arrayBuffer();
+    assert.equal(new TextDecoder().decode(out), text, `${name} round trip`);
+
+    // Truncation must ERROR, not return what it managed. This package treats a short body as an
+    // error everywhere else, and a decoder that quietly returns partial output would defeat that
+    // for every compressed response.
+    const cut = packed.subarray(0, Math.floor(packed.length * 0.6));
+    await assert.rejects(
+      () => new Response(decode(new Response(cut).body)).arrayBuffer(),
+      `${name} accepted a truncated stream`,
+    );
+  }
+});
+
+test('the codecs bound their own output, because decodeBody deliberately does not', async () => {
+  // `decodeBody` caps built-in codings against maxBodyBytes but leaves a caller-supplied decoder
+  // to bound itself — so a decoder without its own limit would reopen the gzip-bomb hole closed in
+  // 1.4.1, through the very option added to close it.
+  const { makeBrotliDecoder } = await import('../../../src/profile/vendor/brotli-dec.js');
+  const { brotliCompressSync } = await import('node:zlib');
+  const bomb = new Uint8Array(brotliCompressSync(new Uint8Array(8 * 1024 * 1024)));
+  const capped = makeBrotliDecoder({ maxOutputBytes: 256 * 1024 });
+  await assert.rejects(
+    () => new Response(capped(new Response(bomb).body)).arrayBuffer(),
+    'an 8 MiB decompressed body passed a 256 KiB decoder cap',
+  );
+});

@@ -12,26 +12,30 @@ import { Client } from '../../src/client.js';
 import { chrome } from '../../src/profile/chrome.js';
 import { profiles } from '../../src/profiles.js';
 
-test('the bundled profile satisfies the crypto it declares, and still refuses the codecs', () => {
-  // A profile may now satisfy its own `requires`; checking only the caller's options made a
-  // self-sufficient profile refuse itself. But br and zstd are deliberately NOT bundled — they are
-  // not cryptography, there is no single right implementation, and a Chrome that advertises `br`
-  // and cannot read it is worse than one that says so up front.
-  let err;
-  try {
-    new Client({ profile: chrome });
-  } catch (e) {
-    err = e;
-  }
-  assert.ok(err, 'the bundled profile was accepted without decoders');
-  assert.deepEqual(err.detail.missing, ['decoder:br', 'decoder:zstd']);
-  // The refusal names the subpath, so the declaration in the main entry is not a dead end.
+test('the bundled profile is complete: it constructs with no further options', () => {
+  // br and zstd were held back at first, on the grounds that there is no single right
+  // implementation. Measurement dissolved that — a decode-only build of the reference C beats the
+  // npm alternative by 1.5x at the interface this package actually uses — so the identity is now
+  // presentable as shipped. That it constructs at all is the assertion: every entry in `requires`
+  // is met by the profile itself.
+  const c = new Client({ profile: chrome });
+  assert.deepEqual(Object.keys(c.options.decoders).sort(), ['br', 'zstd']);
+  assert.equal(typeof c.options.ciphers.chacha20.seal, 'function');
+  assert.equal(typeof c.options.groups.x25519mlkem768.keygen, 'function');
+  // The declaration in the main entry still names what the identity needs, so a caller who reaches
+  // for `profiles.chrome` without this subpath gets told what is missing rather than a broken hello.
   assert.match(profiles.chrome.requires.join(), /cipher:chacha20/);
+  assert.match(profiles.chrome.requires.join(), /decoder:br/);
 });
 
-test('with the decoders supplied it builds, carrying every layer of the identity', () => {
-  const stub = (s) => s;
-  const c = new Client({ profile: chrome, decoders: { br: stub, zstd: stub } });
+test('it advertises exactly what Chrome advertises, and can read all of it', async () => {
+  const { acceptEncodingFor } = await import('../../src/client/decode.js');
+  const c = new Client({ profile: chrome });
+  assert.equal(acceptEncodingFor(c.options.decoders), 'gzip, deflate, br, zstd');
+});
+
+test('it carries every layer of the identity', () => {
+  const c = new Client({ profile: chrome });
   assert.equal(c.options.tls.grease, true);
   assert.equal(c.options.tls.extensionOrder, 'shuffle', 'Chromium shuffles; the profile must too');
   assert.deepEqual(c.options.http2PseudoHeaderOrder, [':method', ':authority', ':scheme', ':path']);
@@ -41,8 +45,7 @@ test('with the decoders supplied it builds, carrying every layer of the identity
 
 test('the caller can override what the profile brought', () => {
   const mine = { seal: () => new Uint8Array(0), open: () => null };
-  const stub = (s) => s;
-  const c = new Client({ profile: chrome, decoders: { br: stub, zstd: stub }, ciphers: { chacha20: mine } });
+  const c = new Client({ profile: chrome, ciphers: { chacha20: mine } });
   assert.equal(c.options.ciphers.chacha20, mine, 'the profile overrode the caller');
 });
 

@@ -17,8 +17,10 @@ import { parseCertificate } from '../../src/trust/x509.js';
 import { decodeBody } from '../../src/client/decode.js';
 import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js';
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
-import { RAW_BYTES, BR, BR11, GZ } from './codec-fixture.js';
+import { RAW_BYTES, BR, BR11, GZ, ZSTD } from './codec-fixture.js';
 import { gunzipSync } from 'fflate';
+import { zstd as zstdFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/zstd-dec.wasm.js';
+import { br as brotliFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/brotli-dec.wasm.js';
 import brotliJs from 'brotli/decompress.js';
 import { ungzip as pakoUngzip } from 'pako';
 import brotliWasm from 'brotli-dec-wasm/web/bg.wasm';
@@ -876,13 +878,39 @@ async function cryptoBench(op, n, params = null) {
     return { op, codecs: out };
   }
 
-  if (op === 'brotli-wasm' || op === 'brotli-wasm-stream' || op === 'brotli-q11-stream' ||
+  if (op === 'zstd-freestanding' || op === 'brotli-npm-stream-wrapped' || op === 'brotli-freestanding' || op === 'brotli-wasm' || op === 'brotli-wasm-stream' || op === 'brotli-q11-stream' ||
       op === 'gzip-native' || op === 'inflate-js' || op === 'inflate-pako' || op === 'brotli-js') {
     // Same payload, same decompressed size, one codec each. Differencing two `n` values gives the
     // marginal cost of one decode, which is the number that decides whether `br` can be afforded
     // on a runtime that bills CPU rather than bytes.
     for (let i = 0; i < n; i++) {
-      if (op === 'brotli-js') {
+      if (op === 'zstd-freestanding') {
+        // zstd has no native path either. Same stream shape as the brotli comparison, so the three
+        // codecs are measured identically.
+        sink += (await new Response(zstdFree(new Response(ZSTD).body)).arrayBuffer()).byteLength;
+      } else if (op === 'brotli-npm-stream-wrapped') {
+        // The npm package behind the SAME stream->stream shape the freestanding build exposes, so
+        // the comparison is decoder against decoder rather than one decoder against the other's
+        // wrapper.
+        const wrapped = (src) => {
+          const dec = new BrotliDecStream();
+          return src.pipeThrough(new TransformStream({
+            transform(chunk, c) {
+              let r = dec.dec(chunk, 1 << 20);
+              if (r.buf.length) c.enqueue(r.buf);
+              while (r.code === BrotliStreamResultCode.NeedsMoreOutput) {
+                r = dec.dec(new Uint8Array(0), 1 << 20);
+                if (r.buf.length) c.enqueue(r.buf);
+              }
+            },
+          }));
+        };
+        sink += (await new Response(wrapped(new Response(BR).body)).arrayBuffer()).byteLength;
+      } else if (op === 'brotli-freestanding') {
+        // The freestanding decode-only build, measured in the SAME run as the npm package it
+        // claims to beat 3x. Cross-run comparisons have been wrong here before.
+        sink += (await new Response(brotliFree(new Response(BR).body)).arrayBuffer()).byteLength;
+      } else if (op === 'brotli-js') {
         // The controlled comparison the earlier run lacked: the SAME algorithm as brotli-wasm, in
         // pure JavaScript. WASM-brotli beating JS-inflate proved nothing about WASM, because those
         // are different algorithms. This pair differs in one variable only.
