@@ -18,9 +18,9 @@ import { FRAME } from '../../src/http2/constants.js';
  * reading, so after the flight this drains side b in the background — otherwise the GOAWAY that
  * close() writes would block on the in-memory transport's backpressure and hang the test.
  */
-async function capturePreface() {
+async function capturePreface(opts = {}) {
   const { a, b } = duplexPair();
-  const conn = new Http2Connection(a, {});
+  const conn = new Http2Connection(a, opts);
   const reader = new ByteReader(b.readable);
   const preface = await reader.readExactly(24, 'preface');
   const settings = await readFrame(reader);
@@ -111,3 +111,23 @@ function reserialize(frame) {
   header[8] = frame.streamId & 0xff;
   return concat([header, frame.payload]);
 }
+
+test('the SETTINGS flight is configurable, ids and order included', async () => {
+  // The default is curl's and is pinned above. This is the other half of the contract the TLS side
+  // now has: a caller matching some client other than curl must be able to place the settings where
+  // that client places them, because an Akamai-style h2 fingerprint reads the ids in wire order.
+  const { conn, settings } = await capturePreface({
+    settings: [
+      [0x1, 65536], // HEADER_TABLE_SIZE
+      [0x2, 0], // ENABLE_PUSH
+      [0x4, 6291456], // INITIAL_WINDOW_SIZE
+      [0x6, 262144], // MAX_HEADER_LIST_SIZE
+    ],
+  });
+  const ids = [];
+  for (let o = 0; o < settings.payload.length; o += 6) {
+    ids.push((settings.payload[o] << 8) | settings.payload[o + 1]);
+  }
+  assert.deepEqual(ids, [0x1, 0x2, 0x4, 0x6]);
+  await conn.close();
+});

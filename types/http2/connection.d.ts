@@ -74,6 +74,8 @@ export class Http2Connection {
         endStream: boolean;
     } | null;
     _maxHeaderBlockBytes: number;
+    /** @type {Array<[number, number]> | null} the SETTINGS flight, ids and order included */
+    _settingsFlight: Array<[number, number]> | null;
     _expectFirstSettings: boolean;
     _fatal: any;
     _goaway: {
@@ -252,6 +254,13 @@ export type Http2ConnectionOptions = {
      * self-protection cap on a decoded response header list.
      */
     maxHeaderListSize?: number | undefined;
+    /**
+     * the SETTINGS flight sent in the connection
+     * preface, as [id, value] pairs. Order is significant — an Akamai-style HTTP/2 fingerprint reads
+     * the ids in the order they are sent — so this replaces the flight entirely rather than merging.
+     * Defaults to curl's: MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH.
+     */
+    settings?: [number, number][] | undefined;
     /**
      * cap on the RAW bytes of one HEADERS+CONTINUATION run,
      * before HPACK decoding. Default 262144, matching the decoded cap. This is the bound that stops

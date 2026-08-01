@@ -117,6 +117,10 @@ export class Http2Retryable extends Http2Error {}
  * @property {number} [maxConcurrentStreams] our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
  * @property {number} [maxHeaderTableSize] our advertised SETTINGS_HEADER_TABLE_SIZE.
  * @property {number} [maxHeaderListSize] self-protection cap on a decoded response header list.
+ * @property {Array<[number, number]>} [settings] the SETTINGS flight sent in the connection
+ *   preface, as [id, value] pairs. Order is significant — an Akamai-style HTTP/2 fingerprint reads
+ *   the ids in the order they are sent — so this replaces the flight entirely rather than merging.
+ *   Defaults to curl's: MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH.
  * @property {number} [maxHeaderBlockBytes] cap on the RAW bytes of one HEADERS+CONTINUATION run,
  *   before HPACK decoding. Default 262144, matching the decoded cap. This is the bound that stops
  *   a CONTINUATION flood; `maxHeaderListSize` cannot, because it is only reachable once the whole
@@ -196,6 +200,8 @@ export class Http2Connection {
     // reference makes a small input decode LARGER, never the reverse — so a block whose raw size
     // exceeds the decoded cap could not have produced an acceptable header list anyway.
     this._maxHeaderBlockBytes = opts.maxHeaderBlockBytes ?? 262144;
+    /** @type {Array<[number, number]> | null} the SETTINGS flight, ids and order included */
+    this._settingsFlight = opts.settings ?? null;
     this._expectFirstSettings = true;
 
     this._fatal = null; // set once; rejects every stream and every future request
@@ -230,11 +236,19 @@ export class Http2Connection {
   _sendPreface() {
     // Exactly curl's flight and order: the 24-byte magic, then SETTINGS (ids 3,4,2), then a
     // connection-level WINDOW_UPDATE that raises the receive window to 1000 MiB. See constants.js.
-    const settings = settingsFrame([
-      [SETTINGS.MAX_CONCURRENT_STREAMS, this._ourMaxConcurrent],
-      [SETTINGS.INITIAL_WINDOW_SIZE, this._ourInitialWindow],
-      [SETTINGS.ENABLE_PUSH, 0],
-    ]);
+    //
+    // The ORDER of the settings, not just their values, is part of the fingerprint an Akamai-style
+    // h2 hash reads, so a caller matching some other client needs to be able to set both. Supplying
+    // `settings` replaces the flight wholesale; the values still drive this connection's own
+    // behaviour, so a caller who advertises a window it will not honour has misconfigured the
+    // connection rather than merely disguised it.
+    const settings = settingsFrame(
+      this._settingsFlight ?? [
+        [SETTINGS.MAX_CONCURRENT_STREAMS, this._ourMaxConcurrent],
+        [SETTINGS.INITIAL_WINDOW_SIZE, this._ourInitialWindow],
+        [SETTINGS.ENABLE_PUSH, 0],
+      ],
+    );
     const inc = this._ourConnWindow - DEFAULT_INITIAL_WINDOW;
     const flight =
       inc > 0

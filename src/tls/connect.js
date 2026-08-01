@@ -135,6 +135,12 @@ function expectServerHello(msg, offers12) {
  * @property {number[]} [offerGroups] groups to send an actual key_share for. Default the first
  *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
  * @property {number[]} [ciphers] cipher suites to offer, in preference order.
+ * @property {number[]} [sigSchemes] signature_algorithms to offer, in preference order.
+ * @property {number[]} [extensionOrder] ClientHello extension types, in the order to emit them.
+ *   JA3 and JA4 hash the extension list in WIRE ORDER, so this is most of what a fingerprinter
+ *   reads. Defaults to curl's order (`CURL_EXTENSION_ORDER`). Extensions not named keep their
+ *   natural position at the end; `pre_shared_key` is always last whatever is asked, because RFC
+ *   8446 s4.2.11 defines the binder transcript as the hello truncated just before the binders.
  * @property {Uint8Array} [clientRandom] fixed ClientHello.random, for reproducible handshakes.
  * @property {Uint8Array} [legacySessionId] fixed legacy_session_id, likewise.
  * @property {boolean} [compatibilityCcs] send the middlebox-compatibility ChangeCipherSpec.
@@ -326,6 +332,8 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
     alpn,
     ciphers,
     versions,
+    extensionOrder: options.extensionOrder,
+    sigSchemes: options.sigSchemes,
     random: options.clientRandom,
     legacySessionId: options.legacySessionId,
     psk: pskOffer && {

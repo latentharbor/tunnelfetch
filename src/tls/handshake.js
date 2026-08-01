@@ -239,6 +239,10 @@ export async function continueTls13(ctx) {
       alpn,
       ciphers,
       versions,
+      // The retry must reproduce the first hello's extension set AND order: s4.1.2 does not list
+      // either among the modifications a second ClientHello may make, and a strict server checks.
+      extensionOrder: options.extensionOrder,
+      sigSchemes: options.sigSchemes,
       random: hello.clientRandom,
       legacySessionId: hello.legacySessionId,
       extraExtensions: cookie ? [cookieExtension(cookie)] : [],
