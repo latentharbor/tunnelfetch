@@ -846,13 +846,33 @@ bytes: ~2 ms for a 559-byte body, so for small JSON `decompress: false` can be c
 For large bodies the per-byte cost is not really per byte — it is per stream-boundary crossing.
 The runtime's `DecompressionStream` emits 4096-byte chunks and its sockets deliver reads of at
 most 4096 bytes, and every chunk that crosses between the runtime and JS costs tens of
-microseconds regardless of size. Both hot paths therefore drain their sources with BYOB reads
-into 64 KiB views (a BYOB read hands over everything already buffered in one crossing, and
-resolves partially filled the moment any byte exists, so streaming latency is unchanged). That
-rebuild took the decode stage from ~28 ms to ~6 ms per MB of decompressed output — measured by
-A/B-ing both implementations inside one isolate: 110 ms against 23 ms for the same 4 MB body.
-What remains is close to floor: inflate itself (~2 ms/MB) plus materialising the body into a JS
-string (~1.7 ms/MB), and that last term is the one cost the platform's own `fetch` also bills.
+microseconds regardless of size — measured here at about **17 µs per crossing**, from a ladder
+that collects the same 1 MB in 4 KiB chunks (6.0 ms/MB) through 256 KiB chunks (1.67 ms/MB).
+Both hot paths therefore drain their sources with BYOB reads, which hand over everything already
+buffered in one crossing and resolve partially filled the moment any byte exists, so streaming
+latency is unchanged.
+
+The view they read into is **16 KiB, and the size was swept rather than assumed**. It matters more
+than it looks. The input is pumped by a JS task on the same event loop as the puller, so the
+decompressor usually holds only a chunk or two when a read arrives and the read comes back
+partially filled — measured over a 1 MB body: 93 reads, *all 93 partial*, average fill 11.3 KiB.
+A 64 KiB view therefore allocates 5.8 MB of throwaway buffer to carry 1 MB of data. Swept on the
+edge, CPU per MB of decompressed output, all five interleaved inside one isolate:
+
+| BYOB view | 4 KiB | 8 KiB | **16 KiB** | 32 KiB | 64 KiB |
+|---|---|---|---|---|---|
+| decode stage, ms/MB | 19.33 | 16.00 | **13.00** | 15.33 | 17.67 |
+
+A clean U: too small pays per-read overhead, too large pays for allocation it never fills. The
+64 KiB that used to sit here was chosen from a probe that fed the decompressor through a native
+`pipeTo` — which runs ahead and *does* fill a 64 KiB view (16 reads, none partial). That is a
+regime the shipped wiring never enters. The probe and the product disagreed and the probe was
+believed. Correcting it cut the stage **31%**, 18.0 → 12.3 ms/MB, A/B-ed in one isolate.
+
+What remains is **not** close to floor, and an earlier version of this section wrongly said it was.
+Native inflate of the same content costs 4.3 ms/MB against the stage's 12.3, so roughly **8 ms/MB
+is this package's own plumbing** — the JS input pump and the output wrapper. Closing that needs a
+redesign rather than a constant, and it is the largest single item left in the body path.
 
 Importing the package is free. The 121 bundled anchors are base64 strings indexed by a hash of the
 subject DN, and only the one anchor a chain lands on is ever decoded, so startup stays at ~2 ms for

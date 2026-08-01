@@ -80,7 +80,26 @@ const KNOWN_UNSUPPORTED = new Set(['br', 'zstd', 'compress', 'x-compress']);
  * least one byte is available — it never waits for the view to fill — so a large view cannot
  * add latency; it only lets a fast decompressor hand over more per boundary crossing.
  */
-const DECOMPRESS_READ_BYTES = 65536;
+// Sized to the fill that actually arrives, not to the one a 64 KiB view hopes for.
+//
+// A BYOB read resolves the moment ANY output exists — that is the property that keeps an SSE body
+// from stalling, and it is why this drain is safe on a streaming path. But it also means the view
+// size is an upper bound that is essentially never reached here: the input is pumped by a JS task
+// on the same event loop as the puller, so the decompressor typically holds one or two of its
+// 4 KiB output chunks when the read arrives. Measured on the edge over a 1 MB body of real content:
+// 93 reads, 93 of them partial, average fill 11.3 KiB — and with a 64 KiB view that is 5.8 MB of
+// throwaway buffer allocated to carry 1 MB of data.
+//
+// Swept on the edge, ms of CPU per MB of decompressed output, all five interleaved in one isolate:
+//
+//     4 KiB  19.33     16 KiB  13.00     64 KiB  17.67
+//     8 KiB  16.00     32 KiB  15.33
+//
+// A clean U: too small pays per-read overhead, too large pays for allocation it never fills.
+// 64 KiB was chosen when this drain was first measured against an input fed by a native pipeTo,
+// which runs ahead and DOES fill a 64 KiB view (16 reads, none partial) — a regime the shipped
+// wiring never enters. The probe and the product disagreed, and the probe was believed.
+const DECOMPRESS_READ_BYTES = 16384;
 
 /**
  * One decompression stage. `sniffDeflate` handles the deflate ambiguity:
@@ -93,18 +112,21 @@ const DECOMPRESS_READ_BYTES = 65536;
  * both, so the check is reliable in practice.
  *
  * The output side is pull-driven and drains the decompressor with a BYOB reader when the
- * runtime supports one (a large view per read), falling back to a default reader elsewhere.
- * This shape is measured, not aesthetic: the target runtime's DecompressionStream emits
- * 4096-byte chunks, and the previous wiring (pipeTo → WritableStream → TransformStream)
- * crossed the JS/runtime boundary several times per chunk — measured on the edge at
- * ~28 ms of CPU per MB of decompressed output for this stage alone, against ~2 ms/MB for
- * the inflate itself. Draining with one 64 KiB read per crossing brings the stage to
- * ~6 ms/MB (A/B-ed old-vs-new inside one isolate: 110 ms vs 23 ms for a 4 MB body).
- * A BYOB read resolves with a partial fill the moment any output exists — verified on the
- * edge with a stalled input, 58 KB arrived into a 1 MB view — so streaming latency is
- * unchanged. Input is still pumped by an independent task: a decompressor legitimately
- * consumes many input chunks before producing output, so tying input progress to output
- * pulls would deadlock.
+ * runtime supports one, falling back to a default reader elsewhere. This shape is measured, not
+ * aesthetic: the target runtime's DecompressionStream emits 4096-byte chunks, and the original
+ * wiring (pipeTo → WritableStream → TransformStream) crossed the JS/runtime boundary several
+ * times per chunk. Draining it directly, one read per crossing, is a large win.
+ *
+ * A BYOB read resolves with a partial fill the moment any output exists — verified on the edge
+ * with a stalled input — so this cannot add streaming latency. Input is still pumped by an
+ * independent task: a decompressor legitimately consumes many input chunks before producing
+ * output, so tying input progress to output pulls would deadlock.
+ *
+ * The per-MB numbers this comment used to carry were all measured against a fixture that tiled a
+ * 63-byte phrase. gzip crushes that ~200:1 into a handful of long matches, so inflating it is
+ * nearly free and every figure taken on it was a floor no real body reaches. Against content that
+ * compresses like content (2.76:1 minified JS) the same stage costs 4.7x more. See
+ * DECOMPRESS_READ_BYTES for the current, honestly-sourced figures.
  */
 function decompressionStage(source, coding, maxBytes = Infinity) {
   // Bytes this stage has produced. `maxBodyBytes` bounded only the COMPRESSED wire body, so a
