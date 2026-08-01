@@ -15,3 +15,4 @@ export { openConnection, targetFromUrl, nativeFetchCanServe } from "./transport.
 export { openTunnel, parseProxy } from "./proxy/index.js";
 export { verifyChain, rootStoreProvenance } from "./trust/index.js";
 export { TunnelFetchError, ProxyError, HttpError, TlsError, TlsUnsupportedError, Http2Error, CertificateError, TimeoutError, LimitError, ConfigError, codes } from "./errors.js";
+export { profiles, curl, chrome, applyProfile } from "./profiles.js";

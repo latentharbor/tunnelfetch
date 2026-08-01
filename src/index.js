@@ -44,3 +44,4 @@ import { createFetch } from './client.js';
  * platform's own fetch cannot serve; see the README for why that is not defaulted.
  */
 export const fetch = createFetch();
+export { profiles, curl, chrome, applyProfile } from './profiles.js';

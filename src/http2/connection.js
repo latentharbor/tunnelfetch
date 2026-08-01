@@ -117,6 +117,13 @@ export class Http2Retryable extends Http2Error {}
  * @property {number} [maxConcurrentStreams] our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
  * @property {number} [maxHeaderTableSize] our advertised SETTINGS_HEADER_TABLE_SIZE.
  * @property {number} [maxHeaderListSize] self-protection cap on a decoded response header list.
+ * @property {string[]} [pseudoHeaderOrder] request pseudo-headers in the order to emit them.
+ *   Defaults to curl's `[':method', ':scheme', ':authority', ':path']`. Any of the four left out is
+ *   appended rather than dropped — RFC 9113 s8.3.1 makes all four mandatory and a request missing
+ *   one is malformed, which is not a fingerprint choice anyone should be able to make by accident.
+ * @property {Record<string, 'incremental'|'without'|'never'>} [hpackIndexing] per-field HPACK
+ *   indexing. Which fields enter the dynamic table is part of the fingerprint. Defaults to curl's:
+ *   everything incremental except `:path`, which is sent without indexing.
  * @property {Array<[number, number]>} [settings] the SETTINGS flight sent in the connection
  *   preface, as [id, value] pairs. Order is significant — an Akamai-style HTTP/2 fingerprint reads
  *   the ids in the order they are sent — so this replaces the flight entirely rather than merging.
@@ -202,6 +209,10 @@ export class Http2Connection {
     this._maxHeaderBlockBytes = opts.maxHeaderBlockBytes ?? 262144;
     /** @type {Array<[number, number]> | null} the SETTINGS flight, ids and order included */
     this._settingsFlight = opts.settings ?? null;
+    // The rest of what an Akamai-style h2 fingerprint reads: the pseudo-header order and which
+    // fields go into the HPACK dynamic table. Both default to curl's, both captured off the wire.
+    this._pseudoHeaderOrder = opts.pseudoHeaderOrder ?? null;
+    this._hpackIndexing = opts.hpackIndexing ?? null;
     this._expectFirstSettings = true;
 
     this._fatal = null; // set once; rejects every stream and every future request
@@ -321,7 +332,10 @@ export class Http2Connection {
     }
     const hasBody = body != null && body.byteLength > 0;
 
-    const fields = buildRequestFields({ method, scheme, authority, path, headers });
+    const fields = buildRequestFields(
+      { method, scheme, authority, path, headers },
+      { pseudoHeaderOrder: this._pseudoHeaderOrder, hpackIndexing: this._hpackIndexing },
+    );
     const block = encodeHeaderBlock(fields);
     this._sendHeaderBlock(id, block, !hasBody);
     stream.localEnded = !hasBody;
@@ -1206,14 +1220,32 @@ export class Http2Connection {
  *   headers: Array<[string, string]> }} req
  * @returns {import('./hpack.js').HpackField[]}
  */
-export function buildRequestFields({ method, scheme, authority, path, headers }) {
+export function buildRequestFields({ method, scheme, authority, path, headers }, opts = {}) {
   const pseudo = { ':method': method, ':scheme': scheme, ':authority': authority, ':path': path };
+  const order = opts.pseudoHeaderOrder ?? PSEUDO_HEADER_ORDER;
+  // Which fields go into the dynamic table is itself part of the fingerprint: an Akamai-style h2
+  // hash reads the HPACK representation, and curl indexes everything except :path. A caller
+  // matching another client needs both this and the order, so both are configurable — with the
+  // caller's map consulted first and curl's rule as the default.
+  const indexingFor = (name) =>
+    opts.hpackIndexing?.[name] ?? (name === ':path' ? 'without' : 'incremental');
+
   const fields = [];
+  const seen = new Set();
+  for (const name of order) {
+    if (!(name in pseudo) || seen.has(name)) continue;
+    seen.add(name);
+    fields.push({ name, value: pseudo[name], indexing: indexingFor(name) });
+  }
+  // A caller-supplied order that omits a pseudo-header would produce a malformed request
+  // (RFC 9113 s8.3.1 makes all four mandatory for a request), so the missing ones are appended in
+  // curl's order rather than silently dropped.
   for (const name of PSEUDO_HEADER_ORDER) {
-    fields.push({ name, value: pseudo[name], indexing: name === ':path' ? 'without' : 'incremental' });
+    if (seen.has(name)) continue;
+    fields.push({ name, value: pseudo[name], indexing: indexingFor(name) });
   }
   for (const [name, value] of headers) {
-    fields.push({ name, value, indexing: 'incremental' });
+    fields.push({ name, value, indexing: indexingFor(name) });
   }
   return fields;
 }

@@ -79,7 +79,7 @@ export type HpackField = {
      * how to represent it when it is not a
      * full static match. Default 'incremental', which is what curl uses for most fields.
      */
-    indexing?: "incremental" | "without" | "never" | undefined;
+    indexing?: "without" | "incremental" | "never" | undefined;
 };
 export type HpackDecoderOptions = {
     /**

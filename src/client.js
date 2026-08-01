@@ -16,6 +16,7 @@ import { serializeRequestHead } from './http1/request.js';
 import { bodyFraming, readResponseBody, readResponseHead } from './http1/response.js';
 import { acceptEncodingFor, decodeBody } from './client/decode.js';
 import { OrderedHeaders, CURL_HEADER_ORDER, callerHeaderOrder } from './client/header-order.js';
+import { applyProfile } from './profiles.js';
 import { CookieJar } from './client/cookies.js';
 import { DEFAULT_MAX_REDIRECTS, nextRequest, shouldRedirect } from './client/redirect.js';
 import { ConnectionPool, poolKey } from './pool.js';
@@ -83,10 +84,20 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {import('./profiles.js').FingerprintProfile} [profile] one coherent network identity
+ *   instead of a dozen knobs that can disagree — TLS, HTTP/2, header order and default headers
+ *   together. Explicit options win over it. A profile that declares capabilities this package
+ *   cannot perform is REFUSED rather than silently reduced: see `profiles.chrome`.
  * @property {readonly string[]} [headerOrder] request header names, lowercased, in the order to
  *   emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
  *   to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
  *   without this a request goes out with `user-agent` last, which no real client does.
+ * @property {string[]} [http2PseudoHeaderOrder] request pseudo-headers in the order to emit them.
+ *   Defaults to curl's. Any of the four omitted is appended rather than dropped: RFC 9113 s8.3.1
+ *   makes all four mandatory, so a request missing one is malformed rather than merely unusual.
+ * @property {Record<string, 'incremental'|'without'|'never'>} [http2HpackIndexing] per-field HPACK
+ *   indexing. Which fields enter the dynamic table is read by an Akamai-style h2 fingerprint.
+ *   Defaults to curl's: everything incremental except `:path`.
  * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
  *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
  *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
@@ -111,7 +122,7 @@ export class Client {
    * @param {ClientOptions} [options]
    */
   constructor(options = {}) {
-    this.options = snapshotOptions(options);
+    this.options = snapshotOptions(applyProfile(options));
     this.pool = new ConnectionPool(options.pool);
     // HTTP/2 connections are NOT pooled the way h1 is: one connection multiplexes many concurrent
     // streams, so it is not checked out per request. It lives here, keyed exactly like the h1 pool,
@@ -456,6 +467,12 @@ function registerHttp2(client, key, conn) {
       // `tls`, and one being reachable while the other was not made "the fingerprint is
       // configurable" only half true.
       ...(client.options.http2Settings ? { settings: client.options.http2Settings } : {}),
+      ...(client.options.http2PseudoHeaderOrder
+        ? { pseudoHeaderOrder: client.options.http2PseudoHeaderOrder }
+        : {}),
+      ...(client.options.http2HpackIndexing
+        ? { hpackIndexing: client.options.http2HpackIndexing }
+        : {}),
       onClose: () => {
         client._h2conns.delete(h2);
         // Only drop the keyed entry if it is still this connection; a newer one may have replaced it.
@@ -738,6 +755,10 @@ function buildH2Request(client, current, target) {
   const authority =
     target.port === defaultPort ? current.url.hostname : `${current.url.hostname}:${target.port}`;
 
+  // Profile headers are defaults: a request that sets its own User-Agent keeps it.
+  for (const [name, value] of client.options.profileHeaders ?? []) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
   if (!headers.has('accept')) headers.set('accept', '*/*');
   if (!headers.has('accept-encoding') && o.decompress !== false) {
     headers.set('accept-encoding', acceptEncodingFor(o.decoders));
@@ -820,6 +841,12 @@ function buildHeaders(client, current, target) {
   const hostValue =
     target.port === defaultPort ? current.url.hostname : `${current.url.hostname}:${target.port}`;
 
+  // Profile headers are defaults: a request that sets its own User-Agent keeps it. Applied on both
+  // the h1 and h2 paths, which build their headers separately — the h2 side had this and the h1
+  // side did not, so a profile's User-Agent reached an h2 request and vanished from an h1 one.
+  for (const [name, value] of client.options.profileHeaders ?? []) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
   if (!headers.has('accept')) headers.set('accept', '*/*');
   if (!headers.has('accept-encoding') && client.options.decompress !== false) {
     // Never advertise br or zstd: the runtime has no DecompressionStream for either, so the

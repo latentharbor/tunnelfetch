@@ -131,3 +131,42 @@ test('the SETTINGS flight is configurable, ids and order included', async () => 
   assert.deepEqual(ids, [0x1, 0x2, 0x4, 0x6]);
   await conn.close();
 });
+
+test('the pseudo-header order is configurable, and a missing one is appended not dropped', () => {
+  // Order is read by an Akamai-style h2 fingerprint, so a caller matching another client needs it.
+  // But RFC 9113 s8.3.1 makes all four pseudo-headers mandatory for a request, so an order that
+  // omits one must not produce a malformed request — that is not a fingerprint choice anyone
+  // should be able to make by accident.
+  const req = { method: 'GET', scheme: 'https', authority: 'h', path: '/', headers: [] };
+
+  const reordered = buildRequestFields(req, {
+    pseudoHeaderOrder: [':method', ':path', ':authority', ':scheme'],
+  });
+  assert.deepEqual(
+    reordered.map((f) => f.name),
+    [':method', ':path', ':authority', ':scheme'],
+  );
+
+  const partial = buildRequestFields(req, { pseudoHeaderOrder: [':path', ':method'] });
+  assert.deepEqual(
+    partial.map((f) => f.name),
+    [':path', ':method', ':scheme', ':authority'],
+    'a pseudo-header left out of the order was dropped instead of appended',
+  );
+});
+
+test('HPACK indexing is configurable, and defaults to curl\'s', () => {
+  // Which fields enter the dynamic table is part of the fingerprint. curl indexes everything
+  // except :path.
+  const req = { method: 'GET', scheme: 'https', authority: 'h', path: '/', headers: [['a', 'b']] };
+  const dflt = buildRequestFields(req);
+  assert.equal(dflt.find((f) => f.name === ':path').indexing, 'without');
+  assert.equal(dflt.find((f) => f.name === ':method').indexing, 'incremental');
+
+  const custom = buildRequestFields(req, {
+    hpackIndexing: { ':path': 'incremental', a: 'never' },
+  });
+  assert.equal(custom.find((f) => f.name === ':path').indexing, 'incremental');
+  assert.equal(custom.find((f) => f.name === 'a').indexing, 'never');
+  assert.equal(custom.find((f) => f.name === ':scheme').indexing, 'incremental', 'unlisted fields moved');
+});
