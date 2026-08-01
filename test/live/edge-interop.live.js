@@ -90,9 +90,20 @@ test('a SOCKS5 tunnel carries the same request', async () => {
 test('a second request on one Client reuses the connection', async () => {
   const r = await rig(`keepalive=${TARGET}`);
   assert.equal(r.ok, true, `${r.code}: ${r.error}`);
-  assert.equal(r.poolHits, 1, 'the second request must come from the pool');
   assert.equal(r.first.status, 200);
   assert.equal(r.second.status, 200);
+
+  // Assert reuse, not the mechanism. Over HTTP/1.1 the second request comes out of the pool; over
+  // HTTP/2 it is another stream on a connection the pool never holds, so poolHits stays 0 and
+  // asserting on it fails against a working client. What matters either way is that two requests
+  // cost one connection. (This test did assert poolHits === 1, and started failing the moment the
+  // target negotiated h2 — the client was right and the test was encoding HTTP/1.1's plumbing.)
+  assert.equal(r.connectionsOpened, 1,
+    `two requests should open one connection, opened ${r.connectionsOpened} ` +
+    `(alpn ${r.first.alpn} then ${r.second.alpn}, poolHits ${r.poolHits})`);
+  if (r.first.alpn === 'http/1.1') {
+    assert.equal(r.poolHits, 1, 'over HTTP/1.1 the reuse must be a pool hit');
+  }
   // Wall clock, so it includes the handshake round trips the second request skips.
   assert.ok(r.second.ms < r.first.ms,
     `reuse should be faster: first ${r.first.ms}ms, second ${r.second.ms}ms`);

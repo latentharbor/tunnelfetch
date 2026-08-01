@@ -91,11 +91,19 @@ async function keepAlive({ proxy, url }) {
     const b = await client.fetch(url);
     await b.text();
     const t2 = Date.now();
+    // Which mechanism carried the reuse depends on what ALPN negotiated, and the two look nothing
+    // alike from outside: over HTTP/1.1 the second request takes the connection out of the pool
+    // (a pool hit), while over HTTP/2 it opens another stream on a connection the pool never sees.
+    // Reporting both, plus the ALPN, lets the assertion be about reuse rather than about whichever
+    // mechanism happens to apply.
     return {
-      first: { status: a.status, ms: t1 - t0 },
-      second: { status: b.status, ms: t2 - t1 },
+      first: { status: a.status, ms: t1 - t0, alpn: a.tunnelfetch?.tls?.alpnProtocol ?? null },
+      second: { status: b.status, ms: t2 - t1, alpn: b.tunnelfetch?.tls?.alpnProtocol ?? null },
       poolHits: client.pool.stats.hits,
       poolMisses: client.pool.stats.misses,
+      // One miss total means exactly one connection was opened for two requests, whichever
+      // mechanism carried the second — which is the property worth asserting.
+      connectionsOpened: client.pool.stats.misses,
     };
   } finally {
     await client.close();
