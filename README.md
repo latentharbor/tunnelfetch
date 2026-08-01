@@ -398,9 +398,14 @@ Not implemented, and not planned:
 - **A public-suffix list for cookies.** Only the "no dot in the domain" guard is implemented, so
   `Domain=com` is refused but `Domain=co.uk` is not. Documented rather than faked.
 - **IDNA.** Pass A-labels (punycode); a non-ASCII hostname is rejected with a message saying so.
-- **`br` and `zstd` content encodings.** The runtime has `DecompressionStream` for gzip, deflate
-  and deflate-raw only. The client therefore never advertises `br` — asking for it would return
-  bytes that cannot be decoded.
+- **`br` and `zstd` content encodings.** The runtime's `DecompressionStream` accepts gzip, deflate
+  and deflate-raw only — measured, not assumed; `br` and `zstd` are rejected outright. The client
+  therefore never advertises `br`, and a well-behaved server never sends what was not asked for:
+  fetching a Brotli-serving origin returns identical content as gzip. What it costs is bandwidth,
+  and not a little — the same page measured 290 KB as gzip against 99 KB as `br`. What it would
+  cost to fix is worse on the axis that is billed. Brotli would have to come from WebAssembly, and
+  decompressing in WASM is far more CPU than the runtime's native gzip; on a platform that bills
+  CPU and not bytes, adding `br` would trade an unbilled cost for a billed one.
 - **HTTP/3.** ALPN offers `h2` and `http/1.1` (see [HTTP/2](#http2--access-not-speed)); it does
   not offer `h3`, which is QUIC over UDP and unreachable from a runtime that exposes only raw TCP.
   A server selecting anything the client did not offer fails closed — there is no fallback-and-retry
@@ -412,8 +417,11 @@ Not implemented, and not planned:
 **Sockets cannot cross request contexts.** The pool is per-`Client` and per-invocation by design;
 there is no cross-request connection cache, because the runtime does not permit one.
 
-**Concurrency.** The platform allows six connections simultaneously awaiting response headers.
-A crawler wanting more parallelism must pipeline within that limit.
+**Concurrency.** The limit is six connections **per Worker invocation** simultaneously awaiting
+response headers — not per Worker and not per account, so separate requests to your Worker each get
+their own six. A connection stops occupying a slot the moment its response head arrives, so the
+limit bounds how many handshakes can be in flight at once, not how many bodies can be downloading.
+A crawler wanting more parallelism inside one invocation must pipeline within that limit.
 
 ## Cost on a live Worker
 

@@ -306,13 +306,13 @@ CertificateError [CERT_PIN_MISMATCH]: no certificate in the chain matches any co
 - **dNSName 与 iPAddress 之外的名称约束。** 标为 *critical* 且指名不支持类型的约束扩展会被拒绝；非 critical 的则按 RFC 5280 允许的那样忽略。
 - **cookie 的 public suffix list。** 只实现了“域名里没有点”这一道防护，所以 `Domain=com` 会被拒绝，`Domain=co.uk` 不会。如实写明，而不是伪造。
 - **IDNA。** 请传 A-label (punycode)；非 ASCII 主机名会被拒绝，并附上说明原因的报错。
-- **`br` 与 `zstd` 内容编码。** 运行时的 `DecompressionStream` 只支持 gzip、deflate 和 deflate-raw。因此客户端从不声明接受 `br`——主动要它，换回来的只会是解不开的字节。
+- **`br` 与 `zstd` 内容编码。** 运行时的 `DecompressionStream` 只接受 gzip、deflate 和 deflate-raw——这是实测的，不是假设的；`br` 和 `zstd` 会被直接拒绝。因此客户端从不声明接受 `br`，而守规矩的服务器绝不会发送没被请求的编码：抓一个提供 Brotli 的源站，拿到的内容与 gzip 完全相同。代价是带宽，而且不小——同一个页面 gzip 是 290 KB，`br` 是 99 KB。但要修好它，代价落在被计费的那根轴上：Brotli 只能靠 WebAssembly，而在 WASM 里解压比运行时原生的 gzip 费得多的 CPU；在一个按 CPU 而不按字节计费的平台上，加 `br` 等于拿不计费的成本去换计费的成本。
 - **HTTP/3。** ALPN 报出的是 `h2` 与 `http/1.1`（见 [HTTP/2](#http2--要的是访问不是速度)）；不报 `h3`——那是跑在 UDP 上的 QUIC，从一个只暴露原始 TCP 的运行时根本够不着。服务器若选中客户端未曾报出的协议，一律 fail closed——任何一层都不存在回退重试。
 - **服务器推送、HTTP/2 优先级与 h2c。** 推送在我们的 SETTINGS 里就是关闭的，收到 `PUSH_PROMISE` 即为连接错误；RFC 9113 的优先级机制已被废弃，PRIORITY 帧一律忽略；h2 只跑在 ALPN 协商出的 TLS 之上，绝不以“prior knowledge”走明文。
 
 **socket 不能跨请求上下文。** 连接池按设计随 `Client`、随单次调用存在；不存在跨请求的连接缓存，因为运行时不允许有。
 
-**并发。** 平台允许同时有六条连接处于等待响应头的状态。想要更高并行度的爬虫，必须在这个限额之内做流水线。
+**并发。** 限制是**每次 Worker 调用**最多六条连接同时处于等待响应头的状态——不是每个 Worker，也不是每个账号，所以打到你 Worker 的不同请求各有各的六条。连接在响应头到达的那一刻就腾出槽位，所以它约束的是「同时能有多少次握手在飞」，而不是「同时能下载多少个 body」。想在一次调用内跑更高并行度的爬虫，必须在这个限额之内做流水线。
 
 ## 线上 Worker 的开销
 
