@@ -23,8 +23,9 @@ export function acceptEncodingFor(decoders: Record<string, BodyDecoder> | null |
  *   comma-separated list names codings in the order the SERVER applied them, so decoding
  *   applies them in reverse.
  * @param {Record<string, BodyDecoder> | null} [decoders] caller-supplied codings
- * @param {number} [maxBytes] cap on DECODED output, per stage. `maxBodyBytes` alone bounded the
- *   compressed body, which a gzip bomb walks straight past.
+ * @param {number} [maxBytes] cap on DECODED output, per stage, for built-in AND registered
+ *   decoders alike. `maxBodyBytes` alone bounded the compressed body, which a decompression bomb
+ *   walks straight past. A non-finite cap leaves a registered decoder's output to the caller.
  * @returns {ReadableStream<Uint8Array>} decoded bytes
  */
 export function decodeBody(stream: ReadableStream<Uint8Array>, contentEncoding: string | null | undefined, decoders?: Record<string, BodyDecoder> | null, maxBytes?: number): ReadableStream<Uint8Array>;
