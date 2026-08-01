@@ -602,25 +602,28 @@ Fetching a size-controlled origin through a proxy, warm, medians over seven-plus
 isolate, gzip on the wire. The last column is the same numbers as a rate, which is the form worth
 carrying around:
 
-| | New connection | Each further request, same connection | Marginal rate |
-| --- | --- | --- | --- |
-| 1 KB body | 11 ms | 2–3 ms | — |
-| 16 KB body | 11 ms | 3 ms | — |
-| 64 KB body | 11 ms | 2–4 ms | — |
-| 256 KB body | 7 ms | 3.4 ms | ~13 ms/MB |
-| 1 MB body | 11 ms | 6–12 ms | ~9 ms/MB |
-| 4 MB body | 31 ms | 21–35 ms | ~7 ms/MB |
-| **Same 16 KB page over HTTP/2** | 12 ms | 2.2 ms | — |
-| **First request in a fresh isolate** | 46 ms | — | — |
-| **…after `warmup({ iterations: 5 })`** | 16 ms | — | — |
+| | New connection (first request included) | Each further request, same connection |
+| --- | --- | --- |
+| 1 KB body | 6.4 ms | 1.6 ms |
+| 16 KB body | 6.5 ms | 1.7 ms |
+| 64 KB body | 6.7 ms | 1.9 ms |
+| 256 KB body | 7.4 ms | 2.6 ms |
+| 1 MB body | 10.4 ms | 5.6 ms |
+| 4 MB body | 22.4 ms | 17.6 ms |
+| **First request in a fresh isolate** | 46 ms | — |
+| **…after `warmup({ iterations: 5 })`** | 16 ms | — |
 
-One model fits every body-size row to within its spread:
+Re-measured for 1.4.0 against a size-controlled origin through a proxy, ten rounds per size, HTTP/2
+negotiated, gzip on the wire. The rows are not independent measurements — they are one model, fitted
+to the sweep and then checked back against it:
 
-> **≈ 9.5 ms to open a connection + 2 ms per request + 5–8 ms per MB of body**
+> **≈ 6.4 ms to open a connection + 1.6 ms per further request + ~4 ms per MB of body**
 
-The connection term recovered independently from each row lands between 5 and 11 ms, agreeing with
-the 9–12 ms measured for a new connection by other means. Most of it is the TLS handshake and
-certificate chain validation; almost none of it is parsing (see below).
+Each sweep request fetches five pages — one on a fresh connection and four reusing it — so the two
+terms were separated by varying the reuse count rather than assumed: two pages against ten gives
+1.63 ms per further request, and the connection term falls out of the remainder. Fitted on 1 KB and
+4 MB, the model predicts 32.9 ms for the 1 MB row against 35 measured, and 92.9 for the 4 MB row
+against 94.
 
 The ranges are real, not imprecision: absolute CPU on this platform varies by up to ~1.5× between
 isolates and runs — the same sweep repeated lands on faster and slower machines — so the values are

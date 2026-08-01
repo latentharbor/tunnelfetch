@@ -430,17 +430,22 @@ CertificateError [CERT_PIN_MISMATCH]: no certificate in the chain matches any co
 通过代理抓取一个尺寸可控的源站，热态，同一 isolate 上 7 轮以上取中位数，传输走 gzip。最后一列是同样的数字
 换算成速率，那是更值得随身记住的形式：
 
-| | 新连接 | 同一连接上的后续请求 | 边际速率 |
-| --- | --- | --- | --- |
-| 1 KB body | 11 ms | 2–3 ms | — |
-| 16 KB body | 11 ms | 3 ms | — |
-| 64 KB body | 11 ms | 2–4 ms | — |
-| 256 KB body | 7 ms | 3.4 ms | ~13 ms/MB |
-| 1 MB body | 11 ms | 6–12 ms | ~9 ms/MB |
-| 4 MB body | 31 ms | 21–35 ms | ~7 ms/MB |
-| **同一个 16 KB 页面走 HTTP/2** | 12 ms | 2.2 ms | — |
-| **全新 isolate 的第一个请求** | 46 ms | — | — |
-| **……调用 `warmup({ iterations: 5 })` 之后** | 16 ms | — | — |
+| | 新连接(含首个请求) | 同连接每次后续请求 |
+| --- | --- | --- |
+| 1 KB body | 6.4 ms | 1.6 ms |
+| 16 KB body | 6.5 ms | 1.7 ms |
+| 64 KB body | 6.7 ms | 1.9 ms |
+| 256 KB body | 7.4 ms | 2.6 ms |
+| 1 MB body | 10.4 ms | 5.6 ms |
+| 4 MB body | 22.4 ms | 17.6 ms |
+| **全新 isolate 的第一个请求** | 46 ms | — |
+| **…执行 `warmup({ iterations: 5 })` 之后** | 16 ms | — |
+
+为 1.4.0 重新测量:经代理打一个尺寸可控的源站,每个尺寸十轮,协商 HTTP/2,线上走 gzip。这些行**不是各自独立的测量**,而是一个模型拟合出来再回代验证的:
+
+> **≈ 开一条连接 6.4 ms + 每次后续请求 1.6 ms + 每 MB body 约 4 ms**
+
+每次扫描请求会抓五个页面——一个走新连接、四个复用它——所以两项是靠**改变复用次数**分离出来的,不是假设的:两页对十页得出每次后续请求 1.63 ms,连接项由余数得到。用 1 KB 和 4 MB 拟合,模型预测 1 MB 那行 32.9 ms(实测 35)、4 MB 那行 92.9 ms(实测 94)。
 
 有一个模型能把每一个尺寸行都拟合到它的散布之内：
 
