@@ -256,22 +256,32 @@ presents curl's TLS and HTTP/2 fingerprints by default, and `gzip, deflate` is w
 the default is already consistent. It stops being consistent the moment you dress the handshake up
 as a browser and leave the header behind.
 
-It is not a saving. Measured on the edge, decoding the same 256 KB page to the same bytes:
+It is not a saving. Measured on the edge, decoding the same 256 KB page to the same bytes, **all
+through the same `ReadableStream -> ReadableStream` shape a `decoders` entry actually has**:
 
-| Implementation | Algorithm | ms/MB |
-|---|---|---|
-| `DecompressionStream` — the runtime's own C++ | inflate | **2.5** |
-| WASM brotli (`brotli-dec-wasm`) | brotli | 4.7 |
-| JS inflate (`fflate` / `pako`) | inflate | 7.5 / 8.2 |
-| JS brotli (`brotli`) | brotli | 19.7 |
+| Implementation | Algorithm | ms/MB | vs native gzip |
+|---|---|---|---|
+| `DecompressionStream` — the runtime's own C++ | inflate | **2.75** | 1.0x |
+| WASM zstd (bundled, decode-only build of facebook/zstd) | zstd | 5.5 | 2.0x |
+| WASM brotli (bundled, decode-only build of google/brotli) | brotli | 7.0 | 2.5x |
+| WASM brotli (`brotli-dec-wasm` from npm) | brotli | 10.5 | 3.8x |
+| JS inflate (`fflate` / `pako`) | inflate | 7.5 / 8.2 | 2.7x / 3.0x |
+| JS brotli (`brotli`) | brotli | 19.7 | 7.2x |
 
-Two things fall out, and both are worth knowing before reaching for WebAssembly anywhere else in a
-Worker. **WASM is about 4x faster than JavaScript at the same algorithm** (brotli: 4.7 against
+An earlier version of this table said 4.7 ms/MB for `brotli-dec-wasm`, and that figure was wrong in
+a way worth naming: it was measured by driving the decoder in a bare loop, while the README's own
+example wires it up as a `decoders` entry, which is a stream. The same decoder costs **4.7 in a
+loop and 10.5 behind a `TransformStream` — the stream machinery is 121% on top**, and the number
+that belongs here is the one matching the documented usage. Measured and used must be the same
+thing.
+
+Two things still fall out, both worth knowing before reaching for WebAssembly anywhere else in a
+Worker. **WASM is roughly 3x faster than JavaScript at the same algorithm** (brotli: 7.0 against
 19.7) — so if a coding has no native path, WASM is the right way to add one. And **native is about
-3x faster than JavaScript at the same algorithm** (inflate: 2.5 against 7.5–8.2) — so where a
-native path already exists, nothing in userland improves on it. That is why `gzip` and `deflate`
-are not overridable: replacing them could only ever be slower, and doing it silently is the kind of
-quiet downgrade this package refuses everywhere else.
+3x faster than JavaScript** (inflate: 2.75 against 7.5–8.2), while WASM lands 2–2.5x above native —
+so where a native path already exists, nothing in userland improves on it. That is why `gzip` and
+`deflate` are not overridable: replacing them could only ever be slower, and doing it silently is
+the kind of quiet downgrade this package refuses everywhere else.
 
 Brotli itself lands at 1.9x native inflate. That gap is the price of the coding, and the wire bytes
 it saves do not pay it back — see [What this cannot do](#what-this-cannot-do-and-why). Decoder names
@@ -293,9 +303,70 @@ freestanding WASM and both with known-answer tests in this repository. **Importi
 opt-in:** a bundler pulls them in only for code on this path, so the default identity carries none
 of it.
 
-`br` and `zstd` stay yours. They are not cryptography and there is no single right implementation,
-so the profile keeps refusing until you supply them — a Chrome that advertises `br` and cannot read
-it is worse than one that says so.
+Nothing else to supply: `br` and `zstd` are bundled too. They were held back at first, on the
+grounds that there is no single right implementation — measurement dissolved that. A decode-only
+build of the reference C is 1.5x faster than the npm alternative at the interface this package
+actually uses, and half the size.
+
+The whole cost of the four blobs is **3 ms once per isolate** — module-scope instantiation lands in
+startup, which this runtime does not bill, so only the first request in a fresh isolate sees
+anything and every request after it sees nothing. Measured against an otherwise identical
+deployment that imports none of them:
+
+| | with all four WASM modules | importing none |
+|---|---|---|
+| first request in a fresh isolate | 3 ms | 0 ms |
+| requests 2–5 | 0 ms | 0 ms |
+| request 6 onward | 0 ms | 0 ms |
+
+Per-byte decoding is separate and conditional: you pay it only when an origin actually serves `br`
+or `zstd`. See the codec table above.
+
+### Customising an identity
+
+Three levels, in the order you are likely to want them.
+
+**Override one field.** `tls` merges per-field, so naming one thing keeps the rest of the profile:
+
+```js
+new Client({ profile: chrome, tls: { alpn: ['http/1.1'] } });
+// alpn replaced; extensionOrder, grease, ciphers, groups all still Chrome's
+```
+
+Top-level fields (`headerOrder`, `http2Settings`, `http2PseudoHeaderOrder`, `http2HpackIndexing`)
+replace wholesale, since a half-merged order is not an order.
+
+**Derive a profile.** A profile is a plain frozen object, so spreading one is the whole mechanism —
+no API to learn. This is the right way to change a User-Agent for every request:
+
+```js
+const mine = { ...chrome, name: 'chrome+mine',
+               headers: [['User-Agent', 'mybot/1.0'], ['X-Tag', 'a']] };
+new Client({ profile: mine, connect, proxy });
+```
+
+**Write one from scratch.** Nothing about the built-ins is privileged:
+
+```js
+const firefox = {
+  name: 'my-firefox/130',
+  tls: { alpn: ['h2', 'http/1.1'], ciphers: [0x1302, 0x1301],
+         extensionOrder: [0, 10, 11, 13, 16, 23, 43, 45, 51, 0xff01], grease: false },
+  headerOrder: ['host', 'user-agent', 'accept', 'accept-language', 'accept-encoding', '*', 'connection'],
+  headers: [['User-Agent', 'Mozilla/5.0 Firefox/130.0']],
+  http2Settings: [[1, 65536], [4, 131072], [5, 16384]],
+  http2PseudoHeaderOrder: [':method', ':path', ':authority', ':scheme'],
+  requires: [],
+};
+```
+
+`requires` applies to your profile exactly as it does to the built-ins: name a capability the
+Client has not been given and construction is refused, naming what is missing. A custom identity
+gets the same guard against advertising what it cannot perform.
+
+Profile `headers` are defaults — a per-request header of the same name wins — while explicit
+`Client` options win over the profile. So the precedence runs: per-request, then Client options,
+then the profile.
 
 Verified end to end, not merely constructed:
 
@@ -662,8 +733,9 @@ the edge the same way as the rest — differencing two work counts, minimum of s
 | `headerOrder` | not measurable — the ordered list is *faster* than the platform `Headers` (1.6 µs against 3.8 µs) | per request |
 | `groups: { x25519mlkem768 }` | **+0.15 ms** with the bundled WASM, **+1.35 ms** with a pure-JS ML-KEM | per **connection**, not per request — amortised across every request that reuses it |
 | `ciphers: { chacha20 }` | **+2.0 ms/MB**, and only if the server *selects* it | per byte. Servers with AES hardware generally prefer AES-GCM, so the usual cost is zero and the offer is what matters |
-| `decoders: { br }` | **+4.4 ms/MB** | per byte, whenever an origin serves brotli. Harder compression is worse, not better: quality 11 is 16% smaller on the wire and 46% dearer to decode |
-| `profile: chrome` | the sum of the three above | |
+| `decoders: { br }` | **+4.2 ms/MB** over the native gzip path (7.0 against 2.75) | per byte, whenever an origin serves brotli |
+| `decoders: { zstd }` | **+2.8 ms/MB** (5.5 against 2.75) | per byte, whenever an origin serves zstd |
+| `profile: chrome` via `tunnelfetch/profile/chrome` | **+3 ms once per isolate** for four WASM modules, then the per-byte rows above as origins use them | |
 
 Two defaults moved in 1.4.0 and neither is visible in the table above them: matching curl's cipher
 order means AES-256-GCM is negotiated where AES-128-GCM used to be, measured at **+4%** per MB

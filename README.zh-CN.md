@@ -239,6 +239,58 @@ const client = new Client({ profile: chrome, connect, proxy, decoders: { br, zst
 | `blog.cloudflare.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
 | `www.shopify.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
 
+### 自定义一个身份
+
+三个层次,按你大概率会用到的顺序。
+
+**改一个字段。** `tls` 是逐项合并的,点名一项不会丢掉 profile 的其余部分:
+
+```js
+new Client({ profile: chrome, tls: { alpn: ['http/1.1'] } });
+// alpn 换了;extensionOrder、grease、ciphers、groups 仍然是 Chrome 的
+```
+
+顶层字段(`headerOrder`、`http2Settings`、`http2PseudoHeaderOrder`、`http2HpackIndexing`)是整体替换——一个合并了一半的顺序不成其为顺序。
+
+**派生一个 profile。** profile 就是个普通的冻结对象,spread 它就是全部机制,没有 API 要学。想给所有请求换 User-Agent,这就是正确做法:
+
+```js
+const mine = { ...chrome, name: 'chrome+mine',
+               headers: [['User-Agent', 'mybot/1.0'], ['X-Tag', 'a']] };
+new Client({ profile: mine, connect, proxy });
+```
+
+**从零写一个。** 内置的那两个没有任何特权:
+
+```js
+const firefox = {
+  name: 'my-firefox/130',
+  tls: { alpn: ['h2', 'http/1.1'], ciphers: [0x1302, 0x1301],
+         extensionOrder: [0, 10, 11, 13, 16, 23, 43, 45, 51, 0xff01], grease: false },
+  headerOrder: ['host', 'user-agent', 'accept', 'accept-language', 'accept-encoding', '*', 'connection'],
+  headers: [['User-Agent', 'Mozilla/5.0 Firefox/130.0']],
+  http2Settings: [[1, 65536], [4, 131072], [5, 16384]],
+  http2PseudoHeaderOrder: [':method', ':path', ':authority', ':scheme'],
+  requires: [],
+};
+```
+
+`requires` 对你自己的 profile 和对内置的一视同仁:声明一项 Client 没有拿到的能力,构造就会被拒绝并指名缺什么。**自定义身份同样受"不许声明做不到的事"的约束。**
+
+profile 的 `headers` 是默认值——单次请求的同名 header 会盖掉它;而 `Client` 的显式选项会盖掉 profile。所以优先级是:每请求 > Client 选项 > profile。
+
+### 四个 WASM 模块的冷启动成本
+
+模块作用域的实例化落在启动阶段,而这个运行时**不对启动计费**,所以只有全新 isolate 的第一个请求看得见,之后为零。对照一组除了「有没有 import 这四个模块」之外完全相同的部署:
+
+| | 带四个 WASM 模块 | 一个都不导入 |
+|---|---|---|
+| 全新 isolate 的第一个请求 | 3 ms | 0 ms |
+| 第 2–5 个请求 | 0 ms | 0 ms |
+| 第 6 个请求以后 | 0 ms | 0 ms |
+
+每字节的解码成本是另一回事,而且是**有条件的**:只有源站真的发 `br` 或 `zstd` 时才付。
+
 ### HTTP/2 — 要的是访问，不是速度
 
 客户端默认在 ALPN 中同时报出 `h2` 与 `http/1.1`，服务器选中哪个就说哪个。没有单独的 API：
