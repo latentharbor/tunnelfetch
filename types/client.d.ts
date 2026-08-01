@@ -65,6 +65,10 @@ export function install(options?: ClientOptions): () => void;
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {readonly string[]} [headerOrder] request header names, lowercased, in the order to
+ *   emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
+ *   to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
+ *   without this a request goes out with `user-agent` last, which no real client does.
  * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
  *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
  *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
@@ -227,6 +231,13 @@ export type ClientOptions = {
      * default true.
      */
     keepAlive?: boolean | undefined;
+    /**
+     * request header names, lowercased, in the order to
+     * emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
+     * to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
+     * without this a request goes out with `user-agent` last, which no real client does.
+     */
+    headerOrder?: readonly string[] | undefined;
     /**
      * the HTTP/2 SETTINGS flight, as [id, value]
      * pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they

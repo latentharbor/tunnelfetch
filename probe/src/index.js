@@ -536,6 +536,130 @@ export default {
           modules: await moduleInventory(),
           crypto: await nodeCryptoShape(),
         };
+      } else if (url.pathname === "/mlkem") {
+        // ML-KEM-768 has no native path anywhere on this runtime — not WebCrypto, not node:crypto —
+        // so offering X25519MLKEM768 means carrying a userland implementation. Unlike an AEAD this
+        // is per-HANDSHAKE work, not per-byte: the client generates a key pair for its key_share
+        // and decapsulates the server's ciphertext. Encapsulation is the server's side and is
+        // measured only for completeness.
+        const { ml_kem768 } = await import("@noble/post-quantum/ml-kem.js");
+        const n = Number(url.searchParams.get("n") ?? 10);
+        console.log(JSON.stringify({ mark: "mlkem", n, side: url.searchParams.get("side") ?? "client" }));
+        // `side=client` is the only figure that describes this package's cost: a TLS client
+        // generates a key pair for its key_share and decapsulates the server's ciphertext.
+        // Encapsulation is the server's work and is measured only for completeness.
+        const side = url.searchParams.get("side") ?? "client";
+        let sink = 0;
+        if (side === "keygen" || side === "decap") {
+          // Split the client's two operations. The optimisation on the table is pre-generating key
+          // pairs at module scope, where startup CPU is not billed — which only pays if keygen is
+          // the expensive half. Measured rather than assumed.
+          const pre = ml_kem768.keygen();
+          const ct = ml_kem768.encapsulate(pre.publicKey).cipherText;
+          for (let i = 0; i < n; i++) {
+            sink += side === "keygen"
+              ? ml_kem768.keygen().publicKey.length
+              : ml_kem768.decapsulate(ct, pre.secretKey).length;
+          }
+        } else if (side === "client") {
+          const pre = ml_kem768.keygen();
+          const ct = ml_kem768.encapsulate(pre.publicKey).cipherText;
+          for (let i = 0; i < n; i++) {
+            const k = ml_kem768.keygen();
+            sink += k.publicKey.length + ml_kem768.decapsulate(ct, pre.secretKey).length;
+          }
+        } else {
+          for (let i = 0; i < n; i++) {
+            const keys = ml_kem768.keygen();
+            const { cipherText } = ml_kem768.encapsulate(keys.publicKey);
+            sink += ml_kem768.decapsulate(cipherText, keys.secretKey).length;
+          }
+        }
+        const keys = ml_kem768.keygen();
+        const { cipherText } = ml_kem768.encapsulate(keys.publicKey);
+        body = { n, sink, publicKeyBytes: keys.publicKey.length, cipherTextBytes: cipherText.length };
+      } else if (url.pathname === "/aead") {
+        // AES-GCM through WebCrypto against AES-GCM and ChaCha20-Poly1305 through node:crypto,
+        // over one MB of 16 KiB TLS records. Two effects pull opposite ways and only a measurement
+        // settles them: node:crypto was measured 4.5x slower than WebCrypto on this runtime, but
+        // it is SYNCHRONOUS, and the record layer currently awaits a promise for every record.
+        // Run here rather than in the interop rig because only this deployment has nodejs_compat.
+        const RECORD = 16384;
+        const mb = Number(url.searchParams.get("mb") ?? 1);
+        const records = Math.max(1, Math.round((mb * 1048576) / RECORD));
+        const plain = new Uint8Array(RECORD);
+        const key = new Uint8Array(32).fill(7);
+        const iv = new Uint8Array(12);
+        const nc = await import("node:crypto");
+        const run = async (which) => {
+          let bytes = 0;
+          const t = Date.now();
+          if (which === "webcrypto-aes") {
+            const k = await crypto.subtle.importKey("raw", key, "AES-GCM", false, ["encrypt"]);
+            for (let i = 0; i < records; i++) {
+              iv[11] = i & 0xff;
+              bytes += (await crypto.subtle.encrypt({ name: "AES-GCM", iv, tagLength: 128 }, k, plain)).byteLength;
+            }
+          } else if (which === "js-chacha") {
+            // Pure JS. The only option that needs neither nodejs_compat nor a WASM blob nor a
+            // build step — so if it is fast enough, it is the one that can actually ship.
+            const { chacha20poly1305 } = await import("@noble/ciphers/chacha.js");
+            for (let i = 0; i < records; i++) {
+              iv[11] = i & 0xff;
+              bytes += chacha20poly1305(key, iv).encrypt(plain).length;
+            }
+          } else {
+            const alg = which === "node-chacha" ? "chacha20-poly1305" : "aes-256-gcm";
+            for (let i = 0; i < records; i++) {
+              iv[11] = i & 0xff;
+              const c = nc.createCipheriv(alg, key, iv, { authTagLength: 16 });
+              bytes += c.update(plain).length + c.final().length + c.getAuthTag().length;
+            }
+          }
+          return { bytes, wallMs: Date.now() - t };
+        };
+        // One cipher per request: cpuTime is per-request, so running all three together attributes
+        // nothing. Wall clock is useless here regardless — Date.now() is frozen through synchronous
+        // execution on this runtime — so the reading comes from `wrangler tail`, differencing two
+        // `mb` values to cancel the fixed per-request cost.
+        const which = url.searchParams.get("which") ?? "webcrypto-aes";
+        console.log(JSON.stringify({ mark: "aead", which, mb, records }));
+        body = { which, records, mb, ...(await run(which)) };
+      } else if (url.pathname === "/pqcaps") {
+        // Does this runtime have ChaCha20-Poly1305 or ML-KEM natively, anywhere? The answer
+        // decides whether adding them is wiring or a userland crypto implementation. Probed here
+        // rather than in the interop rig because only this deployment has nodejs_compat, and
+        // node:crypto is the likelier of the two places to carry them.
+        const nc = await import("node:crypto").catch((e) => ({ __err: String(e?.message ?? e) }));
+        const probe = async (label, fn) => {
+          try { return [label, { ok: true, v: String(await fn()) }]; }
+          catch (e) { return [label, { ok: false, err: String(e?.message ?? e).slice(0, 100) }]; }
+        };
+        body = Object.fromEntries(await Promise.all([
+          probe("node:crypto loads", async () => (nc.__err ? "FAILED: " + nc.__err : "yes")),
+          probe("node:crypto.getCiphers()", async () => {
+            const list = nc.getCiphers();
+            return list.length + " ciphers; chacha20-poly1305=" + list.includes("chacha20-poly1305");
+          }),
+          probe("node:crypto chacha20-poly1305 encrypt", async () => {
+            const c = nc.createCipheriv("chacha20-poly1305", new Uint8Array(32), new Uint8Array(12),
+              { authTagLength: 16 });
+            const out = Buffer.concat([c.update(Buffer.alloc(64)), c.final()]);
+            return out.length + " bytes + tag " + c.getAuthTag().length;
+          }),
+          probe("node:crypto ml-kem-768 keygen", async () => {
+            const { publicKey } = nc.generateKeyPairSync("ml-kem-768");
+            return publicKey ? "generated" : "no";
+          }),
+          probe("webcrypto ChaCha20-Poly1305", async () => {
+            await crypto.subtle.importKey("raw", new Uint8Array(32), "ChaCha20-Poly1305", false, ["encrypt"]);
+            return "imported";
+          }),
+          probe("webcrypto X25519MLKEM768", async () => {
+            await crypto.subtle.generateKey({ name: "X25519MLKEM768" }, true, ["deriveBits"]);
+            return "generated";
+          }),
+        ]));
       } else if (url.pathname === "/nodetls") {
         // Needs a real proxy and a real origin: the whole question is whether node:tls will run a
         // handshake over a socket it did not dial, and demand the ORIGIN's identity while doing it.

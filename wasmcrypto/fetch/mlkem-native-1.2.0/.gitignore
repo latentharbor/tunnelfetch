@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0 OR ISC OR MIT
+
+.direnv
+.vscode
+.idea
+test/build
+__pycache__/
+# Downloaded ACVP test data
+test/acvp/.acvp-data/
+# Downloaded Wycheproof test data
+test/wycheproof/.wycheproof-data/

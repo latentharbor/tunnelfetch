@@ -4,6 +4,8 @@
   "type": "module",
   "description": "Edge capability probe. Not published; results feed the offline test suite.",
   "devDependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "@noble/post-quantum": "^0.6.1",
     "wrangler": "^4.115.0"
   }
 }

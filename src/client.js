@@ -15,6 +15,7 @@ import { ByteReader, ByteWriter, UnexpectedEofError, concat, utf8 } from './util
 import { serializeRequestHead } from './http1/request.js';
 import { bodyFraming, readResponseBody, readResponseHead } from './http1/response.js';
 import { acceptEncodingFor, decodeBody } from './client/decode.js';
+import { OrderedHeaders, CURL_HEADER_ORDER, callerHeaderOrder } from './client/header-order.js';
 import { CookieJar } from './client/cookies.js';
 import { DEFAULT_MAX_REDIRECTS, nextRequest, shouldRedirect } from './client/redirect.js';
 import { ConnectionPool, poolKey } from './pool.js';
@@ -82,6 +83,10 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
+ * @property {readonly string[]} [headerOrder] request header names, lowercased, in the order to
+ *   emit them; `'*'` marks where headers not named go, in the order the caller gave them. Defaults
+ *   to curl's (`CURL_HEADER_ORDER`). The platform `Headers` sorts alphabetically and lowercases, so
+ *   without this a request goes out with `user-agent` last, which no real client does.
  * @property {Array<[number, number]>} [http2Settings] the HTTP/2 SETTINGS flight, as [id, value]
  *   pairs. Order is significant — an Akamai-style h2 fingerprint reads the ids in the order they
  *   are sent — so this replaces the flight rather than merging into it. Defaults to curl's. The
@@ -237,6 +242,9 @@ export function install(options = {}) {
 
 async function performFetch(client, input, init) {
   const o = client.options;
+  // Read the caller's header names and case before `Request` normalises them away: the platform
+  // `Headers` sorts lexicographically and lowercases, so by the line below both are already gone.
+  const callerOrder = callerHeaderOrder(input, init);
   const request = new Request(input, init);
   const redirectMode = init?.redirect ?? request.redirect ?? 'follow';
   const maxRedirects = o.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
@@ -251,7 +259,9 @@ async function performFetch(client, input, init) {
   let current = {
     url: new URL(request.url),
     method: request.method,
-    headers: new Headers(request.headers),
+    // The caller's own list when it survived, so its order and case reach the wire; otherwise the
+    // normalised Headers, which is all there is left to work from.
+    headers: new OrderedHeaders(callerOrder ?? request.headers),
     body,
   };
   const history = [];
@@ -723,7 +733,7 @@ async function sendAndReceiveH2(client, h2, current, { deadlines }) {
  */
 function buildH2Request(client, current, target) {
   const o = client.options;
-  const headers = new Headers(current.headers);
+  const headers = new OrderedHeaders(current.headers);
   const defaultPort = current.url.protocol === 'https:' ? 443 : 80;
   const authority =
     target.port === defaultPort ? current.url.hostname : `${current.url.hostname}:${target.port}`;
@@ -747,12 +757,12 @@ function buildH2Request(client, current, target) {
   else if (['POST', 'PUT', 'PATCH'].includes(current.method)) headers.set('content-length', '0');
   else headers.delete('content-length');
 
-  // Headers iterates lowercased (RFC 9113 s8.2.1 requires lowercase names on the wire) — which is
-  // also why h1 loses caller order; h2 is no different here. Pseudo-header ORDER, the part a
-  // fingerprinter reads, is fixed in http2/connection.js buildRequestFields, not here.
-  const out = [];
-  for (const [k, v] of headers) out.push([k, v]);
-  return { authority, headers: out };
+  // Lowercased at the last moment, and only here: RFC 9113 s8.2.1 REQUIRES lowercase field names
+  // on an h2 wire and a server must treat an uppercase one as malformed. h1 is the opposite — real
+  // clients send `Host:`, not `host:` — which is why the case is carried this far and dropped only
+  // on this path. Pseudo-header order is fixed in http2/connection.js buildRequestFields.
+  headers.reorder(o.headerOrder ?? CURL_HEADER_ORDER);
+  return { authority, headers: headers.lowercased() };
 }
 
 function wantsKeepAlive(headInfo) {
@@ -803,7 +813,7 @@ function requestTarget(url) {
 }
 
 function buildHeaders(client, current, target) {
-  const headers = new Headers(current.headers);
+  const headers = new OrderedHeaders(current.headers);
   // Host is derived from the URL and never carried across a redirect; the default port is omitted
   // because a server matching virtual hosts on the literal Host value expects it that way.
   const defaultPort = current.url.protocol === 'https:' ? 443 : 80;
@@ -838,12 +848,11 @@ function buildHeaders(client, current, target) {
   else if (['POST', 'PUT', 'PATCH'].includes(current.method)) headers.set('content-length', '0');
   else headers.delete('content-length');
 
-  const ordered = [['host', hostValue]];
-  for (const [k, v] of headers) {
-    if (k === 'host') continue;
-    ordered.push([k, v]);
-  }
-  return ordered;
+  // Host is set rather than prepended so the order below decides where it goes — which for curl
+  // is first, but for a caller matching something else may not be.
+  headers.set('Host', hostValue);
+  headers.reorder(client.options.headerOrder ?? CURL_HEADER_ORDER);
+  return headers.entries();
 }
 
 export { CookieJar, ConnectionPool, utf8 };
