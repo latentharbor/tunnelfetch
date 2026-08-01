@@ -150,3 +150,25 @@ jobs:
       # that is not a commit.
       - name: bundled trust anchors are still fresh
         run: node --test --test-reporter=spec "test/trust/roots-freshness.test.js"
+
+  fuzz-soak:
+    # The exploratory half of the fuzzing. CI runs a fixed seed on every commit, which gates but
+    # never searches anywhere new; this walks a different corner of the input space each time.
+    #
+    # The seed is the run id, printed in the log and in any failure — so a finding here is
+    # reproducible forever with `FUZZ_SEED=<n> FUZZ_ITERATIONS=<n> node --test test/fuzz/fuzz.test.js`,
+    # and the first thing to do with one is pin it into a unit test with the base64 case.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - name: fuzz the parsers with a fresh seed
+        env:
+          FUZZ_ITERATIONS: 3000000
+          FUZZ_SEED: ${{ github.run_id }}
+        run: |
+          echo "seed=$FUZZ_SEED iterations=$FUZZ_ITERATIONS"
+          node --test test/fuzz/fuzz.test.js

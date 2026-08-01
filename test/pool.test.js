@@ -190,3 +190,53 @@ test('stats track hits and misses honestly', () => {
     { hits: 1, misses: 2, released: 1 },
   );
 });
+
+// The pool key must separate connections along EVERY axis the certificate verifier reads, because
+// a reused connection was validated once, under whatever policy was in force then. These cover the
+// fields the fingerprint previously dropped: an external audit found that `system` ignored
+// `revocation`, `pinned` ignored `anchors`, and `none` ignored `pins`, so two materially different
+// policies produced one key and could share a socket.
+//
+// src/trust/index.js declares the per-mode field set by rejecting every other key (`forbidKeys`),
+// and these assertions mirror those lists in both directions — different policy, different key;
+// same policy, same key, or the pool would never hit at all.
+test('the pool key separates trust policies that differ in revocation', () => {
+  const base = { scheme: 'https:', hostname: 'a.example', port: 443, proxy: null, tls: null };
+  const relaxed = poolKey({ ...base, trust: { mode: 'system' } });
+  const strict = poolKey({ ...base, trust: { mode: 'system', revocation: 'require-staple' } });
+  assert.notEqual(relaxed, strict, 'require-staple shared a key with the default policy');
+  // The default is 'staple', so spelling it out must NOT split the pool.
+  assert.equal(relaxed, poolKey({ ...base, trust: { mode: 'system', revocation: 'staple' } }));
+
+  const anchors = [new Uint8Array([1, 2, 3])];
+  assert.notEqual(
+    poolKey({ ...base, trust: { mode: 'anchors', anchors } }),
+    poolKey({ ...base, trust: { mode: 'anchors', anchors, revocation: 'require-staple' } }),
+  );
+});
+
+test('the pool key separates pinned policies that differ in anchors', () => {
+  const base = { scheme: 'https:', hostname: 'a.example', port: 443, proxy: null, tls: null };
+  const pins = ['sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='];
+  // Absent anchors means the system store — a different policy from custom anchors, not the same
+  // one with a field missing.
+  const viaSystem = poolKey({ ...base, trust: { mode: 'pinned', pins } });
+  const viaCustom = poolKey({ ...base, trust: { mode: 'pinned', pins, anchors: [new Uint8Array([9])] } });
+  assert.notEqual(viaSystem, viaCustom, 'pinning to custom anchors shared a key with the system store');
+  assert.notEqual(
+    viaCustom,
+    poolKey({ ...base, trust: { mode: 'pinned', pins, anchors: [new Uint8Array([8])] } }),
+  );
+  assert.equal(viaSystem, poolKey({ ...base, trust: { mode: 'pinned', pins: [...pins] } }));
+});
+
+test("the pool key separates 'none' policies that differ in pins", () => {
+  const base = { scheme: 'https:', hostname: 'a.example', port: 443, proxy: null, tls: null };
+  // mode 'none' still ENFORCES pins when they are given — it skips path building, not pinning —
+  // so pin-only trust with different pins is different trust.
+  const a = poolKey({ ...base, trust: { mode: 'none', insecureAcceptAnyCertificate: true, pins: ['sha256/AAA='] } });
+  const b = poolKey({ ...base, trust: { mode: 'none', insecureAcceptAnyCertificate: true, pins: ['sha256/BBB='] } });
+  const none = poolKey({ ...base, trust: { mode: 'none', insecureAcceptAnyCertificate: true } });
+  assert.notEqual(a, b, 'two different pin sets shared one key under mode none');
+  assert.notEqual(a, none, 'pinned-but-unverified shared a key with wholly unverified');
+});

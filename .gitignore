@@ -9,3 +9,6 @@ probe/results/*.local.json
 
 # Agent worktrees: transient checkouts, never part of the package.
 .claude/worktrees/
+
+# c8 output, produced by `npx c8 npm test`
+coverage/

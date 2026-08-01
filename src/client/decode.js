@@ -6,12 +6,71 @@
 import { HttpError, codes } from '../errors.js';
 
 /**
- * The exact Accept-Encoding value the request layer must send. The target runtime's
+ * What the request layer advertises with no extra decoders registered. The target runtime's
  * DecompressionStream supports ONLY gzip / deflate / deflate-raw (verified empirically);
  * advertising `br` or `zstd` would invite bytes we can never decode, turning every response
  * from a brotli-preferring CDN into garbage. Keep this list and decodeBody in lockstep.
+ *
+ * It is also exactly what curl sends, which matters because this client presents curl's TLS and
+ * HTTP/2 fingerprints by default: a browser-shaped handshake paired with a curl-shaped
+ * Accept-Encoding is a mismatch a bot detector can read straight off the wire.
  */
 export const ACCEPT_ENCODING = 'gzip, deflate';
+
+/** Codings the runtime decodes itself. Not overridable — see acceptEncodingFor. */
+const BUILT_IN = new Set(['gzip', 'x-gzip', 'deflate', 'identity']);
+
+/** An HTTP token, which is what a content-coding name must be (RFC 9110 §5.6.2). */
+const TOKEN = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/;
+
+/**
+ * The Accept-Encoding to send given the caller's extra decoders.
+ *
+ * Registering a decoder is what makes advertising its coding honest — the two must move together
+ * or the client asks for bytes it cannot read. Order is registration order after the built-ins,
+ * so a caller matching a browser can produce exactly `gzip, deflate, br, zstd`.
+ *
+ * @param {Record<string, BodyDecoder> | null | undefined} decoders
+ * @returns {string}
+ */
+export function acceptEncodingFor(decoders) {
+  if (!decoders) return ACCEPT_ENCODING;
+  const extra = [];
+  for (const name of Object.keys(decoders)) {
+    const coding = name.toLowerCase();
+    // A name is interpolated into a request header, so anything that is not a bare token could
+    // inject a second header field. Reject at registration rather than at send time.
+    if (!TOKEN.test(coding)) {
+      throw new HttpError(
+        codes.HTTP_CONTENT_ENCODING,
+        `"${name}" is not a valid content-coding name; expected an HTTP token`,
+        { coding: name },
+      );
+    }
+    // A built-in must not be overridable. The runtime decompresses gzip and deflate in its own
+    // native code, measured at roughly a third the CPU of the fastest JavaScript implementations,
+    // so accepting a replacement would silently trade that away — and the two code paths disagreed
+    // about it: this function treated `gzip` as already covered while decodeBody would have used
+    // the caller's function. Refusing here makes both paths say the same thing.
+    if (BUILT_IN.has(coding)) {
+      throw new HttpError(
+        codes.HTTP_CONTENT_ENCODING,
+        `"${coding}" is decoded by the runtime natively and cannot be replaced; remove it from ` +
+          '`decoders`. Only codings this runtime has no decoder for can be supplied.',
+        { coding },
+      );
+    }
+    if (typeof decoders[name] !== 'function') {
+      throw new HttpError(
+        codes.HTTP_CONTENT_ENCODING,
+        `the decoder registered for "${coding}" is not a function`,
+        { coding },
+      );
+    }
+    extra.push(coding);
+  }
+  return extra.length ? `${ACCEPT_ENCODING}, ${extra.join(', ')}` : ACCEPT_ENCODING;
+}
 
 /** Codings that exist and are real but that this runtime cannot decompress. */
 const KNOWN_UNSUPPORTED = new Set(['br', 'zstd', 'compress', 'x-compress']);
@@ -192,13 +251,29 @@ function firstBytes(chunks, i) {
 /**
  * Undo the response's Content-Encoding.
  *
+/**
+ * A caller-supplied content decoder: raw coded bytes in, decoded bytes out. Streaming, so a body
+ * is never fully buffered on this client's behalf.
+ * @typedef {(stream: ReadableStream<Uint8Array>) => ReadableStream<Uint8Array>} BodyDecoder
+ */
+
+/**
  * @param {ReadableStream<Uint8Array>} stream the raw body
  * @param {string|null|undefined} contentEncoding the Content-Encoding header value; a
  *   comma-separated list names codings in the order the SERVER applied them, so decoding
  *   applies them in reverse.
+ * @param {Record<string, BodyDecoder> | null} [decoders] caller-supplied codings
  * @returns {ReadableStream<Uint8Array>} decoded bytes
  */
-export function decodeBody(stream, contentEncoding) {
+export function decodeBody(stream, contentEncoding, decoders = null) {
+  /** Look a coding up among the caller's decoders, case-insensitively as the header is. */
+  const custom = (coding) => {
+    if (!decoders) return null;
+    for (const name of Object.keys(decoders)) {
+      if (name.toLowerCase() === coding) return decoders[name];
+    }
+    return null;
+  };
   const codings = (contentEncoding ?? '')
     .split(',')
     .map((c) => c.trim().toLowerCase())
@@ -209,12 +284,17 @@ export function decodeBody(stream, contentEncoding) {
     if (coding === 'gzip' || coding === 'x-gzip' || coding === 'deflate' || coding === 'identity') {
       continue;
     }
+    // A registered decoder is the caller taking responsibility for this coding; it outranks the
+    // built-in refusal, which only ever said "this runtime cannot".
+    if (custom(coding)) continue;
     if (KNOWN_UNSUPPORTED.has(coding)) {
       throw new HttpError(
         codes.HTTP_CONTENT_ENCODING,
-        `Content-Encoding "${coding}" is not decodable: this runtime's DecompressionStream ` +
-          'supports only gzip/deflate/deflate-raw, which is why this client never advertises ' +
-          `"${coding}" in Accept-Encoding — the server should not have sent it`,
+        `Content-Encoding "${coding}" is not decodable: no decoder is registered for it and this ` +
+          "runtime's DecompressionStream " +
+          'supports only gzip/deflate/deflate-raw, which is why this client does not advertise ' +
+          `"${coding}" in Accept-Encoding — the server should not have sent it. Pass ` +
+          `\`decoders: { '${coding}': fn }\` to supply one.`,
         { coding },
       );
     }
@@ -226,6 +306,24 @@ export function decodeBody(stream, contentEncoding) {
   for (let i = codings.length - 1; i >= 0; i--) {
     const coding = codings[i];
     if (coding === 'identity') continue; // no-op by definition
+    // Built-ins take the native path unconditionally; acceptEncodingFor refuses to register one,
+    // and this is the same rule stated where the decoding actually happens, so neither entry
+    // point can be reached with the other's assumption.
+    const fn = BUILT_IN.has(coding) ? null : custom(coding);
+    if (fn) {
+      const staged = fn(out);
+      // A decoder that returns something unreadable would surface far downstream as a confusing
+      // stream error; name it here, where the caller can see which coding misbehaved.
+      if (!staged || typeof staged.getReader !== 'function') {
+        throw new HttpError(
+          codes.HTTP_CONTENT_ENCODING,
+          `the decoder for "${coding}" did not return a ReadableStream`,
+          { coding },
+        );
+      }
+      out = staged;
+      continue;
+    }
     out = decompressionStage(out, coding === 'x-gzip' ? 'gzip' : coding);
   }
   return out;

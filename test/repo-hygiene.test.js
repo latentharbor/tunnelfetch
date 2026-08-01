@@ -306,3 +306,27 @@ test('no credential-shaped literal is committed anywhere in src/ or test/', asyn
   }
   assert.deepEqual(suspicious, [], 'credentials must come from the environment only:\n  ' + suspicious.join('\n  '));
 });
+
+test('CI runs every Node version package.json claims to support', async () => {
+  // An external audit found `engines` claiming >=20 while CI tested only 24 — and Node 20 could
+  // not even run `npm test`, because the runner's glob support arrived in 21. A support floor that
+  // nothing exercises is a guess. This ties the two together in both directions: the matrix must
+  // start at the floor, and every version in it must be at or above the floor.
+  const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const floor = Number(/(\d+)/.exec(pkg.engines.node)?.[1]);
+  assert.ok(Number.isInteger(floor), `could not read a major version out of engines.node ${pkg.engines.node}`);
+
+  const ci = await readFile(join(root, '.github/workflows/ci.yml'), 'utf8');
+  const line = /^\s*node:\s*\[(.+)\]\s*$/m.exec(ci);
+  assert.ok(line, 'the offline job has no `node:` matrix, so nothing pins which versions run');
+  const matrix = line[1].split(',').map((v) => Number(v.trim().replace(/['"]/g, '')));
+
+  assert.ok(
+    matrix.includes(floor),
+    `engines.node is >=${floor} but CI does not run ${floor}: ${matrix.join(', ')}. Either test ` +
+      'the floor or raise it — an untested floor is a claim, not a fact.',
+  );
+  for (const v of matrix) {
+    assert.ok(v >= floor, `CI runs Node ${v}, below the declared floor of ${floor}`);
+  }
+});

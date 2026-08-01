@@ -14,7 +14,7 @@ import { ConfigError, HttpError, TunnelFetchError, codes } from './errors.js';
 import { ByteReader, ByteWriter, UnexpectedEofError, concat, utf8 } from './util/bytes.js';
 import { serializeRequestHead } from './http1/request.js';
 import { bodyFraming, readResponseBody, readResponseHead } from './http1/response.js';
-import { ACCEPT_ENCODING, decodeBody } from './client/decode.js';
+import { acceptEncodingFor, decodeBody } from './client/decode.js';
 import { CookieJar } from './client/cookies.js';
 import { DEFAULT_MAX_REDIRECTS, nextRequest, shouldRedirect } from './client/redirect.js';
 import { ConnectionPool, poolKey } from './pool.js';
@@ -71,8 +71,16 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  *   one across Clients or to persist it.
  * @property {number} [maxRedirects] default 20.
  * @property {number} [maxBodyBytes] enforced from Content-Length before a byte is read.
- * @property {boolean} [decompress] gzip/deflate. Default true. Never `br`; the runtime cannot
- *   decompress it, so it is never advertised either.
+ * @property {boolean} [decompress] gzip/deflate. Default true.
+ * @property {Record<string, import('./client/decode.js').BodyDecoder>} [decoders] extra
+ *   content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
+ *   makes advertising it honest, so each name is appended to Accept-Encoding — a client that
+ *   asked for a coding it cannot decode would turn every such response into garbage. `br` and
+ *   `zstd` are not built in because the runtime's DecompressionStream has neither and this
+ *   package takes no dependencies; supply your own and the cost, and the supply chain, are
+ *   yours and visible. Measured on the edge: WASM brotli decodes at about 2x native gzip, and
+ *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
+ *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
  * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
  *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
@@ -93,7 +101,7 @@ export class Client {
    * @param {ClientOptions} [options]
    */
   constructor(options = {}) {
-    this.options = { ...options };
+    this.options = snapshotOptions(options);
     this.pool = new ConnectionPool(options.pool);
     // HTTP/2 connections are NOT pooled the way h1 is: one connection multiplexes many concurrent
     // streams, so it is not checked out per request. It lives here, keyed exactly like the h1 pool,
@@ -118,6 +126,12 @@ export class Client {
       typeof options.now === 'number' ? { now: () => options.now } : {},
     );
     this._closed = false;
+    // Response bodies that have not finished arriving. `fetch` resolves at the response HEAD, so a
+    // caller holding a Response may still be streaming over a connection this Client owns — and on
+    // HTTP/2 that connection is SHARED and torn down by close(), not checked out of the pool the
+    // way an h1 socket is. Anything that decides when a Client is done needs to see these.
+    /** @type {Set<Promise<void>>} */
+    this._inflight = new Set();
     // Bound so a Client can be handed straight to an SDK expecting a bare function.
     this.fetch = this.fetch.bind(this);
   }
@@ -132,6 +146,19 @@ export class Client {
       throw new TunnelFetchError(codes.POOL_CLOSED, 'this Client has been closed');
     }
     return performFetch(this, input, init);
+  }
+
+  /**
+   * Resolve once every response body handed out by this Client has finished, one way or another —
+   * read to the end, cancelled, or failed. Deliberately NOT folded into close(): close() is the
+   * forceful teardown, and a teardown that waits on the streams it is tearing down would hang on
+   * any body the caller abandoned. This is for callers that want the graceful order.
+   *
+   * Looping rather than a single Promise.all because a body settling can start another (a redirect
+   * drains its predecessor), and a set sampled once would miss the successor.
+   */
+  async idle() {
+    while (this._inflight.size) await Promise.all([...this._inflight]);
   }
 
   /** Release every pooled socket and shared HTTP/2 connection. A Client that is finished must be
@@ -156,11 +183,27 @@ export class Client {
 export function createFetch(options = {}) {
   return async function tunnelFetch(input, init) {
     const client = new Client(options);
+    let response;
     try {
-      return await client.fetch(input, init);
-    } finally {
+      response = await client.fetch(input, init);
+    } catch (err) {
       await client.close();
+      throw err;
     }
+    // NOT `finally { await client.close() }`. `fetch` resolves when the response HEAD arrives and
+    // the body is still on the wire, so closing here tore down the connection out from under the
+    // caller — invisibly on HTTP/1.1, where the socket is checked out of the pool and closeAll()
+    // could not reach it, but fatally on HTTP/2, where the connection is shared and close() ends
+    // every stream on it. `res.text()` then failed with HTTP2_PROTOCOL.
+    //
+    // Not awaited, or this would deadlock: the body only drains when the caller reads it, and the
+    // caller cannot read a Response that has not been returned yet.
+    //
+    // A caller who neither reads nor cancels the body would leave the Client open — the same leak
+    // as forgetting to close one — except that the idle deadline aborts a stalled body, which
+    // settles the completion and fires this anyway.
+    void client.idle().then(() => client.close().catch(() => {}));
+    return response;
   };
 }
 
@@ -422,6 +465,48 @@ function registerHttp2(client, key, conn) {
  * @param {unknown} err
  * @returns {boolean}
  */
+/**
+ * Take a private, frozen copy of the security-relevant configuration.
+ *
+ * `{ ...options }` is a SHALLOW copy, so `client.options.trust` stayed the caller's own object: a
+ * caller could flip `revocation` or swap `pins` after construction and the next request would run
+ * under the new policy over a pool of connections verified under the old one. The pool key covers
+ * every field the verifier reads (see trustFingerprint), but a key computed from a mutable object
+ * is only as stable as the object.
+ *
+ * `proxy` is deliberately NOT frozen: openTunnel treats a frozen proxy as already normalised and
+ * skips parseProxy, so freezing a raw object here would bypass its validation entirely. Proxy
+ * identity is part of the pool key on its own, so a changed proxy gets a different key regardless.
+ *
+ * @param {ClientOptions} options
+ * @returns {Readonly<ClientOptions>}
+ */
+function snapshotOptions(options) {
+  const o = { ...options };
+  if (o.trust && typeof o.trust === 'object') {
+    const t = { ...o.trust };
+    if (Array.isArray(t.pins)) t.pins = Object.freeze([...t.pins]);
+    if (Array.isArray(t.anchors)) t.anchors = Object.freeze([...t.anchors]);
+    o.trust = Object.freeze(t);
+  }
+  if (o.tls && typeof o.tls === 'object') o.tls = Object.freeze({ ...o.tls });
+  if (o.timeouts && typeof o.timeouts === 'object') o.timeouts = Object.freeze({ ...o.timeouts });
+  return Object.freeze(o);
+}
+
+/**
+ * Remember a body until it settles. Never rejects: a failed body is still a finished one, and this
+ * set exists to answer "is anything still arriving", not "did it go well".
+ */
+function trackBody(client, completed) {
+  const settled = completed.then(
+    () => {},
+    () => {},
+  );
+  client._inflight.add(settled);
+  settled.then(() => client._inflight.delete(settled));
+}
+
 function serverNeverSawIt(err) {
   if (err instanceof UnexpectedEofError) return err.detail?.got === 0;
   return err instanceof TunnelFetchError && err.code === codes.TLS_TRUNCATED && err.detail?.got === 0;
@@ -493,6 +578,7 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
 
   // The connection goes back to the pool only when the body reaches the end its framing declared.
   // `completed` resolving false means the caller cancelled and the stream position is unknown.
+  trackBody(client, raw.completed);
   raw.completed.then(
     (ok) => {
       deadlines.dispose();
@@ -556,6 +642,7 @@ async function sendAndReceiveH2(client, h2, current, { deadlines }) {
   const raw = head.body;
   // Dispose the per-request deadline once the body is done, however it ends. Unlike h1 there is no
   // pool.release: the connection stays shared and alive for the next stream.
+  trackBody(client, raw.completed);
   raw.completed.then(
     () => deadlines.dispose(),
     () => deadlines.dispose(),
@@ -585,7 +672,7 @@ function buildH2Request(client, current, target) {
 
   if (!headers.has('accept')) headers.set('accept', '*/*');
   if (!headers.has('accept-encoding') && o.decompress !== false) {
-    headers.set('accept-encoding', ACCEPT_ENCODING);
+    headers.set('accept-encoding', acceptEncodingFor(o.decoders));
   }
   if (client.jar) {
     const cookie = client.jar.headerFor(current.url);
@@ -624,7 +711,7 @@ function decodeResponseBody(body, headers, options) {
   if (options.decompress === false) return body;
   const encoding = headers.get('content-encoding');
   if (!encoding) return body;
-  return decodeBody(body, encoding);
+  return decodeBody(body, encoding, options.decoders ?? null);
 }
 
 function buildResponse(headInfo, body, framing, conn) {
@@ -669,7 +756,7 @@ function buildHeaders(client, current, target) {
   if (!headers.has('accept-encoding') && client.options.decompress !== false) {
     // Never advertise br or zstd: the runtime has no DecompressionStream for either, so the
     // reward for asking would be a body we cannot decode.
-    headers.set('accept-encoding', ACCEPT_ENCODING);
+    headers.set('accept-encoding', acceptEncodingFor(client.options.decoders));
   }
   if (client.jar) {
     const cookie = client.jar.headerFor(current.url);

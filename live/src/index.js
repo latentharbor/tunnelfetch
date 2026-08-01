@@ -17,6 +17,18 @@ import { parseCertificate } from '../../src/trust/x509.js';
 import { decodeBody } from '../../src/client/decode.js';
 import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js';
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
+import { RAW_BYTES, BR, BR11, GZ } from './codec-fixture.js';
+import { gunzipSync } from 'fflate';
+import brotliJs from 'brotli/decompress.js';
+import { ungzip as pakoUngzip } from 'pako';
+import brotliWasm from 'brotli-dec-wasm/web/bg.wasm';
+import { initSync as brotliInit, decompress as brotliDecompress, BrotliDecStream, BrotliStreamResultCode } from 'brotli-dec-wasm/web';
+
+// Instantiated at MODULE SCOPE, which is the whole question: WASM instantiation is a one-time cost
+// and this runtime does not bill startup CPU, so if the expensive part of Brotli were the module
+// coming up, it would be free here. What that cannot move is the decompression itself, which is
+// per-request and per-byte — and that is what the benchmark below actually measures.
+brotliInit({ module: brotliWasm });
 
 const enc = new TextEncoder();
 
@@ -219,6 +231,47 @@ function markPath(path, extra = {}) {
   PATH_COUNT.set(path, nth);
   // Emitted as a log line so it lands in the same `wrangler tail` event as this request's cpuTime.
   console.log(JSON.stringify({ iso: ISOLATE, path, nth, req: ++REQ_SEQ, ...extra }));
+}
+
+/** Brotli as a streaming BodyDecoder, backed by the module-scope WASM instance. */
+function brotliDecoder(stream) {
+  const dec = new BrotliDecStream();
+  return stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, c) {
+        let res = dec.dec(chunk, 1 << 20);
+        if (res.buf.length) c.enqueue(res.buf);
+        while (res.code === BrotliStreamResultCode.NeedsMoreOutput) {
+          res = dec.dec(new Uint8Array(0), 1 << 20);
+          if (res.buf.length) c.enqueue(res.buf);
+        }
+      },
+    }),
+  );
+}
+
+async function brThroughProxy({ proxy, url }) {
+  const client = new Client({
+    proxy,
+    connect,
+    decoders: { br: brotliDecoder },
+    timeouts: { connectMs: 10000, handshakeMs: 15000, headersMs: 20000, idleMs: 20000 },
+  });
+  try {
+    const res = await client.fetch(url, { headers: { 'user-agent': 'tunnelfetch-live' } });
+    const body = await res.text();
+    return {
+      status: res.status,
+      contentEncoding: res.headers.get('content-encoding'),
+      httpVersion: res.tunnelfetch.httpVersion,
+      decodedBytes: body.length,
+      // If the decoder silently produced nothing, or produced compressed bytes, this is the tell.
+      looksLikeHtml: /<html|<!doctype/i.test(body.slice(0, 2000)),
+      head: body.slice(0, 80),
+    };
+  } finally {
+    await client.close();
+  }
 }
 
 function fixedSource(bytes, chunkSize) {
@@ -823,6 +876,59 @@ async function cryptoBench(op, n, params = null) {
     return { op, codecs: out };
   }
 
+  if (op === 'brotli-wasm' || op === 'brotli-wasm-stream' || op === 'brotli-q11-stream' ||
+      op === 'gzip-native' || op === 'inflate-js' || op === 'inflate-pako' || op === 'brotli-js') {
+    // Same payload, same decompressed size, one codec each. Differencing two `n` values gives the
+    // marginal cost of one decode, which is the number that decides whether `br` can be afforded
+    // on a runtime that bills CPU rather than bytes.
+    for (let i = 0; i < n; i++) {
+      if (op === 'brotli-js') {
+        // The controlled comparison the earlier run lacked: the SAME algorithm as brotli-wasm, in
+        // pure JavaScript. WASM-brotli beating JS-inflate proved nothing about WASM, because those
+        // are different algorithms. This pair differs in one variable only.
+        sink += brotliJs(BR).length;
+      } else if (op === 'inflate-pako') {
+        // A second JS inflate, so "JS inflate is slow" is a property of the approach rather than
+        // of one library's code.
+        sink += pakoUngzip(GZ).length;
+      } else if (op === 'inflate-js') {
+        // A NON-NATIVE inflate, same algorithm as the native path. This separates two costs that
+        // the brotli-vs-gzip comparison folds together: how much of the gap is Brotli's decoder
+        // being heavier per output byte, and how much is simply not being the runtime's own C++.
+        sink += gunzipSync(GZ).length;
+      } else if (op === 'brotli-q11-stream' || op === 'brotli-wasm-stream') {
+        // How a body actually arrives: in chunks, decoded incrementally. The one-shot op above
+        // flatters Brotli by comparing it against a gzip path that pays stream overhead, so this
+        // is the figure that belongs in any honest comparison.
+        // q11 is 16% smaller than q5 for identical output — if harder compression made decoding
+        // cheaper, this is where it would show.
+        const src = op === 'brotli-q11-stream' ? BR11 : BR;
+        const dec = new BrotliDecStream();
+        const CHUNK = 16384;
+        for (let o = 0; o < src.length; o += CHUNK) {
+          const part = src.subarray(o, Math.min(o + CHUNK, src.length));
+          let res = dec.dec(part, 1 << 20);
+          sink += res.buf.length;
+          // NeedsMoreOutput means this chunk produced more than the output budget: pump the same
+          // input until it stops asking, or bytes are silently dropped.
+          while (res.code === BrotliStreamResultCode.NeedsMoreOutput) {
+            res = dec.dec(new Uint8Array(0), 1 << 20);
+            sink += res.buf.length;
+          }
+        }
+      } else if (op === 'brotli-wasm') {
+        sink += brotliDecompress(BR).length;
+      } else {
+        const out = await new Response(
+          new Response(GZ).body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+        sink += out.byteLength;
+      }
+    }
+    // Asserting the output size means a decoder that silently produced nothing cannot look fast.
+    if (sink !== RAW_BYTES * n) throw new Error(`decoded ${sink}, expected ${RAW_BYTES * n}`);
+    return { op, n, bytes: sink, perDecode: RAW_BYTES };
+  }
+
   if (op === 'noop') return { op, n, bytes: 0 }; // fixed request cost, to subtract off
 
   return { op, error: 'unknown op' };
@@ -891,6 +997,9 @@ export default {
       // `prebuilt`/`fixed` are per-isolate, so whether this request paid for a fixture matters
       // to the reading and must be recorded before the work, not inferred after it.
       markPath(op, {
+        // `n` must be in the mark, not just the query string: differencing two `n` values is how
+        // the marginal cost is extracted, and the tail event carries only what was logged.
+        n,
         prebuilt: Boolean(prebuilt.plain || prebuilt.chunked),
         fixed: [...BODYFIX.keys()].join('+') || null,
         mb: url.searchParams.get('mb') ?? null,
@@ -916,6 +1025,14 @@ export default {
     if (url.searchParams.get('keepalive')) {
       const t = url.searchParams.get('keepalive');
       results.push(await attempt(`keepalive ${t}`, () => keepAlive({ proxy, url: `https://${t}/` })));
+    }
+    if (url.searchParams.get('br')) {
+      // End-to-end proof that the pluggable-decoder design actually works against a server that
+      // really serves brotli — mocks prove the wiring, this proves the feature. The decoder is the
+      // WASM one whose per-MB cost was measured by /crypto-bench, wrapped as the streaming
+      // ReadableStream->ReadableStream the option expects.
+      const t = url.searchParams.get('br');
+      results.push(await attempt(`br ${t}`, () => brThroughProxy({ proxy, url: `https://${t}/` })));
     }
     if (url.searchParams.get('pin')) {
       const t = url.searchParams.get('pin');

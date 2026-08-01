@@ -225,3 +225,28 @@ test('a second request reuses the shared h2 connection (no new dial)', async () 
   assert.equal(conn._nextStreamId, 5, 'two streams opened on the same connection');
   await client.close();
 });
+
+test('a registered decoder is advertised and applied over h2 as well as h1', async () => {
+  // h1 and h2 build their request headers in separate functions, so `decoders` reaching one says
+  // nothing about the other. This covers buildH2Request; the h1 side is covered in client.test.js.
+  const reverse = (stream) =>
+    stream.pipeThrough(
+      new TransformStream({
+        transform(chunk, c) {
+          c.enqueue(chunk.slice().reverse());
+        },
+      }),
+    );
+  const { client, server } = h2Client({ clientOptions: { decoders: { br: reverse } } });
+  const p = client.fetch('https://origin.example/');
+  await answer(
+    server,
+    1,
+    [{ name: ':status', value: '200' }, { name: 'content-encoding', value: 'br' }],
+    enc.encode('2h revo rb'),
+  );
+  const res = await p;
+  assert.equal(await res.text(), 'br over h2');
+  assert.equal(server.requests.get(1).headers.get('accept-encoding'), 'gzip, deflate, br');
+  await client.close();
+});

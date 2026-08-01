@@ -11,6 +11,8 @@
 
 零依赖。ESM。无构建步骤。`src/` 中没有任何 `node:` 导入。
 
+> **成熟度。** 这是一个新实现，不是久经沙场的实现。它在用户态实现了 TLS 1.2/1.3 与证书校验——在这个领域，好的测试是必要条件，但不是充分条件。它有 1132 个离线测试、RFC 向量、逐字节分片、真实边缘互操作测试、对每一个面向对端的解析器做种子化 fuzzing，行覆盖率 95%；但它**没有**经过外部安全审计。请把它当作一个值得一试的高质量实现，而不是一个已被生产验证的东西。发现任何问题都欢迎报告——见 [SECURITY.md](SECURITY.md)。
+
 ```js
 import { Client } from 'tunnelfetch';
 import { connect } from 'cloudflare:sockets';
@@ -170,6 +172,53 @@ for await (const chunk of res.body) {
 
 中途放弃一条流，连接绝不会回到池里：它的位置是未知的，复用会把上一个响应的残余拼接到下一个请求上。
 
+### `br`、`zstd` 与其它编码
+
+`gzip` 和 `deflate` 是内置的，因为运行时原生就能解。其余都是可插拔的：给 `decoders` 传一个"每种编码一个函数"的表，该编码就会被追加进 `Accept-Encoding`，并被用于解码匹配的响应。注册这个动作本身，正是"声明"变得诚实的前提——请求一个自己读不了的编码，会把每一个这样的响应变成乱码，所以两者绑在一起、不可能漂移。
+
+```js
+import { Client } from 'tunnelfetch';
+import { connect } from 'cloudflare:sockets';
+import { BrotliDecStream, BrotliStreamResultCode, initSync } from 'brotli-dec-wasm/web';
+import wasm from 'brotli-dec-wasm/web/bg.wasm';
+
+// 放在模块作用域，实例化就落进 isolate 启动阶段，而这个运行时不对启动计费。
+// 边缘实测：这一步的成本测不出来（带它启动 12 ms，不带也是 12 ms）。
+initSync({ module: wasm });
+
+const brotli = (stream) => {
+  const dec = new BrotliDecStream();
+  return stream.pipeThrough(new TransformStream({
+    transform(chunk, c) {
+      let r = dec.dec(chunk, 1 << 20);
+      if (r.buf.length) c.enqueue(r.buf);
+      while (r.code === BrotliStreamResultCode.NeedsMoreOutput) {
+        r = dec.dec(new Uint8Array(0), 1 << 20);
+        if (r.buf.length) c.enqueue(r.buf);
+      }
+    },
+  }));
+};
+
+const client = new Client({ connect, proxy, decoders: { br: brotli } });
+// 此后会发送 `Accept-Encoding: gzip, deflate, br`，并解码 `Content-Encoding: br`。
+```
+
+顺序是内置项之后按注册顺序排，所以 `{ br, zstd }` 得到的正是 Chrome 发的 `gzip, deflate, br, zstd`——而这才是做这件事的真正理由。这个客户端默认呈现 curl 的 TLS 与 HTTP/2 指纹，而 `gzip, deflate` 正是 curl 发的，所以默认状态本就是一致的。它不再一致，恰恰是从你把握手打扮成浏览器、却把这个头留在原地的那一刻开始。
+
+它不是一项省钱优化。边缘实测，把同一个 256 KB 页面解成同样的字节：
+
+| 实现 | 算法 | ms/MB |
+|---|---|---|
+| `DecompressionStream`——运行时自己的 C++ | inflate | **2.5** |
+| WASM brotli（`brotli-dec-wasm`） | brotli | 4.7 |
+| JS inflate（`fflate` / `pako`） | inflate | 7.5 / 8.2 |
+| JS brotli（`brotli`） | brotli | 19.7 |
+
+由此得到两条结论，在 Worker 里任何地方考虑用 WebAssembly 之前都值得知道。**同一算法下 WASM 比 JavaScript 快约 4 倍**（brotli：4.7 对 19.7）——所以某个编码若没有原生实现，WASM 是补上它的正确方式。**同一算法下原生又比 JavaScript 快约 3 倍**（inflate：2.5 对 7.5–8.2）——所以只要已经有原生路径，用户态怎么写都赢不了。这正是 `gzip` 和 `deflate` 不可覆盖的原因：替换它们只可能更慢，而静默地这么做，恰恰是这个包在别处一律拒绝的那种悄悄降级。
+
+brotli 本身落在原生 inflate 的 1.9 倍。这个差价就是这个编码的成本，而它省下的线上字节买不回来——见[这个包做不到什么](#这个包做不到什么为什么)。解码器名字会按 HTTP token 校验；解码器抛错时响应体 fail closed，而不是被截断；未注册的编码依然会被拒绝。
+
 ### HTTP/2 — 要的是访问，不是速度
 
 客户端默认在 ALPN 中同时报出 `h2` 与 `http/1.1`，服务器选中哪个就说哪个。没有单独的 API：
@@ -306,7 +355,10 @@ CertificateError [CERT_PIN_MISMATCH]: no certificate in the chain matches any co
 - **dNSName 与 iPAddress 之外的名称约束。** 标为 *critical* 且指名不支持类型的约束扩展会被拒绝；非 critical 的则按 RFC 5280 允许的那样忽略。
 - **cookie 的 public suffix list。** 只实现了“域名里没有点”这一道防护，所以 `Domain=com` 会被拒绝，`Domain=co.uk` 不会。如实写明，而不是伪造。
 - **IDNA。** 请传 A-label (punycode)；非 ASCII 主机名会被拒绝，并附上说明原因的报错。
-- **`br` 与 `zstd` 内容编码。** 运行时的 `DecompressionStream` 只接受 gzip、deflate 和 deflate-raw——这是实测的，不是假设的；`br` 和 `zstd` 会被直接拒绝。因此客户端从不声明接受 `br`，而守规矩的服务器绝不会发送没被请求的编码：抓一个提供 Brotli 的源站，拿到的内容与 gzip 完全相同。代价是带宽，而且不小——同一个页面 gzip 是 290 KB，`br` 是 99 KB。但要修好它，代价落在被计费的那根轴上：Brotli 只能靠 WebAssembly，而在 WASM 里解压比运行时原生的 gzip 费得多的 CPU；在一个按 CPU 而不按字节计费的平台上，加 `br` 等于拿不计费的成本去换计费的成本。
+- **开箱即用的 `br` 与 `zstd`。** 运行时的 `DecompressionStream` 只接受 gzip、deflate 和 deflate-raw——这是实测的，不是假设的。但这两种编码并非够不着：用 [`decoders`](#br-zstd-与其它编码) 注册一个解码器，该编码就会被声明并被解码。包里不内置任何一个，是因为在这个运行时上拿到 Brotli 的唯一途径是 WebAssembly，而一个 208 KB 的二进制块会同时让这个包失去零依赖、以及"不经打包器即可导入"的可移植性。自带解码器，等于把那份成本和那条供应链变成你自己的、并且看得见的。
+
+  不开它是安全的，而不是有损的：内容协商决定了服务器绝不会发送没被请求的编码，所以提供 Brotli 的源站只会返回 gzip。代价是带宽——同一个页面 gzip 是 290 KB，`br` 是 99 KB——而带宽恰恰不是这个平台计费的东西。边缘实测下来，这笔交易是反着的：WASM Brotli 的 CPU 约为运行时原生 inflate 的 **1.9 倍**；即便在 14 个站点里线上字节省得最多的那一个上，省下的 186 KB 只换回约 1.2 ms，而多出来的解压是它的好几倍。而且压得越狠越亏，不是越省——brotli quality 11（CDN 从缓存里发的就是它）比 quality 5 线上小 16%，解码却贵 **46%**，因为解压的工作量跟着**输出**字节走，而更密的编码意味着每产出一个字节要做更多活。开 `br` 的理由是让 `Accept-Encoding` 与浏览器一致，不是省 CPU。
+- **流式请求体。** 请求体会先完整读入内存再发出：一是框定长度需要一个这个客户端敢于担保的 `Content-Length`，二是遇到重定向时可能需要重放。对 SDK 发的那点 JSON 完全够用；对大文件上传就不合适，也意味着不支持 `duplex: 'half'` 的流式上传。响应体则全程流式，任何时候都不会替你缓冲。
 - **HTTP/3。** ALPN 报出的是 `h2` 与 `http/1.1`（见 [HTTP/2](#http2--要的是访问不是速度)）；不报 `h3`——那是跑在 UDP 上的 QUIC，从一个只暴露原始 TCP 的运行时根本够不着。服务器若选中客户端未曾报出的协议，一律 fail closed——任何一层都不存在回退重试。
 - **服务器推送、HTTP/2 优先级与 h2c。** 推送在我们的 SETTINGS 里就是关闭的，收到 `PUSH_PROMISE` 即为连接错误；RFC 9113 的优先级机制已被废弃，PRIORITY 帧一律忽略；h2 只跑在 ALPN 协商出的 TLS 之上，绝不以“prior knowledge”走明文。
 
@@ -445,7 +497,19 @@ inflate 本身（约 2 ms/MB）加上把 body 物化成 JS 字符串（约 1.7 m
 
 ## 运行时要求
 
-WebCrypto (X25519、ECDH P-256/384/521、ECDSA、RSA-PSS、RSASSA-PKCS1、HKDF、HMAC、AES-GCM)、含 BYOB reader 的 WHATWG Streams、`TextEncoder`/`TextDecoder`、`DecompressionStream`、`URL`、`Headers`、`Request`、`Response`、`AbortSignal`、`btoa`。这些在 workerd、Node ≥ 20、Deno 与 Bun 上全部具备。唯一与具体运行时绑定的部分，是你自己提供的 `connect` 函数。
+WebCrypto (X25519、ECDH P-256/384/521、ECDSA、RSA-PSS、RSASSA-PKCS1、HKDF、HMAC、AES-GCM)、含 BYOB reader 的 WHATWG Streams、`TextEncoder`/`TextDecoder`、`DecompressionStream`、`URL`、`Headers`、`Request`、`Response`、`AbortSignal`、`btoa`。这些在 workerd 与 Node ≥ 22 上全部具备。唯一与具体运行时绑定的部分，是你自己提供的 `connect` 函数。
+
+| 运行时 | 离线测试 | 说明 |
+|---|---|---|
+| Node 22、24 | **1132 / 1132** | CI 把关的组合 |
+| Node 20 | 不支持 | `TextDecoder` 把 `iso-8859-1` 当作真正的 ISO-8859-1，而没有按 WHATWG 要求别名到 windows-1252，该字符集的响应体解码结果不同。已于 2026 年 4 月结束维护 |
+| workerd | live 边缘测试全过 | 目标运行时；由定时边缘任务端到端验证，不在离线套件里 |
+| Deno 2.9 | 999 / 1001 | 两个失败都落在 TLS 1.2 测试服务器的 secp521r1 路径上，不在包内；Deno 的 WebCrypto ECDSA 与 ECDH 在 P-521 上单独测试都正常。原因未定位，因此不宣称支持 |
+| Bun 1.3 | 1079 / 1082 | 一个 repo-hygiene 测试的模块解析差异、一个对时序敏感的 deadline 测试，以及同一个 TLS 1.2 套件测试。原因未定位，因此不宣称支持 |
+
+受支持的组合是 Node 22 与 workerd。Deno 和 Bun 已经非常接近可用，但没有进 CI——把这套测试在那两个运行时上跑通，是一个很好的首次贡献。
+
+CI 会跑 `engines` 里声明的每一个版本，并且有一个 repo-hygiene 测试在两者不一致时直接失败——一个没人跑过的支持下限，是声称，不是事实。
 
 ## 测试
 
@@ -459,6 +523,17 @@ npm run test:live # explicit; needs TUNNELFETCH_PROXY in the environment
 每一个按字节消费输入的解析器都会过一遍 `underAllChunkings`：同一串字节分别以整块、逐字节、以及若干伪随机切分点的方式喂入，并断言所有跑法结果一致。在不同分块形状下表现不同的解析器，带着一个只在真实网络分片下才现身的 bug——而那正是那种无法凭报告复现的 bug。
 
 TLS 密钥调度与记录层逐字节钉死在 **RFC 8448** "Example Handshake Traces for TLS 1.3" 上：AEAD 复现出 RFC 里一模一样的密文记录，记录层把 RFC 的完整线上字节在两个方向上原样重放。两个 TLS 驱动都对着独立编写的测试服务器测试——1.2 的服务器建在 `node:crypto` 上，而不是本包自己的原语上，这样客户端的 bug 就不可能被服务器端的同一个 bug 抵消掉。
+
+每一个消费对端字节的解析器——X.509、OCSP、HTTP/1.1 响应头、分块体、HTTP/2 帧、HPACK——都会被 fuzz，断言的属性只有一条：**任意输入，要么解析成功，要么抛出 `TunnelFetchError`。** 抛出未类型化的错误（少了空值检查的 `TypeError`、越界的 `RangeError`）就是一个发现：它意味着某处检查缺失，而所有依赖类型化契约来 fail closed 的调用方都接不住它。
+
+fuzzer 自带种子、零依赖，失败时会打印种子、迭代序号和 base64 的输入——可以精确复现，而无法复现失败的 fuzzer 算不上 fuzzer。目标从 `test/fuzz/targets/` 自动发现，新增一个就是放一个文件进去。这套测试还会 fuzz **它自己**：两个合成目标分别证明引擎能报出未类型化的抛出、且不会误报类型化的抛出——否则一次全绿的 fuzz 只能证明 fuzzer 从来没睁眼。
+
+```bash
+FUZZ_ITERATIONS=1000000 node --test test/fuzz/fuzz.test.js   # 长跑
+FUZZ_SEED=12345 node --test test/fuzz/fuzz.test.js           # 换一个角落
+```
+
+CI 每次提交跑固定种子，作为门禁；定时任务跑三百万次迭代、用 run id 作种子，那才是真正在搜索新地面的那一半。
 
 `probe/` 存放一个可复现的能力探测，输出机器可读的 JSON；`probe/results/` 存放本设计所依据的测量结果。`live/` 是边缘互操作实测环境。
 

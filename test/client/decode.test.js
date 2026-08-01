@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decodeBody,
+  acceptEncodingFor,
   ACCEPT_ENCODING,
   charsetFor,
   charsetFromContentType,
@@ -111,7 +112,9 @@ test('br is rejected up front, naming the runtime limitation', async () => {
     'HTTP_CONTENT_ENCODING',
   );
   assert.match(err.message, /DecompressionStream/);
-  assert.match(err.message, /never advertises/);
+  assert.match(err.message, /does not advertise/);
+  // The refusal must name the way out, or it reads as "impossible" rather than "not built in".
+  assert.match(err.message, /decoders/);
   assert.equal(err.detail.coding, 'br');
 });
 
@@ -444,4 +447,124 @@ test('end to end: gzip body, meta-declared charset, decoded text', async () => {
   assert.equal(charset, 'gbk');
   assert.equal(latin1(bytes).includes('<body>'), true);
   assert.match(decodeText(bytes, charset), /你好/);
+});
+
+// ---------------------------------------------------------------- caller-supplied decoders
+//
+// `br` and `zstd` are not built in: the runtime's DecompressionStream has neither, and adding a
+// WASM decoder would cost this package its zero dependencies AND its ability to be imported
+// without a bundler (a `.wasm` import is not portable ESM). So the coding is pluggable instead —
+// the caller brings the decoder, and its cost and its supply chain are visible as theirs.
+//
+// The invariant these tests protect: what is advertised and what can be decoded never drift
+// apart. Advertising a coding we cannot read turns every such response into garbage.
+
+/** A stand-in decoder: uppercases, so "it ran" is visible in the output. */
+const upperDecoder = (stream) =>
+  stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, c) {
+        c.enqueue(utf8(latin1(chunk).toUpperCase()));
+      },
+    }),
+  );
+
+test('a registered decoder is advertised in Accept-Encoding, in registration order', () => {
+  assert.equal(acceptEncodingFor(null), 'gzip, deflate');
+  assert.equal(acceptEncodingFor({}), 'gzip, deflate');
+  assert.equal(acceptEncodingFor({ br: upperDecoder }), 'gzip, deflate, br');
+  // The order a browser sends, which is the reason to register these at all.
+  assert.equal(
+    acceptEncodingFor({ br: upperDecoder, zstd: upperDecoder }),
+    'gzip, deflate, br, zstd',
+  );
+  // Registering a built-in is refused outright rather than quietly ignored — see the dedicated
+  // test below for why the two entry points have to agree about that.
+});
+
+test('a coding name that is not an HTTP token is refused, so it cannot inject a header', () => {
+  for (const bad of ['br\r\nX-Evil: 1', 'br, zstd', 'br;q=1', 'b r', '']) {
+    assert.throws(
+      () => acceptEncodingFor({ [bad]: upperDecoder }),
+      (e) => e.code === 'HTTP_CONTENT_ENCODING',
+      `"${bad}" was accepted as a coding name`,
+    );
+  }
+});
+
+test('a registered decoder is not a function is refused at registration', () => {
+  assert.throws(
+    () => acceptEncodingFor({ br: 'not a function' }),
+    (e) => e.code === 'HTTP_CONTENT_ENCODING',
+  );
+});
+
+test('a registered decoder decodes the body it was registered for', async () => {
+  const out = decodeBody(readableFrom([utf8('hello')]), 'br', {
+    br: upperDecoder,
+  });
+  assert.equal(latin1(await collect(out)), 'HELLO');
+});
+
+test('decoder lookup is case-insensitive, as Content-Encoding is', async () => {
+  const out = decodeBody(readableFrom([utf8('hi')]), 'BR', { br: upperDecoder });
+  assert.equal(latin1(await collect(out)), 'HI');
+});
+
+test('a decoder composes with the built-ins in the order the server applied them', async () => {
+  // `Content-Encoding: br, gzip` means br first, then gzip — so undo gzip, then undo br.
+  const gzipped = await compress(utf8('layered'), 'gzip');
+  const out = decodeBody(readableFrom([gzipped]), 'br, gzip', { br: upperDecoder });
+  assert.equal(latin1(await collect(out)), 'LAYERED');
+});
+
+test('a decoder that returns something other than a stream is named, not left to fail deep', () => {
+  assert.throws(
+    () => decodeBody(readableFrom([PAYLOAD]), 'br', { br: () => null }),
+    (e) => e.code === 'HTTP_CONTENT_ENCODING' && /did not return a ReadableStream/.test(e.message),
+  );
+});
+
+test('a decoder that throws fails the body closed rather than truncating it', async () => {
+  const out = decodeBody(readableFrom([PAYLOAD]), 'br', {
+    br: (s) =>
+      s.pipeThrough(
+        new TransformStream({
+          transform() {
+            throw new Error('corrupt brotli stream');
+          },
+        }),
+      ),
+  });
+  await assert.rejects(() => collect(out), /corrupt brotli stream/);
+});
+
+test('an unregistered coding is still refused, so the pluggability cannot fail open', async () => {
+  await rejectsWithCode(
+    () => decodeBody(readableFrom([PAYLOAD]), 'zstd', { br: upperDecoder }),
+    'HTTP_CONTENT_ENCODING',
+  );
+});
+
+test('a built-in coding cannot be replaced by a caller-supplied decoder', () => {
+  // Found while measuring: a caller passing `{ gzip: fn }` had their function silently replace the
+  // runtime's native gzip, which is ~3x faster than the fastest JavaScript inflate — a quiet
+  // downgrade of exactly the kind this package refuses everywhere else. Worse, the two entry
+  // points disagreed: acceptEncodingFor treated gzip as already covered and left the header alone,
+  // while decodeBody used the override. Both now refuse.
+  for (const coding of ['gzip', 'x-gzip', 'deflate', 'identity', 'GZIP']) {
+    assert.throws(
+      () => acceptEncodingFor({ [coding]: upperDecoder }),
+      (e) => e.code === 'HTTP_CONTENT_ENCODING' && /natively and cannot be replaced/.test(e.message),
+      `${coding} was accepted as an overridable coding`,
+    );
+  }
+});
+
+test('a gzip body still takes the native path even if a decoder was smuggled past registration', async () => {
+  // decodeBody is exported and reachable on its own, so the rule has to hold where the decoding
+  // happens and not only where registration is validated.
+  const packed = await compress(utf8('native please'), 'gzip');
+  const out = decodeBody(readableFrom([packed]), 'gzip', { gzip: upperDecoder });
+  assert.equal(latin1(await collect(out)), 'native please');
 });

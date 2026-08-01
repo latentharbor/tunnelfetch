@@ -54,8 +54,16 @@ export function install(options?: ClientOptions): () => void;
  *   one across Clients or to persist it.
  * @property {number} [maxRedirects] default 20.
  * @property {number} [maxBodyBytes] enforced from Content-Length before a byte is read.
- * @property {boolean} [decompress] gzip/deflate. Default true. Never `br`; the runtime cannot
- *   decompress it, so it is never advertised either.
+ * @property {boolean} [decompress] gzip/deflate. Default true.
+ * @property {Record<string, import('./client/decode.js').BodyDecoder>} [decoders] extra
+ *   content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
+ *   makes advertising it honest, so each name is appended to Accept-Encoding — a client that
+ *   asked for a coding it cannot decode would turn every such response into garbage. `br` and
+ *   `zstd` are not built in because the runtime's DecompressionStream has neither and this
+ *   package takes no dependencies; supply your own and the cost, and the supply chain, are
+ *   yours and visible. Measured on the edge: WASM brotli decodes at about 2x native gzip, and
+ *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
+ *   matching a browser's Accept-Encoding, not saving CPU.
  * @property {boolean} [keepAlive] default true.
  * @property {boolean} [http2] offer HTTP/2 via ALPN and speak it when the server selects it.
  *   Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
@@ -75,95 +83,7 @@ export class Client {
      * @param {ClientOptions} [options]
      */
     constructor(options?: ClientOptions);
-    options: {
-        /**
-         * Socket factory. Required for any
-         * request the platform's own `fetch` cannot serve — which is every proxied request, and every
-         * request asking for a trust policy `fetch` cannot express.
-         */
-        connect?: import("./proxy/index.js").ConnectFn | undefined;
-        /**
-         * URL string or
-         * config object; `http:`, `https:`, `socks5:` and `socks5h:`.
-         */
-        proxy?: string | import("./proxy/index.js").ProxyConfig | null | undefined;
-        /**
-         * certificate policy, httpx's
-         * `verify=`. Default `{ mode: 'system' }`.
-         */
-        trust?: import("./trust/index.js").TrustConfig | undefined;
-        /**
-         * handshake knobs.
-         */
-        tls?: import("./tls/connect.js").TlsOptions | undefined;
-        /**
-         * connect / handshake /
-         * headers / idle / total, in ms. The idle gap is the control; total is a backstop.
-         */
-        timeouts?: import("./util/deadline.js").DeadlineOptions | undefined;
-        /**
-         * enable a per-Client cookie jar.
-         */
-        cookies?: boolean | undefined;
-        /**
-         * supply a jar directly, e.g. to share
-         * one across Clients or to persist it.
-         */
-        jar?: CookieJar | undefined;
-        /**
-         * default 20.
-         */
-        maxRedirects?: number | undefined;
-        /**
-         * enforced from Content-Length before a byte is read.
-         */
-        maxBodyBytes?: number | undefined;
-        /**
-         * gzip/deflate. Default true. Never `br`; the runtime cannot
-         * decompress it, so it is never advertised either.
-         */
-        decompress?: boolean | undefined;
-        /**
-         * default true.
-         */
-        keepAlive?: boolean | undefined;
-        /**
-         * offer HTTP/2 via ALPN and speak it when the server selects it.
-         * Default true. The goal is ACCESS, not speed — some sites treat HTTP/1.1 as a bot signal — and
-         * on a CPU-billed runtime h2 costs MORE than h1 (HPACK is extra work). Set false to offer only
-         * `http/1.1`. There is no fallback-and-retry either way: the server's ALPN pick is followed.
-         */
-        http2?: boolean | undefined;
-        /**
-         * never delegate to the platform's fetch, even when it could
-         * serve the request. Mainly for exercising this stack against origins that do not need it.
-         */
-        forceTunnel?: boolean | undefined;
-        /**
-         * delegation target; defaults to `globalThis.fetch`.
-         */
-        nativeFetch?: FetchLike | undefined;
-        /**
-         * connection pool sizing.
-         */
-        pool?: {
-            maxPerKey?: number;
-            maxTotal?: number;
-        } | undefined;
-        limits?: Limits | undefined;
-        /**
-         * injectable randomness and key generation.
-         */
-        deps?: import("./tls/connect.js").TlsDeps | undefined;
-        /**
-         * aborts every request this Client makes.
-         */
-        signal?: AbortSignal | undefined;
-        /**
-         * epoch ms override, for certificate validity in tests.
-         */
-        now?: number | undefined;
-    };
+    options: Readonly<ClientOptions>;
     pool: ConnectionPool;
     /** @type {Map<string, import('./http2/connection.js').Http2Connection>} */
     _h2: Map<string, import("./http2/connection.js").Http2Connection>;
@@ -172,6 +92,8 @@ export class Client {
     jar: CookieJar | null;
     tickets: TicketStore;
     _closed: boolean;
+    /** @type {Set<Promise<void>>} */
+    _inflight: Set<Promise<void>>;
     /**
      * @param {RequestInfo | URL} input
      * @param {RequestInit} [init]
@@ -180,6 +102,16 @@ export class Client {
     fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response & {
         tunnelfetch?: ResponseDetail;
     }>;
+    /**
+     * Resolve once every response body handed out by this Client has finished, one way or another —
+     * read to the end, cancelled, or failed. Deliberately NOT folded into close(): close() is the
+     * forceful teardown, and a teardown that waits on the streams it is tearing down would hang on
+     * any body the caller abandoned. This is for callers that want the graceful order.
+     *
+     * Looping rather than a single Promise.all because a body settling can start another (a redirect
+     * drains its predecessor), and a set sampled once would miss the successor.
+     */
+    idle(): Promise<void>;
     /** Release every pooled socket and shared HTTP/2 connection. A Client that is finished must be
      *  closed or sockets leak for the isolate's lifetime. */
     close(): Promise<void>;
@@ -271,10 +203,21 @@ export type ClientOptions = {
      */
     maxBodyBytes?: number | undefined;
     /**
-     * gzip/deflate. Default true. Never `br`; the runtime cannot
-     * decompress it, so it is never advertised either.
+     * gzip/deflate. Default true.
      */
     decompress?: boolean | undefined;
+    /**
+     * extra
+     * content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
+     * makes advertising it honest, so each name is appended to Accept-Encoding — a client that
+     * asked for a coding it cannot decode would turn every such response into garbage. `br` and
+     * `zstd` are not built in because the runtime's DecompressionStream has neither and this
+     * package takes no dependencies; supply your own and the cost, and the supply chain, are
+     * yours and visible. Measured on the edge: WASM brotli decodes at about 2x native gzip, and
+     * the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
+     * matching a browser's Accept-Encoding, not saving CPU.
+     */
+    decoders?: Record<string, import("./client/decode.js").BodyDecoder> | undefined;
     /**
      * default true.
      */
@@ -316,8 +259,8 @@ export type ClientOptions = {
      */
     now?: number | undefined;
 };
-import { CookieJar } from './client/cookies.js';
 import { ConnectionPool } from './pool.js';
+import { CookieJar } from './client/cookies.js';
 import { TicketStore } from './tls/tickets.js';
 import { utf8 } from './util/bytes.js';
 export { CookieJar, ConnectionPool, utf8 };

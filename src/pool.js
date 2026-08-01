@@ -52,15 +52,31 @@ export function poolKey({ scheme, hostname, port, proxy, trust, tls }) {
 
 function trustFingerprint(trust) {
   const mode = trust?.mode ?? 'system';
-  if (mode === 'system') return 'system';
-  if (mode === 'none') return 'none';
+  // The fingerprint must cover exactly the fields the VERIFIER reads for this mode — no fewer, or
+  // a connection validated under one policy serves a request under another; no more, or the pool
+  // is split along axes that make no difference. src/trust/index.js states the set per mode by
+  // rejecting every other key outright (`forbidKeys`), so this mirrors those lists.
+  const rev = `rev=${trust?.revocation ?? 'staple'}`;
+  const pins = `pins=${[...(trust?.pins ?? [])].sort().join(',')}`;
+  // Anchors matter even when they are absent: omitting them means the system store, and a policy
+  // pinned against custom anchors is not the policy pinned against the system store.
+  const anchors =
+    trust?.anchors === undefined
+      ? 'anchors=system'
+      : `anchors=${trust.anchors.length}:${anchorDigest(trust.anchors)}`;
+
+  // 'none' forbids anchors/verify/revocation, so pins are the only thing that can vary — and they
+  // DO vary: pin-only trust still enforces them.
+  if (mode === 'none') return `none|${pins}`;
   if (mode === 'custom') {
     // Two different callbacks are two different policies and we cannot compare functions, so a
     // custom policy never shares a connection. Correct, and cheap: custom trust is rare.
+    // ('custom' forbids anchors/pins/revocation — the callback owns the whole decision.)
     return `custom:${customCounter(trust.verify)}`;
   }
-  if (mode === 'pinned') return `pinned:${[...(trust.pins ?? [])].sort().join(',')}`;
-  if (mode === 'anchors') return `anchors:${(trust.anchors ?? []).length}:${anchorDigest(trust.anchors)}`;
+  if (mode === 'system') return `system|${rev}`;
+  if (mode === 'anchors') return `anchors:${(trust.anchors ?? []).length}:${anchorDigest(trust.anchors)}|${rev}`;
+  if (mode === 'pinned') return `pinned|${pins}|${anchors}|${rev}`;
   return `unknown:${mode}`;
 }
 
