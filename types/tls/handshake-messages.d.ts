@@ -28,7 +28,7 @@ export function generateKeyShare(group: number, { generateKeyPair }?: import("./
  * @returns {Promise<Uint8Array>} throws on any degenerate or malformed peer key
  */
 export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey: Uint8Array): Promise<Uint8Array>;
-export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, psk, randomBytes, }: {
+export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, psk, grease, randomBytes, }: {
     hostname: any;
     keyShares: any;
     random: any;
@@ -41,6 +41,7 @@ export function buildClientHello({ hostname, keyShares, random, legacySessionId,
     extensionOrder?: readonly number[] | undefined;
     extraExtensions?: never[] | undefined;
     psk?: null | undefined;
+    grease?: boolean | undefined;
     randomBytes?: ((n: any) => Uint8Array<any>) | undefined;
 }): {
     message: Uint8Array<ArrayBufferLike>;
@@ -351,6 +352,8 @@ export function checkAlpn(extensions: Map<number, Uint8Array>, offeredAlpn: stri
  * whatever the caller asks for, because RFC 8446 s4.2.11 defines the binder transcript as the hello
  * truncated just before the binders — a range that only exists if nothing follows them.
  */
+/** `extensionOrder: SHUFFLE_EXTENSIONS` reproduces what Chromium does — see grease.js. */
+export const SHUFFLE_EXTENSIONS: "shuffle";
 export const CURL_EXTENSION_ORDER: readonly number[];
 export { GROUP_PARAMS };
 /**

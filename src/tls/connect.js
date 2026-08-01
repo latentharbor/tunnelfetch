@@ -136,7 +136,12 @@ function expectServerHello(msg, offers12) {
  *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
  * @property {number[]} [ciphers] cipher suites to offer, in preference order.
  * @property {number[]} [sigSchemes] signature_algorithms to offer, in preference order.
- * @property {number[]} [extensionOrder] ClientHello extension types, in the order to emit them.
+ * @property {boolean | number} [grease] send GREASE (RFC 8701) reserved values in the cipher list,
+ *   the extension list (one at each end), supported_groups, supported_versions and key_share.
+ *   Default false, because curl does not GREASE — Chromium does. A number is a seed, which makes
+ *   the hello reproducible; `true` draws one from `deps.randomBytes`. A server that negotiates a
+ *   GREASE value is refused with a typed error naming it.
+ * @property {number[] | 'shuffle'} [extensionOrder] ClientHello extension types, in the order to emit them.
  *   JA3 and JA4 hash the extension list in WIRE ORDER, so this is most of what a fingerprinter
  *   reads. Defaults to curl's order (`CURL_EXTENSION_ORDER`). Extensions not named keep their
  *   natural position at the end; `pre_shared_key` is always last whatever is asked, because RFC
@@ -334,6 +339,7 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
     versions,
     extensionOrder: options.extensionOrder,
     sigSchemes: options.sigSchemes,
+    grease: options.grease ?? false,
     random: options.clientRandom,
     legacySessionId: options.legacySessionId,
     psk: pskOffer && {

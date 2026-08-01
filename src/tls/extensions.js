@@ -26,6 +26,16 @@ function ext(type, body) {
   return new Builder().u16(type).vector(2, body).build();
 }
 
+/**
+ * An extension of an arbitrary type with an arbitrary body. Exists for GREASE (RFC 8701), whose
+ * whole point is to carry a reserved type this package assigns no meaning to.
+ * @param {number} type
+ * @param {Uint8Array} body
+ */
+export function encodeRawExtension(type, body) {
+  return ext(type, body);
+}
+
 // ------------------------------------------------------------------ encoders (ClientHello)
 
 /**

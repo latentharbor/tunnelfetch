@@ -11,6 +11,7 @@
 import { TlsError, TlsUnsupportedError, CertificateError, codes, hex16 } from '../errors.js';
 import { concat, equal, timingSafeEqual, utf8 } from '../util/bytes.js';
 import { Builder, Cursor, vector, handshakeMessage } from './wire.js';
+import { greaseSource, greaseKeyShare, shuffleExtensions, isGrease } from './grease.js';
 // der.js is a strict ASN.1 reader with no trust policy in it; the signature-format conversion
 // lives there so the certificate path builder and this file cannot drift apart.
 import { ecdsaDerToRaw } from '../trust/der.js';
@@ -49,6 +50,7 @@ import {
   encodePreSharedKey,
   encodePskKeyExchangeModes,
   encodeRenegotiationInfo,
+  encodeRawExtension,
   encodeServerName,
   encodeSignatureAlgorithms,
   encodeStatusRequest,
@@ -230,6 +232,9 @@ export async function deriveSharedSecret(group, privateKey, peerKey) {
  * whatever the caller asks for, because RFC 8446 s4.2.11 defines the binder transcript as the hello
  * truncated just before the binders — a range that only exists if nothing follows them.
  */
+/** `extensionOrder: SHUFFLE_EXTENSIONS` reproduces what Chromium does — see grease.js. */
+export const SHUFFLE_EXTENSIONS = 'shuffle';
+
 export const CURL_EXTENSION_ORDER = Object.freeze([
   EXTENSION.renegotiation_info,
   EXTENSION.server_name,
@@ -282,8 +287,16 @@ export function buildClientHello({
   extensionOrder = CURL_EXTENSION_ORDER,
   extraExtensions = [],
   psk = null,
+  grease = false,
   randomBytes = defaultRandom,
 }) {
+  // A seed rather than ambient randomness: repo-hygiene forbids Math.random in src/ so that every
+  // byte this package puts on the wire is reproducible in a test, and a fingerprint that cannot be
+  // reproduced cannot be asserted byte-for-byte.
+  const g = grease === false || grease == null
+    ? null
+    : greaseSource(typeof grease === 'number' ? grease : ((randomBytes(4)[0] << 24) |
+        (randomBytes(4)[1] << 16) | (randomBytes(4)[2] << 8) | randomBytes(4)[3]) >>> 0);
   const clientRandom = random ?? randomBytes(32);
   if (clientRandom.byteLength !== 32) {
     throw new TlsError(codes.CONFIG_INVALID, `ClientHello.random must be 32 bytes, got ${clientRandom.byteLength}`);
@@ -302,7 +315,9 @@ export function buildClientHello({
     throw new TlsError(codes.CONFIG_INVALID, 'ClientHello would offer no cipher suites');
   }
 
+  // GREASE goes FIRST in each list, which is where Chromium puts it — captured, not recalled.
   const suiteBytes = new Builder();
+  if (g) suiteBytes.u16(g.take());
   for (const s of suites) suiteBytes.u16(s);
 
   if (psk && !offersTls13) {
@@ -318,11 +333,16 @@ export function buildClientHello({
     // Always offered, for either version: without it a server may not staple (RFC 6066 s8), and
     // a stapled OCSP response is the only revocation signal this package can consume.
     encodeStatusRequest(),
-    encodeSupportedGroups(groups),
+    encodeSupportedGroups(g ? [g.take(), ...groups] : groups),
     encodeSignatureAlgorithms(sigSchemes),
     alpn.length ? encodeAlpn(alpn) : null,
-    offersTls13 ? encodeSupportedVersions(versions) : null,
-    offersTls13 ? encodeKeyShare(keyShares.map(({ group, keyExchange }) => ({ group, keyExchange }))) : null,
+    offersTls13 ? encodeSupportedVersions(g ? [g.take(), ...versions] : versions) : null,
+    offersTls13
+      ? encodeKeyShare([
+          ...(g ? [greaseKeyShare(g.take())] : []),
+          ...keyShares.map(({ group, keyExchange }) => ({ group, keyExchange })),
+        ])
+      : null,
     offersTls13 ? encodePskKeyExchangeModes() : null,
     offersTls12 ? encodeExtendedMasterSecret() : null,
     offersTls12 ? encodeEcPointFormats() : null,
@@ -339,13 +359,36 @@ export function buildClientHello({
     if (part) offered.add((part[0] << 8) | part[1]);
   }
 
+  const typeOf = (e) => (e[0] << 8) | e[1];
+  // Order (or shuffle) the real extensions FIRST, then bracket them with GREASE. Doing it the
+  // other way round put both GREASE extensions at the end under a fixed order, because neither
+  // reserved type appears in any order list — and it put the trailing one after pre_shared_key,
+  // which RFC 8446 s4.2.11 forbids.
+  const laidReal =
+    extensionOrder === SHUFFLE_EXTENSIONS
+      ? shuffleExtensions(extensionParts.filter(Boolean), g ?? greaseSource(1), typeOf,
+          EXTENSION.pre_shared_key)
+      : orderExtensions(extensionParts, extensionOrder);
+
+  let laid = laidReal;
+  if (g) {
+    // Leading GREASE is empty, trailing carries a single zero byte — as captured from Chromium.
+    // The trailing one goes BEFORE any pre_shared_key, which must stay last of all.
+    const head = encodeRawExtension(g.take(), new Uint8Array(0));
+    const tail = encodeRawExtension(g.take(), Uint8Array.of(0));
+    const pskAt = laidReal.findIndex((e) => typeOf(e) === EXTENSION.pre_shared_key);
+    laid = pskAt === -1
+      ? [head, ...laidReal, tail]
+      : [head, ...laidReal.slice(0, pskAt), tail, ...laidReal.slice(pskAt)];
+  }
+
   const body = new Builder()
     .u16(LEGACY_VERSION)
     .push(clientRandom)
     .vector(1, sessionId)
     .vector(2, suiteBytes.build())
     .vector(1, Uint8Array.from([0])) // legacy_compression_methods: null only
-    .push(encodeExtensionBlock(orderExtensions(extensionParts, extensionOrder)))
+    .push(encodeExtensionBlock(laid))
     .build();
 
   const message = handshakeMessage(HANDSHAKE_TYPE.client_hello, body);
@@ -506,6 +549,19 @@ export function negotiateVersion(serverHello, { offeredVersions }) {
  */
 export function negotiateCipher(serverHello, { offeredCiphers, version }) {
   const suite = serverHello.cipherSuite;
+  // A GREASE value is reserved and MUST be ignored by a server (RFC 8701 s3). One that negotiates
+  // it is broken, and because we offered it the "was it offered" test below would let it through —
+  // so it is refused here, naming GREASE, rather than falling to the missing-parameters check
+  // whose message would blame this package's own offer list.
+  if (isGrease(suite)) {
+    throw new TlsUnsupportedError(
+      codes.TLS_CIPHER_UNSUPPORTED,
+      `server selected the GREASE cipher suite ${hex16(suite)}, which RFC 8701 reserves and ` +
+        'requires a server to ignore. It exists in the offer precisely to detect peers that do ' +
+        'not.',
+      { cipherSuite: suite },
+    );
+  }
   if (!offeredCiphers.includes(suite)) {
     throw new TlsUnsupportedError(
       codes.TLS_CIPHER_UNSUPPORTED,
