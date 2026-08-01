@@ -59,7 +59,7 @@ export const curl: Readonly<{
  * `applyProfile` refuses both cases with a message naming what is missing.
  */
 export const chrome: Readonly<{
-    name: "chromium (TLS layer only)";
+    name: "chrome/150";
     tls: Readonly<{
         ciphers: readonly number[];
         groups: readonly number[];
@@ -68,8 +68,11 @@ export const chrome: Readonly<{
         extensionOrder: "shuffle";
         grease: true;
     }>;
+    http2Settings: readonly number[][];
+    http2ConnectionWindow: number;
+    http2PseudoHeaderOrder: readonly string[];
+    headerOrder: readonly string[];
     headers: readonly string[][];
-    http2Settings: null;
     requires: readonly string[];
 }>;
 /** @type {Record<string, FingerprintProfile>} */

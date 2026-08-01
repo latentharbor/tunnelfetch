@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 
 import { createAead, buildNonce } from '../../src/tls/aead.js';
 import { CIPHER, MAX_PLAINTEXT, TLS12, TLS13 } from '../../src/tls/constants.js';
-import { concat, fromHex, toHex, u8, u16, utf8 } from '../../src/util/bytes.js';
+import { concat, fromHex, latin1, toHex, u8, u16, utf8 } from '../../src/util/bytes.js';
 import { codes } from '../../src/errors.js';
 import { rejectsWithCode } from '../_harness.js';
 import { RFC8448_1RTT as V } from './_vectors.js';
@@ -189,8 +189,11 @@ test('oversized plaintext and short ciphertext are rejected up front', async () 
 test('createAead validates cipher, key length, and IV length', async () => {
   const k16 = new Uint8Array(16);
   const iv12 = new Uint8Array(12);
-  await rejectsWithCode(() => createAead({ cipher: 0x1303, key: k16, iv: iv12 }),
-    codes.TLS_CIPHER_UNSUPPORTED, /0x1303/);
+  // 0x00ff, which is TLS_EMPTY_RENEGOTIATION_INFO_SCSV and never a real suite. This used to be
+  // 0x1303, but ChaCha20 has AEAD parameters now — it is refused later, for the specific reason
+  // that no implementation was injected, which is a different and more useful error.
+  await rejectsWithCode(() => createAead({ cipher: 0x00ff, key: k16, iv: iv12 }),
+    codes.TLS_CIPHER_UNSUPPORTED, /0x00ff/);
   await rejectsWithCode(() => createAead({ cipher: AES128, key: new Uint8Array(32), iv: iv12 }),
     codes.CONFIG_INVALID);
   await rejectsWithCode(() => createAead({ cipher: AES128, key: k16, iv: new Uint8Array(4) }),
@@ -274,4 +277,61 @@ test('TLS 1.3 static IV is copied, not aliased', async () => {
   const before = await aead.encrypt(0n, 23, utf8('pinned'));
   iv.fill(0); // caller scrubs its buffer; the AEAD must be unaffected
   eq(await aead.encrypt(0n, 23, utf8('pinned')), before);
+});
+
+// ChaCha20-Poly1305 is reachable only through an injected implementation. This runtime has no
+// WebCrypto ChaCha20 — feature-detected on workerd, where the only native path is node:crypto, and
+// taking it would cost the package its "nothing but the web platform" property.
+test('ChaCha20-Poly1305 is refused without an implementation, and works with one', async () => {
+  const key = new Uint8Array(32).fill(9);
+  const iv = new Uint8Array(12).fill(3);
+  const CHACHA = 0x1303;
+
+  // The refusal must name the way out. It says "no implementation supplied" rather than "unknown
+  // suite", which is the difference between a fixable configuration and an apparent dead end.
+  await assert.rejects(
+    () => createAead({ cipher: CHACHA, key, iv }),
+    (e) => e.code === 'CONFIG_INVALID' && /no implementation was supplied/.test(e.message),
+  );
+
+  // A stand-in AEAD: XOR with a keystream byte, then a trivial tag. Not cryptography — the point
+  // is that the record layer routes through whatever it is given and round-trips correctly.
+  const impl = {
+    seal: (k, n, p, aad) => {
+      const out = new Uint8Array(p.length + 16);
+      for (let i = 0; i < p.length; i++) out[i] = p[i] ^ k[i % 32] ^ n[i % 12];
+      for (let i = 0; i < 16; i++) out[p.length + i] = (aad[i % aad.length] + p.length) & 0xff;
+      return out;
+    },
+    open: (k, n, c, aad) => {
+      const len = c.length - 16;
+      for (let i = 0; i < 16; i++) {
+        if (c[len + i] !== ((aad[i % aad.length] + len) & 0xff)) return null; // authentication fails
+      }
+      const out = new Uint8Array(len);
+      for (let i = 0; i < len; i++) out[i] = c[i] ^ k[i % 32] ^ n[i % 12];
+      return out;
+    },
+  };
+
+  const aead = await createAead({ cipher: CHACHA, key, iv, impl });
+  const msg = utf8('chacha over the record layer');
+  const ct = await aead.encrypt(0n, 23, msg);
+  const header = Uint8Array.from([23, 3, 3, ct.length >> 8, ct.length & 0xff]);
+  const got = await aead.decrypt(0n, ct, header);
+  assert.equal(latin1(got.plaintext), 'chacha over the record layer');
+  assert.equal(got.type, 23);
+
+  // `open` returning null must surface as the same authentication failure the AES path throws,
+  // not as a null plaintext handed to the caller.
+  const tampered = Uint8Array.from(ct);
+  tampered[tampered.length - 1] ^= 1;
+  await assert.rejects(() => aead.decrypt(0n, tampered, header), (e) => e.code === 'TLS_RECORD');
+});
+
+test('the ChaCha20 suite is never offered by default', async () => {
+  // Having parameters for it must not put it in the offer. An offer is a claim, and without an
+  // injected implementation this package cannot honour it.
+  const { TLS13_CIPHERS } = await import('../../src/tls/constants.js');
+  assert.ok(!TLS13_CIPHERS.includes(0x1303));
 });

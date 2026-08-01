@@ -43,7 +43,11 @@ test('a profile is REFUSED when it declares what this package cannot perform', (
   }
   assert.ok(err, 'the chrome profile was accepted');
   assert.equal(err.code, 'CONFIG_INVALID');
-  for (const need of ['cipher:chacha20', 'group:x25519mlkem768', 'decoder:br', 'http2:captured']) {
+  // http2:captured is gone from the list — Chrome's h2 preface WAS captured (Chrome 150 driven at
+  // this package's own TLS server with --ignore-certificate-errors, no root CA installed anywhere).
+  // What remains is only what this package cannot yet PERFORM, which is the kind of gap that makes
+  // an offer dishonest rather than merely incomplete.
+  for (const need of ['cipher:chacha20', 'group:x25519mlkem768', 'decoder:br']) {
     assert.ok(err.message.includes(need), `the refusal does not name ${need}`);
   }
 });
@@ -52,7 +56,6 @@ test('the refusal clears once the missing pieces are injected', () => {
   const stub = () => {};
   const c = new Client({
     profile: profiles.chrome,
-    http2: false, // Chromium's h2 preface was never captured, so h2 must be off
     decoders: { br: stub, zstd: stub },
     ciphers: { chacha20: stub },
     groups: { x25519mlkem768: stub },
