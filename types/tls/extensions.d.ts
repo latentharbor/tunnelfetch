@@ -1,4 +1,11 @@
 /**
+ * An extension of an arbitrary type with an arbitrary body. Exists for GREASE (RFC 8701), whose
+ * whole point is to carry a reserved type this package assigns no meaning to.
+ * @param {number} type
+ * @param {Uint8Array} body
+ */
+export function encodeRawExtension(type: number, body: Uint8Array): Uint8Array<ArrayBufferLike>;
+/**
  * server_name (RFC 6066). Only host_name (type 0) exists in practice.
  * An IP literal must NOT be sent as SNI — RFC 6066 s3 forbids it, and servers that do virtual
  * hosting will hand back an unrelated certificate if we do, which would look like an attack.

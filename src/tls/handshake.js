@@ -243,6 +243,7 @@ export async function continueTls13(ctx) {
       // either among the modifications a second ClientHello may make, and a strict server checks.
       extensionOrder: options.extensionOrder,
       sigSchemes: options.sigSchemes,
+      grease: options.grease ?? false,
       random: hello.clientRandom,
       legacySessionId: hello.legacySessionId,
       extraExtensions: cookie ? [cookieExtension(cookie)] : [],
