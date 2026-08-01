@@ -1203,7 +1203,37 @@ export default {
         }
       }));
     }
-    if (url.searchParams.get('native')) {
+    if (url.searchParams.get('sizecmp')) {
+      // Platform fetch against this package, same real origins, same run. A size-controlled origin
+      // of our own is unusable here: Cloudflare error 1042 refuses a Worker fetching a Worker on
+      // the same account, which once made a 17-byte 404 look like a 100x win.
+      const which = url.searchParams.get('sizecmp'); // 'native' | 'pkg'
+      const target = url.searchParams.get('target');
+      const reps = Number(url.searchParams.get('reps') ?? 1);
+      markPath('sizecmp', { which, target, reps });
+      let bytes = 0, status = 0;
+      if (which === 'native') {
+        for (let i = 0; i < reps; i++) {
+          const r = await fetch(`https://${target}?i=${i}`, { cf: { cacheTtl: 0 } });
+          status = r.status;
+          bytes += (await r.arrayBuffer()).byteLength;
+        }
+      } else {
+        const client = new Client({ proxy, connect,
+          timeouts: { connectMs: 10000, handshakeMs: 15000, headersMs: 25000, idleMs: 25000 } });
+        try {
+          for (let i = 0; i < reps; i++) {
+            const r = await client.fetch(`https://${target}?i=${i}`);
+            status = r.status;
+            bytes += (await r.arrayBuffer()).byteLength;
+          }
+        } finally { await client.close(); }
+      }
+      return Response.json({ which, target, reps, status, bytes });
+    }
+    if (url.searchParams.get("native")) {
+      markPath("native", { sizes: url.searchParams.get("native") ?? null,
+                           reuse: url.searchParams.get("reuse") ?? null });
       // The platform's own fetch against the same origin and the same sizes, so the cost table has
       // something to be compared against. Not a like-for-like comparison and it must not be
       // presented as one: native fetch cannot traverse a proxy, so this measures "the cheapest

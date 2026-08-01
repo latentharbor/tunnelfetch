@@ -669,52 +669,38 @@ Fetching a size-controlled origin through a proxy, warm, medians over seven-plus
 isolate, gzip on the wire. The last column is the same numbers as a rate, which is the form worth
 carrying around:
 
-| | New connection (first request included) | Each further request, same connection |
-| --- | --- | --- |
-| 1 KB body | 6.4 ms | 1.6 ms |
-| 16 KB body | 6.5 ms | 1.7 ms |
-| 64 KB body | 6.7 ms | 1.9 ms |
-| 256 KB body | 7.4 ms | 2.6 ms |
-| 1 MB body | 10.4 ms | 5.6 ms |
-| 4 MB body | 22.4 ms | 17.6 ms |
-| **First request in a fresh isolate** | 46 ms | — |
-| **…after `warmup({ iterations: 5 })`** | 16 ms | — |
+| Body | Averaged over 5 pages | Reusing a connection | New connection |
+| --- | --- | --- | --- |
+| 1 KB | 3.2 ms | 1.7 ms | 9.2 ms |
+| 16 KB | 4.6 ms | 3.1 ms | 10.6 ms |
+| 64 KB | 8.2 ms | 6.7 ms | 14.2 ms |
+| 256 KB | 18.2 ms | 16.7 ms | 24.2 ms |
+| 1 MB | 54.8 ms | 53.3 ms | 60.8 ms |
+| 4 MB | 119.8 ms | 118.3 ms | 125.8 ms |
+| **First request in a fresh isolate** | +46 ms | — | — |
+| **…after `warmup({ iterations: 5 })`** | +16 ms | — | — |
 
-Re-measured for 1.4.0 against a size-controlled origin through a proxy, ten rounds per size, HTTP/2
-negotiated, gzip on the wire. The rows are not independent measurements — they are one model, fitted
-to the sweep and then checked back against it:
+Measured through a proxy against a size-controlled origin, eight rounds per size, HTTP/2, gzip on
+the wire. Connection and per-request terms were separated by varying the reuse count rather than
+assumed — two pages against ten gives **9.8 ms to open a connection** and **2.25 ms per further
+request**, and the body cost is what is left.
 
-> **≈ 6.4 ms to open a connection + 1.6 ms per further request + ~4 ms per MB of body**
+**These figures replace ones that were measured wrong, and the mistake is worth describing.** The
+origin they came from tiled a 150-byte HTML fragment, which gzip compressed **220:1** — so a "1 MB
+body" was four kilobytes on the wire, and every measurement taken against it priced decompression
+while erasing the per-wire-byte cost of TLS records and streaming entirely. Real pages compress
+around 4:1. The origin now tiles 256 KiB of real minified JavaScript, which lands at 2.8:1: gzip's
+window is 32 KiB, so a repeat period that large does not compress away.
 
-Each sweep request fetches five pages — one on a fresh connection and four reusing it — so the two
-terms were separated by varying the reuse count rather than assumed: two pages against ten gives
-1.63 ms per further request, and the connection term falls out of the remainder. Fitted on 1 KB and
-4 MB, the model predicts 32.9 ms for the 1 MB row against 35 measured, and 92.9 for the 4 MB row
-against 94.
+The correction is large. Body-heavy rows are **two to three times** what this table said through
+1.4.0, and no amount of care about medians or minimums would have caught it, because the numbers
+were internally consistent — they were answers to the wrong question. A second, independent
+measurement agrees: fetching a real 3.6 MB file from a CDN costs 142 ms, against 120 ms predicted
+here.
 
-The ranges are real, not imprecision: absolute CPU on this platform varies by up to ~1.5× between
-isolates and runs — the same sweep repeated lands on faster and slower machines — so the values are
-medians and the spread is what repeated same-isolate measurement actually shows.
-
-**Reuse is the lever.** Thirty 16 KB pages from one host cost about 103 ms down one connection and
-about 300 ms opening thirty. That gap is the entire argument for holding a `Client` rather than
-calling `createFetch` per request, and it widens as pages get smaller.
-
-**HTTP/2 is more expensive in every cell and cheaper in none** — 12 ms against 8 ms for one page on
-a new connection, 76 ms against 67 ms for thirty pages on one connection, changing only the offered
-ALPN against the same origin and proxy. The overhead is HPACK plus frame and stream bookkeeping,
-concentrated at connection setup: the preface, the `SETTINGS` exchange, and the first header block.
-Multiplexing, the thing HTTP/2 is *for* in a browser, buys latency a one-request-per-handler Worker
-cannot spend. Reach for it when a site refuses HTTP/1.1, and set `http2: false` on paths that do
-not need it. (These two rows came from the Workers GraphQL analytics API rather than `wrangler
-tail`, which would not survive the measurement network here; same edge CPU-time metric, quantiled
-per minute.)
-
-**The fresh-isolate rows are a ramp, not a step.** V8 tiers up per function per isolate, so the
-first executions run interpreted and the excess decays over roughly six requests: 61 ms of total
-excess above the warm floor without `warmup()`, 15 ms with it at five iterations — about 4.4 ms and
-1.1 ms per request respectively, amortised over an isolate's early life. Warming costs 10 ms of
-startup at one iteration and 22 ms at five, against a 1 s budget, and does not lower the warm floor.
+Two cautions on reading it. The 2.8:1 content is slightly *less* compressible than a typical page,
+so these are mildly conservative rather than optimistic. And CPU on this platform varies by up to
+~1.5× between isolates, so the shape matters more than any single figure.
 
 ### What the optional switches cost
 
@@ -750,26 +736,29 @@ the measurements above, with the charge split out so it is clear what is yours t
 
 | Workload | CPU/request | 10M/mo, cold | 10M/mo, warmed | 1B/mo, cold | 1B/mo, warmed |
 | --- | --- | --- | --- | --- | --- |
-| Platform `fetch` — reference; it cannot use a proxy | 0.3 ms | $5.00 | $5.00 | $307.40 | $307.40 |
-| Pooled connection, 16 KB pages | 1.7 ms | $5.61 | $5.00 | $422.65 | $356.65 |
-| Pooled connection, 1 MB pages | 5.6 ms | $6.40 | $5.74 | $501.40 | $435.40 |
-| New connection per request, 16 KB | 6.5 ms | $6.57 | $5.91 | $518.65 | $452.65 |
-| New connection per request, 1 MB | 10.4 ms | $7.36 | $6.70 | $597.40 | $531.40 |
-| New connection per request, 4 MB | 22.4 ms | $9.76 | $9.10 | $837.40 | $771.40 |
-| Chrome identity, pooled, 1 MB pages served `br` | 9.8 ms | $7.25 | $6.59 | $586.40 | $520.40 |
+| Platform `fetch`, 16 KB — reference; it cannot use a proxy | 0.3 ms | $5.00 | $5.00 | $307.40 | $307.40 |
+| Platform `fetch`, 4 MB — same reference, measured | 3.2 ms | $5.04 | $5.04 | $365.40 | $365.40 |
+| Pooled connection, 16 KB pages | 3.1 ms | $5.90 | $5.24 | $451.20 | $385.20 |
+| New connection per request, 16 KB | 10.6 ms | $7.41 | $6.75 | $602.20 | $536.20 |
+| Pooled connection, 1 MB pages | 53.3 ms | $15.94 | $15.28 | $1455.20 | $1389.20 |
+| New connection per request, 1 MB | 60.8 ms | $17.45 | $16.79 | $1606.20 | $1540.20 |
+| Pooled connection, 4 MB pages | 118.3 ms | $28.94 | $28.28 | $2755.20 | $2689.20 |
+| New connection per request, 4 MB | 125.8 ms | $30.45 | $29.79 | $2906.20 | $2840.20 |
 
-The CPU column comes from the re-measured model — 6.4 ms to open a connection, 1.6 ms per further
-request, ~4 ms per MB — rather than from six separately quoted figures. The Chrome row is the same
-model with brotli decoding substituted for gzip, which moves the body term from ~4 to ~8.25 ms/MB;
-its one-off 3 ms of WASM instantiation per isolate is real but disappears when amortised over the
-requests an isolate serves. Every row through 1.3.0 was 40–60% higher, because the model behind
-them predated connection reuse over HTTP/2 and a slower body path.
+The reference row is given at two sizes because the platform's own `fetch` is **not flat** — it
+scales at about 0.82 ms per decompressed MB, measured on a size ladder from one CDN so that only the
+size changes. Quoting it as a single 0.3 ms and comparing that against a 4 MB row was a like-for-
+unlike comparison, and it flattered this package's competition rather than this package.
+
+These dollar figures follow the corrected CPU measurements above, so the body-heavy rows are **two
+to three times** what this table said through 1.4.0. That correction is not a regression in the
+package; it is the removal of an origin whose content compressed 220:1.
 
 "Cold" carries the measured fresh-isolate ramp of +4.4 ms per request amortised; "warmed" is the
-same workload with `warmup({ iterations: 5 })`, which brings the ramp down to +1.1 ms. The saving is
-$0.66/month at ten million requests and $66/month at a billion, identical across every row because
-the ramp is a property of the isolate rather than of the request. The reference row carries no ramp
-because the platform's own `fetch` has no JavaScript protocol stack to tier up.
+same workload with `warmup({ iterations: 5 })`, which brings it to +1.1 ms. The saving is $0.66/month
+at ten million requests and $66/month at a billion, identical across every row because the ramp is a
+property of the isolate rather than of the request. The reference rows carry no ramp: the platform's
+`fetch` has no JavaScript protocol stack to tier up.
 
 #### What each Chrome-identity option costs
 
@@ -779,12 +768,12 @@ pooled 1 MB workload at a billion requests a month, warmed:
 
 | Change from the baseline | CPU/request | 1B/mo, warmed | Δ | Paid when |
 | --- | --- | --- | --- | --- |
-| baseline — gzip, AES-256-GCM, x25519 | 5.60 ms | $435.40 | — | always |
-| origin serves `br` instead of gzip | 9.85 ms | $520.40 | **+$85** | the origin chooses `br` |
-| server selects ChaCha20-Poly1305 | 8.55 ms | $494.40 | **+$59** | the server picks it over AES |
-| origin serves `zstd` instead of gzip | 8.35 ms | $490.40 | **+$55** | the origin chooses `zstd` |
-| X25519MLKEM768, 1 request per connection | 10.55 ms | $534.40 | **+$99** | every handshake |
-| X25519MLKEM768, 20 requests per connection | 5.61 ms | $435.55 | **+$0.15** | the same handshake, amortised |
+| baseline — gzip, AES-256-GCM, x25519 | 53.3 ms | $1,389 | — | always |
+| origin serves `br` instead of gzip | 57.6 ms | $1,474 | **+$85** | the origin chooses `br` |
+| server selects ChaCha20-Poly1305 | 56.3 ms | $1,448 | **+$59** | the server picks it over AES |
+| origin serves `zstd` instead of gzip | 56.1 ms | $1,444 | **+$55** | the origin chooses `zstd` |
+| X25519MLKEM768, 1 request per connection | 61.0 ms | $1,542 | **+$153** | every handshake |
+| X25519MLKEM768, 20 requests per connection | 53.3 ms | $1,390 | **+$0.15** | the same handshake, amortised |
 
 The last two rows are the same 0.15 ms of ML-KEM, and the difference between them is entirely
 connection reuse — which is the point worth taking from this table. Post-quantum key exchange is
@@ -803,20 +792,20 @@ replaces (4.89 against 1.95 ms/MB). An earlier version of this section quoted +2
 
 Four things fall out of it.
 
-**At ten million requests a month, none of this matters.** Every row lands between $5 and $10
-because the included quotas swallow it — the included CPU works out to 3.0 ms per request at that
-volume, so a pooled 16 KB workload is inside the base fee entirely once warmed, and everything else
-is within a few dollars of it.
+**At ten million requests a month, small pages are free and big ones are not.** A pooled 16 KB
+workload sits inside the base fee; a pooled 1 MB workload is $15/month. The included CPU works out
+to 3.0 ms per request at that volume, which a 16 KB page fits into and a 1 MB page does not.
 
 **At a billion, $297 of every row is the request charge**, identical across all of them and
-unchangeable by anything this package does. Only the CPU is left to optimise, and there the
-difference between reusing connections and not is $96/month on 16 KB pages — the single largest
-lever in the table, and it costs nothing but keeping a Client alive.
+unchangeable by anything this package does. Only the CPU is left, and there the largest lever is
+not connection reuse — it is body size. Reuse saves $151/month on 1 MB pages; fetching 16 KB pages
+instead of 1 MB ones saves $1,004.
 
-**Pooled and warmed, the whole userland stack costs about 16% more than the platform's own
-`fetch`** — $357 against $307 — for something the platform's `fetch` cannot do at all. It was 27%
-through 1.3.0; the gap narrowed because the cost model was re-measured over HTTP/2 with connection
-reuse, not because anything was optimised for this table.
+**Body-heavy work is where the userland stack actually costs something.** Pooled and warmed on
+16 KB pages it is 25% above the platform's own `fetch` — $385 against $307. On 1 MB pages it is
+**3.8x** — $1,389 against $365 — because every byte is decrypted, reassembled and decompressed in
+JavaScript, and the platform does all three in the runtime where none of it is billed. If your
+workload is large bodies, that ratio is the number to plan around, not the 16 KB one.
 
 That reference row is measured, not assumed, and it is not flat. Fetching real pages of different
 sizes from the same Worker, marginal cost per request on a reused connection:
