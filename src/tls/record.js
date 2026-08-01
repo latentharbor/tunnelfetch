@@ -81,8 +81,19 @@ async function withGrace(promise, ms) {
 /**
  * Keys for one direction: a TLS 1.3 traffic `secret` (key and IV derived per RFC 8446 s7.3,
  * KeyUpdate rotation possible) or raw TLS 1.2 key_block slices (no forward rotation).
- * @typedef {{ cipher: number, secret: Uint8Array }
- *   | { cipher: number, key: Uint8Array, iv: Uint8Array }} DirectionKeys
+ * Exactly one of the two shapes is valid — a 1.3 `secret`, or a 1.2 `key`+`iv` — and _makeState
+ * enforces that at runtime. It is spelled with optional members rather than as a union because the
+ * setters destructure all four names, and TypeScript cannot destructure a union member that some
+ * branch lacks; a union here emits declarations that do not type-check for a consumer.
+ * @typedef {{ cipher: number, secret?: Uint8Array, key?: Uint8Array, iv?: Uint8Array }} DirectionKeys
+ */
+
+/**
+ * One direction's live protection state. Module-level, not inside the constructor: a typedef
+ * declared in a function body is not in scope where the emitted declaration needs it.
+ * @typedef {null | { aead: import('./aead.js').Aead, seq: bigint, cipher: number,
+ *   hash: import('./keyschedule.js').ScheduleHash,
+ *   secret: Uint8Array | null }} DirectionState
  */
 
 /**
@@ -113,9 +124,6 @@ export class RecordLayer {
     this._onPostHandshake = opts.onPostHandshake ?? null;
 
     this._version = TLS13; // semantics selector; setVersion() pins it when negotiated
-    /** @typedef {null | { aead: import('./aead.js').Aead, seq: bigint, cipher: number,
-     *   hash: import('./keyschedule.js').ScheduleHash,
-     *   secret: Uint8Array | null }} DirectionState */
     /** @type {DirectionState} */
     this._send = null;
     /** @type {DirectionState} */

@@ -49,12 +49,12 @@ export class Http2Retryable extends Http2Error {
  */
 export class Http2Connection {
     /**
-     * @param {import('./frames.js').ByteDuplex | { readable: ReadableStream<Uint8Array>,
+     * @param {import('../tls/connect.js').ByteDuplex | { readable: ReadableStream<Uint8Array>,
      *   writable: WritableStream<Uint8Array> }} duplex plaintext transport (a TLS session's
      *   plaintextDuplex, or a raw socket for cleartext h2 in tests)
      * @param {Http2ConnectionOptions} [opts]
      */
-    constructor(duplex: import("./frames.js").ByteDuplex | {
+    constructor(duplex: import("../tls/connect.js").ByteDuplex | {
         readable: ReadableStream<Uint8Array>;
         writable: WritableStream<Uint8Array>;
     }, opts?: Http2ConnectionOptions);

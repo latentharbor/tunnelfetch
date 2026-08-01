@@ -9,8 +9,18 @@
 /**
  * Keys for one direction: a TLS 1.3 traffic `secret` (key and IV derived per RFC 8446 s7.3,
  * KeyUpdate rotation possible) or raw TLS 1.2 key_block slices (no forward rotation).
- * @typedef {{ cipher: number, secret: Uint8Array }
- *   | { cipher: number, key: Uint8Array, iv: Uint8Array }} DirectionKeys
+ * Exactly one of the two shapes is valid — a 1.3 `secret`, or a 1.2 `key`+`iv` — and _makeState
+ * enforces that at runtime. It is spelled with optional members rather than as a union because the
+ * setters destructure all four names, and TypeScript cannot destructure a union member that some
+ * branch lacks; a union here emits declarations that do not type-check for a consumer.
+ * @typedef {{ cipher: number, secret?: Uint8Array, key?: Uint8Array, iv?: Uint8Array }} DirectionKeys
+ */
+/**
+ * One direction's live protection state. Module-level, not inside the constructor: a typedef
+ * declared in a function body is not in scope where the emitted declaration needs it.
+ * @typedef {null | { aead: import('./aead.js').Aead, seq: bigint, cipher: number,
+ *   hash: import('./keyschedule.js').ScheduleHash,
+ *   secret: Uint8Array | null }} DirectionState
  */
 /**
  * @typedef {object} RecordLayerOptions
@@ -37,25 +47,10 @@ export class RecordLayer {
     _padding: ((type: number, length: number) => number) | null;
     _onPostHandshake: ((msg: HandshakeMessage) => void | Promise<void>) | null;
     _version: number;
-    /** @typedef {null | { aead: import('./aead.js').Aead, seq: bigint, cipher: number,
-     *   hash: import('./keyschedule.js').ScheduleHash,
-     *   secret: Uint8Array | null }} DirectionState */
     /** @type {DirectionState} */
-    _send: {
-        aead: import("./aead.js").Aead;
-        seq: bigint;
-        cipher: number;
-        hash: import("./keyschedule.js").ScheduleHash;
-        secret: Uint8Array | null;
-    } | null;
+    _send: DirectionState;
     /** @type {DirectionState} */
-    _recv: {
-        aead: import("./aead.js").Aead;
-        seq: bigint;
-        cipher: number;
-        hash: import("./keyschedule.js").ScheduleHash;
-        secret: Uint8Array | null;
-    } | null;
+    _recv: DirectionState;
     /** Handshake reassembly. Chunk list, not one growing buffer, so a peer drip-feeding a
      * message in tiny records costs O(records), not O(records^2).
      * @type {Uint8Array[]} */
@@ -323,14 +318,27 @@ export type HandshakeMessage = {
 /**
  * Keys for one direction: a TLS 1.3 traffic `secret` (key and IV derived per RFC 8446 s7.3,
  * KeyUpdate rotation possible) or raw TLS 1.2 key_block slices (no forward rotation).
+ * Exactly one of the two shapes is valid — a 1.3 `secret`, or a 1.2 `key`+`iv` — and _makeState
+ * enforces that at runtime. It is spelled with optional members rather than as a union because the
+ * setters destructure all four names, and TypeScript cannot destructure a union member that some
+ * branch lacks; a union here emits declarations that do not type-check for a consumer.
  */
 export type DirectionKeys = {
     cipher: number;
-    secret: Uint8Array;
-} | {
+    secret?: Uint8Array;
+    key?: Uint8Array;
+    iv?: Uint8Array;
+};
+/**
+ * One direction's live protection state. Module-level, not inside the constructor: a typedef
+ * declared in a function body is not in scope where the emitted declaration needs it.
+ */
+export type DirectionState = null | {
+    aead: import("./aead.js").Aead;
+    seq: bigint;
     cipher: number;
-    key: Uint8Array;
-    iv: Uint8Array;
+    hash: import("./keyschedule.js").ScheduleHash;
+    secret: Uint8Array | null;
 };
 export type RecordLayerOptions = {
     /**

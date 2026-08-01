@@ -12,7 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile, mkdtemp, rm } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join, dirname, relative } from 'node:path';
@@ -134,4 +134,22 @@ test('public entry points are not typed as any', async () => {
     /export function createFetch\(options\?: \{\}\)/,
     'createFetch must take ClientOptions, not an empty object',
   );
+});
+
+test('the shipped declarations type-check on their own', async () => {
+  // `npm run types` EMITS declarations; it never checks the thing it emitted. A consumer compiling
+  // with skipLibCheck:false does, and three broken typedefs shipped in 1.0.0 because of that gap:
+  // an import path pointing at a module that did not export the type, a union the setters
+  // destructured across, and a typedef declared inside a constructor body where the emitted
+  // declaration could not see it. The runtime was fine and every other test passed.
+  //
+  // skipLibCheck:false is the whole point — it is the setting that looks at our output.
+  const { status, stdout, stderr } = spawnSync(
+    'npx',
+    ['tsc', '--noEmit', '--skipLibCheck', 'false', '--module', 'nodenext',
+      '--moduleResolution', 'nodenext', '--target', 'es2022', '--strict', 'types/index.d.ts'],
+    { encoding: 'utf8' },
+  );
+  assert.equal(status, 0,
+    `the declarations this package publishes do not type-check:\n${stdout}${stderr}`);
 });
