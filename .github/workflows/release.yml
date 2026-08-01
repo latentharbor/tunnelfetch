@@ -1,0 +1,74 @@
+name: Release
+
+# Publishes to npm, and only when a GitHub Release is published — never on a push, never on a bare
+# tag. Publishing is irreversible (a version number can be deprecated but never reused), so the
+# trigger is something a human did on purpose rather than something a merge can cause.
+#
+# No npm token is stored. This uses npm's trusted publishing over OIDC: GitHub mints a short-lived
+# token for this specific workflow in this specific repository, and npm accepts it because the
+# package is configured to trust exactly that. A long-lived automation token in repository secrets
+# would be a credential that publishes as you, sitting somewhere for years.
+#
+# Bootstrapping, because there is a genuine catch-22: trusted publishing is configured per package
+# on npmjs.com, and a package that does not exist yet has no settings page. So the FIRST publish has
+# to be done by hand — `npm publish --access public` — after which npmjs.com → the package →
+# Settings → Trusted Publisher → GitHub Actions, pointing at this repository and `release.yml`.
+# Every publish after that runs here.
+#
+# Requires npm 11.5 or later for OIDC, which is why the npm version is asserted rather than assumed.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # lets GitHub mint the OIDC token npm exchanges for publish rights
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm ci
+
+      # The version in package.json is what actually gets published; the tag is just a label. If
+      # they disagree, someone is about to publish something other than what the release says, and
+      # the only safe thing is to stop. npm would happily publish 1.0.0 under a v1.0.1 release.
+      - name: the release tag and package.json agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "release tag is $GITHUB_REF_NAME (version $tag) but package.json says $pkg"
+            exit 1
+          fi
+          echo "publishing $pkg"
+
+      - name: npm is new enough for OIDC
+        run: |
+          have=$(npm --version)
+          node -e 'const [a,b]=[process.argv[1],"11.5.0"].map(v=>v.split(".").map(Number));
+            const lt=a[0]<b[0]||(a[0]===b[0]&&a[1]<b[1]);
+            if (lt) { console.error(`npm ${process.argv[1]} is too old for trusted publishing; need 11.5+`); process.exit(1); }' "$have"
+          echo "npm $have"
+
+      # The checked-in declarations are part of the published artifact, so a stale one ships to
+      # consumers as types describing code that no longer exists.
+      - run: npm run types
+      - name: generated declarations are current
+        run: git diff --exit-code types/
+
+      # Only the offline suite gates a release. The live suites depend on third-party servers and
+      # proxies, and a release must not be blocked because someone else's site is having a bad day —
+      # that is what the scheduled capability-drift workflow is for.
+      - run: npm test
+
+      # --provenance links the published tarball to this commit and this workflow run,
+      # cryptographically, so a consumer can verify where it came from.
+      - run: npm publish --provenance --access public
