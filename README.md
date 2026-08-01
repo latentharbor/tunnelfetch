@@ -278,6 +278,32 @@ it saves do not pay it back — see [What this cannot do](#what-this-cannot-do-a
 are validated as HTTP tokens, a decoder that throws fails the body closed rather than truncating it,
 and an unregistered coding is still refused.
 
+### The Chrome identity, in one import
+
+```js
+import { Client } from 'tunnelfetch';
+import { chrome } from 'tunnelfetch/profile/chrome';
+
+const client = new Client({ profile: chrome, connect, proxy, decoders: { br, zstd } });
+```
+
+The subpath carries the two primitives this runtime has no native path for — ML-KEM-768 for the
+`X25519MLKEM768` key exchange and ChaCha20-Poly1305 for the record layer, both compiled to
+freestanding WASM and both with known-answer tests in this repository. **Importing it is the
+opt-in:** a bundler pulls them in only for code on this path, so the default identity carries none
+of it.
+
+`br` and `zstd` stay yours. They are not cryptography and there is no single right implementation,
+so the profile keeps refusing until you supply them — a Chrome that advertises `br` and cannot read
+it is worse than one that says so.
+
+Verified end to end, not merely constructed:
+
+| Origin | | TLS | Group | HTTP |
+|---|---|---|---|---|
+| `blog.cloudflare.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
+| `www.shopify.com` | 200 | 1.3 | `0x11ec` X25519MLKEM768 | h2 |
+
 ### HTTP/2 — access, not speed
 
 The client offers `h2` and `http/1.1` in ALPN by default and speaks whichever the server selects.
@@ -619,6 +645,31 @@ first executions run interpreted and the excess decays over roughly six requests
 excess above the warm floor without `warmup()`, 15 ms with it at five iterations — about 4.4 ms and
 1.1 ms per request respectively, amortised over an isolate's early life. Warming costs 10 ms of
 startup at one iteration and 22 ms at five, against a 1 s budget, and does not lower the warm floor.
+
+### What the optional switches cost
+
+Everything above is the default identity: curl's fingerprint, gzip and deflate, no post-quantum, no
+GREASE. Each switch below is off unless asked for, and the table is what asking costs. Measured on
+the edge the same way as the rest — differencing two work counts, minimum of samples.
+
+| Switch | Cost | Paid |
+|---|---|---|
+| `grease: true` | not measurable | a handful of extra bytes in one hello |
+| `tls.extensionOrder: 'shuffle'` | not measurable | shuffling ~11 items, once per handshake |
+| `headerOrder` | not measurable — the ordered list is *faster* than the platform `Headers` (1.6 µs against 3.8 µs) | per request |
+| `groups: { x25519mlkem768 }` | **+0.15 ms** with the bundled WASM, **+1.35 ms** with a pure-JS ML-KEM | per **connection**, not per request — amortised across every request that reuses it |
+| `ciphers: { chacha20 }` | **+2.0 ms/MB**, and only if the server *selects* it | per byte. Servers with AES hardware generally prefer AES-GCM, so the usual cost is zero and the offer is what matters |
+| `decoders: { br }` | **+4.4 ms/MB** | per byte, whenever an origin serves brotli. Harder compression is worse, not better: quality 11 is 16% smaller on the wire and 46% dearer to decode |
+| `profile: chrome` | the sum of the three above | |
+
+Two defaults moved in 1.4.0 and neither is visible in the table above them: matching curl's cipher
+order means AES-256-GCM is negotiated where AES-128-GCM used to be, measured at **+4%** per MB
+(1.50 against 1.45 ms/MB — hardware AES makes the extra rounds cheap), and the ordered header list
+replaced the platform `Headers`, which is slightly *cheaper*. Both are inside the ±1.5× spread the
+figures above already carry.
+
+Bundle: importing `tunnelfetch/profile/chrome` adds **~22 KB gzipped** for the two WASM primitives.
+Nothing else imports them, so a caller on the default identity carries none of it.
 
 ### What that costs in dollars
 
