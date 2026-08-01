@@ -51,7 +51,7 @@ jobs:
       PROBE_NAME: tf-ci-probe-${{ github.run_id }}-${{ github.run_attempt }}
       LIVE_NAME: tf-ci-live-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -130,7 +130,7 @@ jobs:
     # capability change, and vice versa. Both must pass; neither may skip.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -160,7 +160,7 @@ jobs:
     # and the first thing to do with one is pin it into a unit test with the base64 case.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
