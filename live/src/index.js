@@ -20,6 +20,7 @@ import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
 import { RAW_BYTES, BR, BR11, GZ, ZSTD } from './codec-fixture.js';
 import { gunzipSync } from 'fflate';
 import { zstd as zstdFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/zstd-dec.wasm.js';
+import { chacha20poly1305 as chachaWasm } from '../../src/profile/vendor/chacha20poly1305.js';
 import { br as brotliFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/brotli-dec.wasm.js';
 import brotliJs from 'brotli/decompress.js';
 import { ungzip as pakoUngzip } from 'pako';
@@ -955,6 +956,27 @@ async function cryptoBench(op, n, params = null) {
     // Asserting the output size means a decoder that silently produced nothing cannot look fast.
     if (sink !== RAW_BYTES * n) throw new Error(`decoded ${sink}, expected ${RAW_BYTES * n}`);
     return { op, n, bytes: sink, perDecode: RAW_BYTES };
+  }
+
+  if (op === 'aead-wasm-chacha' || op === 'aead-webcrypto-aes') {
+    // The AEAD the package actually ships for ChaCha20 — the bundled WASM, not node:crypto — against
+    // the WebCrypto AES-256 it would replace. Same 16 KiB records, same run.
+    const RECORD = 16384;
+    const records = Math.max(1, Math.round((n * 1048576) / RECORD));
+    const plain = new Uint8Array(RECORD);
+    const key = new Uint8Array(32).fill(7);
+    const iv = new Uint8Array(12);
+    if (op === 'aead-wasm-chacha') {
+      const aad = new Uint8Array(5);
+      for (let i = 0; i < records; i++) { iv[11] = i & 0xff; sink += chachaWasm.seal(key, iv, plain, aad).length; }
+    } else {
+      const k = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
+      for (let i = 0; i < records; i++) {
+        iv[11] = i & 0xff;
+        sink += (await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, k, plain)).byteLength;
+      }
+    }
+    return { op, n, records, bytes: sink };
   }
 
   if (op === 'aes128' || op === 'aes256') {

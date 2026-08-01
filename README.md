@@ -728,7 +728,7 @@ the edge the same way as the rest — differencing two work counts, minimum of s
 | `tls.extensionOrder: 'shuffle'` | not measurable | shuffling ~11 items, once per handshake |
 | `headerOrder` | not measurable — the ordered list is *faster* than the platform `Headers` (1.6 µs against 3.8 µs) | per request |
 | `groups: { x25519mlkem768 }` | **+0.15 ms** with the bundled WASM, **+1.35 ms** with a pure-JS ML-KEM | per **connection**, not per request — amortised across every request that reuses it |
-| `ciphers: { chacha20 }` | **+2.0 ms/MB**, and only if the server *selects* it | per byte. Servers with AES hardware generally prefer AES-GCM, so the usual cost is zero and the offer is what matters |
+| `ciphers: { chacha20 }` | **+2.95 ms/MB** (bundled WASM AEAD 4.89 against AES-GCM 1.95), and only if the server *selects* it | per byte. Servers with AES hardware generally prefer AES-GCM, so the usual cost is zero and the offer is what matters |
 | `decoders: { br }` | **+4.2 ms/MB** over the native gzip path (7.0 against 2.75) | per byte, whenever an origin serves brotli |
 | `decoders: { zstd }` | **+2.8 ms/MB** (5.5 against 2.75) | per byte, whenever an origin serves zstd |
 | `profile: chrome` via `tunnelfetch/profile/chrome` | **+3 ms once per isolate** for four WASM modules, then the per-byte rows above as origins use them | |
@@ -770,6 +770,36 @@ same workload with `warmup({ iterations: 5 })`, which brings the ramp down to +1
 $0.66/month at ten million requests and $66/month at a billion, identical across every row because
 the ramp is a property of the isolate rather than of the request. The reference row carries no ramp
 because the platform's own `fetch` has no JavaScript protocol stack to tier up.
+
+#### What each Chrome-identity option costs
+
+The rows above are the default identity: gzip on the wire, AES-256-GCM, x25519. The Chrome row
+bundles every change together, which is not much use for deciding. Priced one at a time against a
+pooled 1 MB workload at a billion requests a month, warmed:
+
+| Change from the baseline | CPU/request | 1B/mo, warmed | Δ | Paid when |
+| --- | --- | --- | --- | --- |
+| baseline — gzip, AES-256-GCM, x25519 | 5.60 ms | $435.40 | — | always |
+| origin serves `br` instead of gzip | 9.85 ms | $520.40 | **+$85** | the origin chooses `br` |
+| server selects ChaCha20-Poly1305 | 8.55 ms | $494.40 | **+$59** | the server picks it over AES |
+| origin serves `zstd` instead of gzip | 8.35 ms | $490.40 | **+$55** | the origin chooses `zstd` |
+| X25519MLKEM768, 1 request per connection | 10.55 ms | $534.40 | **+$99** | every handshake |
+| X25519MLKEM768, 20 requests per connection | 5.61 ms | $435.55 | **+$0.15** | the same handshake, amortised |
+
+The last two rows are the same 0.15 ms of ML-KEM, and the difference between them is entirely
+connection reuse — which is the point worth taking from this table. Post-quantum key exchange is
+the cheapest thing here if you keep a `Client` alive and the most expensive if you do not, because
+it is per **handshake** while everything else is per byte.
+
+Three of the five are also **conditional and not yours to decide**. `br` and `zstd` cost nothing
+until an origin chooses to serve them, and ChaCha20 costs nothing until a server prefers it over
+AES-GCM — which servers with AES hardware generally do not. Offering them is what buys the
+fingerprint; paying for them happens only when the other end takes you up on it.
+
+The ChaCha20 figure is the **bundled WASM** AEAD measured against the WebCrypto AES-256-GCM it
+replaces (4.89 against 1.95 ms/MB). An earlier version of this section quoted +2.0 ms/MB, which was
+`node:crypto`'s ChaCha20 — a path this package does not use, because taking it would require
+`nodejs_compat`.
 
 Four things fall out of it.
 
