@@ -1037,6 +1037,7 @@ async function cryptoBench(op, n, params = null) {
     const cases = {
       truncated: fix.gz.subarray(0, fix.gz.byteLength - 8), // drop CRC32+ISIZE trailer
       garbage: enc2.encode('this is definitely not gzip at all'),
+      empty: new Uint8Array(0), // zero-byte body: browsers/decodeBody yield empty, not an error
       full: fix.gz,
     };
     const out = {};
@@ -1045,11 +1046,19 @@ async function cryptoBench(op, n, params = null) {
         const got = (await new Response(
           new Response(wire.slice()).body.pipeThrough(new DecompressionStream('gzip')),
         ).arrayBuffer()).byteLength;
+        // For `empty`, NO error means native pipe yields empty — the only case where a native
+        // collect could skip the head-read; an error means the empty-body check (and its async
+        // return, and thus the per-chunk wrapper) is structurally required.
         out[name] = { errored: false, bytes: got,
-          complete: name === 'full' ? got === fix.text.byteLength : null,
-          verdict: name === 'full' ? 'ok' : 'FAILS OPEN (yielded a partial body silently)' };
+          complete: name === 'full' ? got === fix.text.byteLength : name === 'empty' ? got === 0 : null,
+          verdict: name === 'full' ? 'ok'
+            : name === 'empty' ? (got === 0 ? 'yields empty -> native could skip head-read'
+                                            : 'unexpected non-empty')
+            : 'FAILS OPEN (yielded a partial body silently)' };
       } catch (e) {
-        out[name] = { errored: true, error: e?.constructor?.name ?? String(e), verdict: 'fails closed' };
+        out[name] = { errored: true, error: e?.constructor?.name ?? String(e),
+          verdict: name === 'empty' ? 'errors on empty -> head-read + async return REQUIRED'
+                                    : 'fails closed' };
       }
     }
     return { op, cases: out };
