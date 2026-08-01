@@ -38,7 +38,7 @@ import {
 import { TicketStore } from '../../src/tls/tickets.js';
 import { poolKey } from '../../src/pool.js';
 import { Client } from '../../src/client.js';
-import { CIPHER, EXTENSION, GROUP, SIG_SCHEME, TLS12 } from '../../src/tls/constants.js';
+import { CIPHER, EXTENSION, GROUP, SIG_SCHEME, TLS12, TLS13_CIPHERS, CIPHER_PARAMS } from '../../src/tls/constants.js';
 import { codes } from '../../src/errors.js';
 import { Builder, Cursor } from '../../src/tls/wire.js';
 import { concat, latin1, toHex, u16, u32, utf8 } from '../../src/util/bytes.js';
@@ -274,10 +274,13 @@ test('a captured ticket resumes the next connection: no certificate, no verifyPe
   assert.equal(latin1(alpha.identity), 'ticket-alpha');
   assert.equal(alpha.lifetimeSec, 3600);
   assert.equal(alpha.ageAdd, 0x01020304);
-  assert.equal(alpha.hash, 'SHA-256');
-  assert.equal(alpha.cipherSuite, AES128);
+  // Both derived from the negotiated suite rather than pinned: the default offer leads with
+  // AES-256-GCM (SHA-384) since the cipher order was matched to curl, and a ticket's PSK is one
+  // hash length. Hardcoding either made this a test of the default rather than of resumption.
+  assert.equal(alpha.cipherSuite, TLS13_CIPHERS[0]);
+  assert.equal(alpha.hash, CIPHER_PARAMS[TLS13_CIPHERS[0]].hash);
   assert.equal(alpha.maxEarlyDataSize, null);
-  assert.equal(alpha.psk.byteLength, 32);
+  assert.equal(alpha.psk.byteLength, CIPHER_PARAMS[TLS13_CIPHERS[0]].hashLen);
   assert.equal(alpha.peer.stub, true, 'the validated peer rides with the ticket');
   assert.notEqual(toHex(alpha.psk), toHex(beta.psk), 'each nonce mints a distinct PSK');
 
@@ -394,7 +397,9 @@ test('accepting the PSK under a suite of the wrong hash is refused', async () =>
   const sessionCache = new Map();
   const offer = await establishOffer(identity, sessionCache);
   const { a, b } = duplexPair();
-  startServer(b, identity, { sessionCache, resumeCipher: AES256 });
+  // A suite whose HASH differs from the one the ticket was issued under. AES-128 is SHA-256 and
+  // AES-256 is SHA-384; the default offer leads with AES-256 now, so the mismatching one is AES-128.
+  startServer(b, identity, { sessionCache, resumeCipher: AES128 });
   const err = await rejectsWithCode(
     () => handshakeTls13({
       transport: a, hostname: HOST, verifyPeer: acceptStub(identity), options: { psk: offer },
@@ -458,7 +463,7 @@ test('an HRR that pins a different-hash suite drops the PSK from ClientHello2', 
   const offer = await establishOffer(identity, sessionCache); // minted under SHA-256
   const second = await connect13({
     identity,
-    server: { sessionCache, cipher: AES256, hrr: { group: GROUP.secp256r1 } },
+    server: { sessionCache, cipher: AES128, hrr: { group: GROUP.secp256r1 } },
     options: { psk: offer },
   });
   assert.equal(second.tls.info.resumed, false);

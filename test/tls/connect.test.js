@@ -192,7 +192,7 @@ test('offer both, a 1.3 server answers: full 1.3 handshake and data on the one c
   const state = await srv.done;
 
   assert.equal(tls.info.version, TLS13);
-  assert.equal(tls.info.cipherSuite, CIPHER.TLS_AES_128_GCM_SHA256);
+  assert.equal(tls.info.cipherSuite, TLS13_CIPHERS[0]); // the default offer's first choice
   assert.equal(tls.info.alpnProtocol, 'http/1.1');
   assert.equal(tls.info.hostname, HOST);
   assert.deepEqual(state.clientHellos[0].versions, [TLS13, TLS12],

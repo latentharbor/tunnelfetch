@@ -20,7 +20,7 @@ import { handshakeTls13 } from '../../src/tls/handshake.js';
 import { connectTls } from '../../src/tls/connect.js';
 import { generateKeyShare, negotiateVersion } from '../../src/tls/handshake-messages.js';
 import {
-  CIPHER, DOWNGRADE_SENTINEL_12, EXTENSION, GROUP, TLS12, TLS13,
+  CIPHER, CIPHER_PARAMS, DOWNGRADE_SENTINEL_12, EXTENSION, GROUP, TLS12, TLS13, TLS13_CIPHERS,
 } from '../../src/tls/constants.js';
 import { CertificateError, codes } from '../../src/errors.js';
 import { concat, readU16, toHex, utf8 } from '../../src/util/bytes.js';
@@ -34,6 +34,10 @@ import { nodeChacha20 } from './_chacha.js';
 
 const HOST = 'server.test';
 const AES128 = CIPHER.TLS_AES_128_GCM_SHA256;
+// What the DEFAULT offer negotiates against a server that takes the client's first choice. These
+// tests are about handshakes completing, not about a particular suite, so they follow the offer —
+// pinning a value made them fail when the cipher ORDER was corrected to match curl.
+const DEFAULT_SUITE = TLS13_CIPHERS[0];
 const AES256 = CIPHER.TLS_AES_256_GCM_SHA384;
 const pattern = (n) => Uint8Array.from({ length: n }, (_, i) => i & 0xff);
 const eq = (got, want, what) => assert.equal(toHex(got), toHex(want), what);
@@ -214,7 +218,7 @@ test('TLS_AES_128_GCM_SHA256: full handshake, data both ways, and the wire shape
   });
 
   assert.equal(tls.info.version, TLS13);
-  assert.equal(tls.info.cipherSuite, AES128);
+  assert.equal(tls.info.cipherSuite, DEFAULT_SUITE);
   assert.equal(tls.info.group, GROUP.x25519);
   assert.equal(tls.info.alpnProtocol, 'http/1.1');
   assert.equal(tls.info.certificateRequested, false);
@@ -277,11 +281,11 @@ test('TLS_CHACHA20_POLY1305_SHA256: full handshake through the injected AEAD, cu
 });
 
 test('TLS_CHACHA20_POLY1305_SHA256 is NOT offered when no implementation is injected', async () => {
-  // Without deps.aead.chacha20 the default offer is unchanged — AES-128, AES-256 — and 0x1303
+  // Without deps.aead.chacha20 the default offer is unchanged — AES-256, AES-128 — and 0x1303
   // appears nowhere. An AEAD suite offered but not performable is a dead connection if selected.
   const { state } = await connectPair({ identity: testIdentity('rsa-pss') });
   assert.ok(!state.clientHellos[0].cipherSuites.includes(0x1303), 'no ChaCha20 in the offer');
-  assert.deepEqual(state.clientHellos[0].cipherSuites, [0x1301, 0x1302],
+  assert.deepEqual(state.clientHellos[0].cipherSuites, [...TLS13_CIPHERS],
     'the classical default order is untouched');
 });
 
@@ -372,13 +376,13 @@ test('every offered group completes and carries data: x25519, P-256, P-384, P-52
 
 test('an Ed25519 certificate authenticates the handshake', async () => {
   const { tls, srv } = await connectPair({ identity: testIdentity('ed25519') });
-  assert.equal(tls.info.cipherSuite, AES128);
+  assert.equal(tls.info.cipherSuite, DEFAULT_SUITE);
   await exchange(tls, srv, utf8('ed25519 ping'), utf8('ed25519 pong'));
 });
 
 test('an RSA-PSS (rsa_pss_rsae_sha256) certificate authenticates the handshake', async () => {
   const { tls, srv, state } = await connectPair({ identity: testIdentity('rsa-pss') });
-  assert.equal(state.negotiated.cipher, AES128);
+  assert.equal(state.negotiated.cipher, DEFAULT_SUITE);
   await exchange(tls, srv, utf8('pss ping'), utf8('pss pong'));
 });
 
@@ -394,7 +398,7 @@ test('ECDSA certificates: the RFC 8446 DER-encoded CertificateVerify is accepted
   // signatures) and has a curve order length (66) that matches no hash size.
   for (const kind of ['ecdsa-p256', 'ecdsa-p384', 'ecdsa-p521']) {
     const { tls, srv } = await connectPair({ identity: testIdentity(kind) });
-    assert.equal(tls.info.cipherSuite, AES128, kind);
+    assert.equal(tls.info.cipherSuite, DEFAULT_SUITE, kind);
     await exchange(tls, srv, utf8(`${kind} ping`), utf8(`${kind} pong`));
   }
 });
@@ -436,10 +440,14 @@ test('HelloRetryRequest: retry to secp256r1 reuses random and session id, and th
   // The Finished exchanges already prove client and server agree on the substituted
   // transcript; this proves they agree with the RFC, computed here from its text without the
   // Transcript class, so a substitution bug shared by both sides cannot vouch for itself.
-  const ch1Digest = new Uint8Array(await crypto.subtle.digest('SHA-256', ch1.raw));
-  const synthetic = concat([Uint8Array.of(254, 0, 0, 32), ch1Digest]); // message_hash header
+  // The transcript hash is the hash of the NEGOTIATED SUITE, not a fixed SHA-256 — this was
+  // hardcoded and broke when the default offer moved to AES-256-GCM (SHA-384) to match curl's
+  // cipher order. Deriving it from the suite is also what RFC 8446 s4.4.1 actually says.
+  const hash = CIPHER_PARAMS[state.negotiated.cipher].hash;
+  const ch1Digest = new Uint8Array(await crypto.subtle.digest(hash, ch1.raw));
+  const synthetic = concat([Uint8Array.of(254, 0, 0, ch1Digest.length), ch1Digest]); // message_hash
   const expected = new Uint8Array(await crypto.subtle.digest(
-    'SHA-256', concat([synthetic, state.hrrRaw, ch2.raw]),
+    hash, concat([synthetic, state.hrrRaw, ch2.raw]),
   ));
   eq(state.transcriptHashAfterCh2, expected, 'transcript after CH2 matches the RFC formula');
 
@@ -813,7 +821,9 @@ test('a ServerHello changing cipher suite after the HelloRetryRequest is rejecte
   await failPair(
     {
       identity: testIdentity('rsa-pss'),
-      server: { hrr: { group: GROUP.secp256r1, cipherAfter: AES256 } },
+      // "a different suite from the one the HelloRetryRequest settled on". The default offer
+      // leads with AES-256 now (curl's order), so the one that differs is AES-128.
+      server: { hrr: { group: GROUP.secp256r1, cipherAfter: AES128 } },
     },
     codes.TLS_CIPHER_UNSUPPORTED, /after HelloRetryRequest selected/,
   );

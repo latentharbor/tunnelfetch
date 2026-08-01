@@ -73,7 +73,13 @@ test('the userland stack negotiates TLS 1.3 with an AEAD suite and an offered AL
   // Pinned rather than merely recorded: a silent fallback to something weaker is exactly the
   // failure this package refuses to allow, and it would still return 200.
   assert.equal(r.tls.version, '0x304', 'must be TLS 1.3');
-  assert.equal(r.tls.cipherSuite, '0x1301', 'must be TLS_AES_128_GCM_SHA256');
+  // An AEAD suite from the offer, not one particular one — which is what this test is named for.
+  // Pinning 0x1301 made it a test of the offer ORDER: correcting that order to curl's (AES-256
+  // first) changed what real servers pick, and this is where that showed up. Worth recording that
+  // it showed up at all — it means servers here do follow client preference, so the change is not
+  // only cosmetic.
+  assert.ok(['0x1301', '0x1302'].includes(r.tls.cipherSuite),
+    `must be an offered AEAD suite, got ${r.tls.cipherSuite}`);
   assert.equal(r.tls.group, '0x1d', 'must be X25519');
   // The client offers h2 and http/1.1; the server's pick must be one of exactly those, and the
   // reported protocol must agree with it — a fabricated ALPN or a fallback we did not offer both
