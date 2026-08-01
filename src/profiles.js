@@ -69,7 +69,7 @@ export const curl = Object.freeze({
  * `applyProfile` refuses both cases with a message naming what is missing.
  */
 export const chrome = Object.freeze({
-  name: 'chromium (TLS layer only)',
+  name: 'chrome/150',
   tls: Object.freeze({
     // 16 suites, GREASE excluded — it is added by the grease option, not carried in the list.
     ciphers: Object.freeze([
@@ -83,14 +83,31 @@ export const chrome = Object.freeze({
     extensionOrder: SHUFFLE_EXTENSIONS,
     grease: true,
   }),
+  // Captured off the wire the same way as the TLS layer: Chrome 150 driven at this package's own
+  // TLS test server with --ignore-certificate-errors, so no root CA was installed anywhere. The
+  // ClientHello precedes certificate validation and ALPN is negotiated inside the handshake, so
+  // both fingerprints are exactly what the browser normally sends.
+  http2Settings: Object.freeze([[1, 65536], [2, 0], [4, 6291456], [6, 262144]]),
+  http2ConnectionWindow: 15663105 + 65535,
+  // m,a,s,p — NOT curl's m,s,a,p. Measured, and a difference that would have been easy to miss.
+  http2PseudoHeaderOrder: Object.freeze([':method', ':authority', ':scheme', ':path']),
+  headerOrder: Object.freeze([
+    'host',
+    'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+    'upgrade-insecure-requests', 'user-agent', 'accept',
+    'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-user', 'sec-fetch-dest',
+    'accept-encoding', 'accept-language', 'priority',
+    '*',
+    'content-length', 'content-type',
+  ]),
   headers: Object.freeze([['Accept-Encoding', 'gzip, deflate, br, zstd']]),
-  http2Settings: null, // not captured — see above
+  // http2:captured is gone — it is captured now. What remains is what this package cannot yet
+  // PERFORM, which is a different kind of gap and the only kind that can make an offer dishonest.
   requires: Object.freeze([
     'cipher:chacha20',
     'group:x25519mlkem768',
     'decoder:br',
     'decoder:zstd',
-    'http2:captured',
   ]),
 });
 

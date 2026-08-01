@@ -41,6 +41,7 @@ import {
   EXTENSION,
   HANDSHAKE_TYPE,
   HELLO_RETRY_REQUEST_RANDOM,
+  SUPPORTED_GROUPS,
   LEGACY_VERSION,
   TLS13,
   TLS13_CIPHERS,
@@ -478,7 +479,12 @@ async function drive(record, identity, opts, state, kill) {
   // --- ServerHello -------------------------------------------------------------------------
   const group = opts.hrr
     ? opts.hrr.group
-    : (opts.shareGroup ?? opts.group ?? ch.keyShares[0]?.group);
+    // The first key_share this server can actually do, not simply the first one offered. A real
+    // Chrome ClientHello leads with a GREASE entry (RFC 8701 requires a server to ignore it —
+    // picking it is exactly what GREASE exists to catch, and it caught this server) followed by
+    // X25519MLKEM768, and only then x25519.
+    : (opts.shareGroup ?? opts.group ??
+       ch.keyShares.find((k) => SUPPORTED_GROUPS.includes(k.group))?.group);
   if (group === undefined) throw new Error('test server: client offered no key share at all');
   const serverShare = opts.serverKeyPair ?? (await generateKeyShare(group, {}));
 

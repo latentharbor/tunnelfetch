@@ -25,6 +25,12 @@ export function buildNonce(iv: Uint8Array, seq: number | bigint): Uint8Array;
  * @property {Uint8Array} key
  * @property {Uint8Array} iv the 12-byte static IV for TLS 1.3, the 4-byte implicit salt for
  *   TLS 1.2
+ * @property {{seal: (k: Uint8Array, n: Uint8Array, p: Uint8Array, aad: Uint8Array) => Uint8Array,
+ *             open: (k: Uint8Array, n: Uint8Array, c: Uint8Array, aad: Uint8Array) => Uint8Array | null}}
+ *   [impl] caller-supplied AEAD, required for ChaCha20-Poly1305 and unused otherwise. This runtime
+ *   has no WebCrypto ChaCha20 — its only native path is node:crypto, and taking it would cost the
+ *   package its "web platform only" property — so the implementation is injected. `open` returns
+ *   null when authentication fails.
  */
 /**
  * Create record protection for one direction under one key. A new key (handshake -> application,
@@ -33,7 +39,7 @@ export function buildNonce(iv: Uint8Array, seq: number | bigint): Uint8Array;
  * @param {AeadOptions} opts
  * @returns {Promise<Aead>}
  */
-export function createAead({ version, cipher, key, iv }: AeadOptions): Promise<Aead>;
+export function createAead({ version, cipher, key, iv, impl }: AeadOptions): Promise<Aead>;
 /**
  * Record protection for one direction under one key. `encrypt` returns the encrypted record
  * body ready for framing; `decrypt` either returns authenticated plaintext (with the inner
@@ -64,4 +70,14 @@ export type AeadOptions = {
      * TLS 1.2
      */
     iv: Uint8Array;
+    /**
+     * caller-supplied AEAD, required for ChaCha20-Poly1305 and unused otherwise. This runtime
+     * has no WebCrypto ChaCha20 — its only native path is node:crypto, and taking it would cost the
+     * package its "web platform only" property — so the implementation is injected. `open` returns
+     * null when authentication fails.
+     */
+    impl?: {
+        seal: (k: Uint8Array, n: Uint8Array, p: Uint8Array, aad: Uint8Array) => Uint8Array;
+        open: (k: Uint8Array, n: Uint8Array, c: Uint8Array, aad: Uint8Array) => Uint8Array | null;
+    } | undefined;
 };

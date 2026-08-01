@@ -21,6 +21,7 @@
 import { TlsError, TlsUnsupportedError, codes, hex16 } from '../errors.js';
 import { concat, u8, u16 } from '../util/bytes.js';
 import {
+  CIPHER,
   CIPHER_PARAMS, CIPHER_NAME, MAX_PLAINTEXT, LEGACY_VERSION, TLS12, TLS13,
 } from './constants.js';
 
@@ -88,6 +89,12 @@ function seq64(seq) {
  * @property {Uint8Array} key
  * @property {Uint8Array} iv the 12-byte static IV for TLS 1.3, the 4-byte implicit salt for
  *   TLS 1.2
+ * @property {{seal: (k: Uint8Array, n: Uint8Array, p: Uint8Array, aad: Uint8Array) => Uint8Array,
+ *             open: (k: Uint8Array, n: Uint8Array, c: Uint8Array, aad: Uint8Array) => Uint8Array | null}}
+ *   [impl] caller-supplied AEAD, required for ChaCha20-Poly1305 and unused otherwise. This runtime
+ *   has no WebCrypto ChaCha20 — its only native path is node:crypto, and taking it would cost the
+ *   package its "web platform only" property — so the implementation is injected. `open` returns
+ *   null when authentication fails.
  */
 
 /**
@@ -97,7 +104,7 @@ function seq64(seq) {
  * @param {AeadOptions} opts
  * @returns {Promise<Aead>}
  */
-export async function createAead({ version = TLS13, cipher, key, iv }) {
+export async function createAead({ version = TLS13, cipher, key, iv, impl = null }) {
   const params = CIPHER_PARAMS[cipher];
   if (!params || params.hash === undefined) {
     throw new TlsUnsupportedError(codes.TLS_CIPHER_UNSUPPORTED,
@@ -119,8 +126,43 @@ export async function createAead({ version = TLS13, cipher, key, iv }) {
       `iv is ${iv.byteLength} bytes; ${CIPHER_NAME[cipher]} needs ${wantIv} for this version`,
       { cipher, version });
   }
-  const gcmKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false,
-    ['encrypt', 'decrypt']);
+  // ChaCha20-Poly1305 has no WebCrypto on this runtime — feature-detected on workerd, where the
+  // only native path is node:crypto and taking it would cost the package its "web platform only"
+  // property. So the implementation is INJECTED: `impl` supplies seal/open, and without one the
+  // suite is never offered, so a ChaCha20 record can only be reached by a server negotiating a
+  // suite that was not in the offer, which negotiateCipher already refuses.
+  const isChaCha = cipher === CIPHER.TLS_CHACHA20_POLY1305_SHA256;
+  if (isChaCha && (typeof impl?.seal !== 'function' || typeof impl?.open !== 'function')) {
+    throw new TlsError(
+      codes.CONFIG_INVALID,
+      'ChaCha20-Poly1305 was negotiated but no implementation was supplied; pass one as ' +
+        '`ciphers: { chacha20: impl }` with seal(key, nonce, plaintext, aad) and open(...)',
+      { cipher },
+    );
+  }
+  const gcmKey = isChaCha
+    ? null
+    : await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const chachaKey = isChaCha ? key.slice() : null;
+  /** One seal, whichever cipher was negotiated. Returns ciphertext||tag. */
+  const seal = async (nonce, aad, plain) =>
+    isChaCha
+      ? impl.seal(chachaKey, nonce, plain, aad)
+      : new Uint8Array(
+          await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: tagLen * 8 },
+            gcmKey, plain));
+  /** One open. Returns null on authentication failure, which every caller turns into tagFailure. */
+  const open = async (nonce, aad, ct) => {
+    if (isChaCha) return impl.open(chachaKey, nonce, ct, aad);
+    try {
+      return new Uint8Array(
+        await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: tagLen * 8 }, gcmKey, ct));
+    } catch {
+      return null;
+    }
+  };
   const staticIv = iv.slice(); // defensive copy: the caller may zero or reuse its buffer
 
   const tagFailure = () => new TlsError(codes.TLS_RECORD,
@@ -152,10 +194,7 @@ export async function createAead({ version = TLS13, cipher, key, iv }) {
         inner[plaintext.byteLength] = type;
         const aad = concat([u8(23), u16(LEGACY_VERSION), u16(inner.byteLength + tagLen)]);
         const nonce = buildNonce(staticIv, seq);
-        const ct = await crypto.subtle.encrypt(
-          { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: tagLen * 8 },
-          gcmKey, inner);
-        return new Uint8Array(ct);
+        return await seal(nonce, aad, inner);
       },
 
       /**
@@ -177,12 +216,11 @@ export async function createAead({ version = TLS13, cipher, key, iv }) {
         const nonce = buildNonce(staticIv, seq);
         let inner;
         try {
-          inner = new Uint8Array(await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: nonce, additionalData: header, tagLength: tagLen * 8 },
-            gcmKey, body));
+          inner = await open(nonce, header, body);
         } catch {
           throw tagFailure();
         }
+        if (inner == null) throw tagFailure();
         // Strip the zero padding to expose the real content type (RFC 8446 s5.4). Scanning
         // from the end is not constant time, but padding length is not secret from an attacker
         // who can measure it anyway via record timing; the RFC imposes no such requirement.
@@ -222,9 +260,7 @@ export async function createAead({ version = TLS13, cipher, key, iv }) {
       const explicit = seq64(seq);
       const nonce = concat([staticIv, explicit]);
       const aad = concat([explicit, u8(type), u16(TLS12), u16(plaintext.byteLength)]);
-      const ct = new Uint8Array(await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: tagLen * 8 },
-        gcmKey, plaintext));
+      const ct = await seal(nonce, aad, plaintext);
       return concat([explicit, ct]);
     },
 
@@ -251,12 +287,11 @@ export async function createAead({ version = TLS13, cipher, key, iv }) {
       const aad = concat([seq64(seq), header.subarray(0, 3), u16(ptLen)]);
       let plaintext;
       try {
-        plaintext = new Uint8Array(await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: tagLen * 8 },
-          gcmKey, body.subarray(8)));
+        plaintext = await open(nonce, aad, body.subarray(8));
       } catch {
         throw tagFailure();
       }
+      if (plaintext == null) throw tagFailure();
       return { type: header[0], plaintext };
     },
   };

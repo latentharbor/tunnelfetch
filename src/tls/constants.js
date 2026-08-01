@@ -81,7 +81,7 @@ export const CIPHER = {
   // TLS 1.3
   TLS_AES_128_GCM_SHA256: 0x1301,
   TLS_AES_256_GCM_SHA384: 0x1302,
-  TLS_CHACHA20_POLY1305_SHA256: 0x1303, // named for diagnostics only; never offered
+  TLS_CHACHA20_POLY1305_SHA256: 0x1303, // offered only when an implementation is injected
   // TLS 1.2, ECDHE + AEAD only
   TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: 0xc02b,
   TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: 0xc02f,
@@ -118,6 +118,14 @@ export const TLS12_CIPHERS = [
 export const CIPHER_PARAMS = {
   [CIPHER.TLS_AES_128_GCM_SHA256]: { hash: 'SHA-256', hashLen: 32, keyLen: 16, ivLen: 12, tagLen: 16 },
   [CIPHER.TLS_AES_256_GCM_SHA384]: { hash: 'SHA-384', hashLen: 48, keyLen: 32, ivLen: 12, tagLen: 16 },
+  // Parameters only. Deliberately NOT in TLS13_CIPHERS, so it is never offered unless a caller
+  // supplies an implementation — this runtime has no WebCrypto ChaCha20, and its only native path
+  // is node:crypto, which the package will not require. Having the parameters here lets the AEAD
+  // layer refuse with "no implementation supplied" rather than "unknown suite", which is the
+  // difference between a fixable configuration and an apparent dead end.
+  [CIPHER.TLS_CHACHA20_POLY1305_SHA256]: {
+    hash: 'SHA-256', hashLen: 32, keyLen: 32, ivLen: 12, tagLen: 16,
+  },
   [CIPHER.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]: {
     hash: 'SHA-256', hashLen: 32, keyLen: 16, ivLen: 12, tagLen: 16, fixedIvLen: 4, sig: 'ecdsa',
   },
