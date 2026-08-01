@@ -139,12 +139,18 @@ export function applyProfile(options) {
     );
   }
 
+  // A profile may carry its own implementations — `tunnelfetch/profile/chrome` bundles the two
+  // WASM primitives, and importing it is the opt-in. So a requirement is satisfied by either the
+  // caller's options OR the profile itself; checking only the options made a self-sufficient
+  // profile refuse itself.
+  const supplied = (kind, what) =>
+    Boolean(options[kind]?.[what] ?? p[kind]?.[what]);
   const missing = [];
   for (const need of p.requires ?? []) {
     const [kind, what] = need.split(':');
-    if (kind === 'decoder' && !options.decoders?.[what]) missing.push(need);
-    if (kind === 'cipher' && !options.ciphers?.[what]) missing.push(need);
-    if (kind === 'group' && !options.groups?.[what]) missing.push(need);
+    if (kind === 'decoder' && !supplied('decoders', what)) missing.push(need);
+    if (kind === 'cipher' && !supplied('ciphers', what)) missing.push(need);
+    if (kind === 'group' && !supplied('groups', what)) missing.push(need);
     // A profile with no captured h2 layer must not be run over HTTP/2, or it presents this
     // identity's ClientHello above a different client's preface.
     if (kind === 'http2' && options.http2 !== false) missing.push(need);
@@ -155,14 +161,19 @@ export function applyProfile(options) {
       `the "${p.name}" profile cannot be presented honestly: ${missing.join(', ')} ` +
         `${missing.length === 1 ? 'is' : 'are'} missing. A fingerprint field this package cannot ` +
         'perform is an offer a server may take and then find unhonoured, which fails the ' +
-        'connection rather than merely looking wrong. Supply the missing pieces (see `decoders`, ' +
-        '`ciphers`, `groups`) or set `http2: false`, or use a profile that is complete.',
+        'connection rather than merely looking wrong. For the Chrome identity with its two WASM ' +
+        "primitives already wired in, import { chrome } from 'tunnelfetch/profile/chrome'; " +
+        'otherwise supply the missing pieces yourself through `decoders`, `ciphers` and `groups`.',
       { profile: p.name, missing },
     );
   }
 
   const out = { ...options };
   if (p.tls) out.tls = { ...p.tls, ...(options.tls ?? {}) };
+  // Implementations the profile brings, with the caller's taking precedence.
+  for (const kind of ['ciphers', 'groups', 'decoders']) {
+    if (p[kind]) out[kind] = { ...p[kind], ...(options[kind] ?? {}) };
+  }
   for (const key of ['headerOrder', 'http2Settings', 'http2PseudoHeaderOrder', 'http2HpackIndexing']) {
     if (options[key] === undefined && p[key] != null) out[key] = p[key];
   }

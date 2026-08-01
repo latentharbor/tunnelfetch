@@ -117,9 +117,15 @@ test('src/ declares no dependencies beyond the standard platform', async () => {
   const offenders = [];
   for (const file of srcFiles) {
     const code = stripComments(await readFile(file, 'utf8'));
-    for (const m of code.matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+    // Anchored to a real import STATEMENT, not any `from '...'` anywhere in the file. The looser
+    // pattern flagged an error message that tells the caller which module to import — a check that
+    // forces you to write a worse diagnostic is a check with a bug, not a rule worth obeying.
+    for (const m of code.matchAll(/^\s*(?:import|export)\s[^;\n]*?from\s+['"]([^'"]+)['"]/gm)) {
       const spec = m[1];
       if (!spec.startsWith('.')) offenders.push(`${rel(file)} imports "${spec}"`);
+    }
+    for (const m of code.matchAll(/^\s*import\s+['"]([^'"]+)['"]/gm)) {
+      if (!m[1].startsWith('.')) offenders.push(`${rel(file)} imports "${m[1]}"`);
     }
   }
   assert.deepEqual(offenders, [], 'the package is zero-dependency:\n  ' + offenders.join('\n  '));
