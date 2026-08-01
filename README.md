@@ -2,6 +2,11 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/latentharbor/tunnelfetch/actions/workflows/ci.yml/badge.svg)](https://github.com/latentharbor/tunnelfetch/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/tunnelfetch)](https://www.npmjs.com/package/tunnelfetch)
+[![license](https://img.shields.io/npm/l/tunnelfetch)](LICENSE)
+
+
 A `fetch`-shaped HTTP client that can route through an HTTP CONNECT, HTTPS, or SOCKS5 proxy on
 runtimes that expose only raw TCP — principally Cloudflare Workers (`workerd`).
 
@@ -377,8 +382,10 @@ Not implemented, and not planned:
 - **ChaCha20-Poly1305.** It buys nothing: a server can only pick a suite we offered, TLS 1.3
   mandates AES-128-GCM, and AES-GCM is universal in TLS 1.2 deployments. WebCrypto has no
   ChaCha20, so offering it would mean a `node:crypto` dependency for zero compatibility gain.
-- **Client certificates (mTLS), session resumption, 0-RTT, renegotiation.** A `HelloRequest` is
-  refused rather than honoured.
+- **Client certificates (mTLS), 0-RTT, renegotiation.** A `HelloRequest` is refused rather than
+  honoured. 0-RTT is a decision rather than an omission: early data can be replayed, so offering
+  it would let an attacker who captured a POST replay it. (Session resumption itself *is*
+  implemented — a ticket is kept per pool key and offered with `psk_dhe_ke`.)
 - **Revocation fetching (CRL downloads, OCSP responder queries).** Both need network round trips
   mid-handshake, through the proxy, and an OCSP query tells the CA which origins you visit.
   Revocation *is* checked from a **stapled** OCSP response when the server sends one (see Trust

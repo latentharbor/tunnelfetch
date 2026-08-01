@@ -35,8 +35,10 @@ name: Capability drift
 
 on:
   schedule:
-    # 07:00 UTC on the 1st. Monthly matches how fast the things being watched actually move.
-    - cron: '0 7 1 * *'
+    # 07:00 UTC on the 1st and the 16th. Twice a month rather than once: the runtime and the root
+    # programmes move on the order of weeks, and a check that only fires monthly can leave a
+    # capability change or a distrusted root sitting undetected for most of that month.
+    - cron: '0 7 1,16 * *'
   workflow_dispatch:
 
 jobs:

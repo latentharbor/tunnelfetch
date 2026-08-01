@@ -2,6 +2,11 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/latentharbor/tunnelfetch/actions/workflows/ci.yml/badge.svg)](https://github.com/latentharbor/tunnelfetch/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/tunnelfetch)](https://www.npmjs.com/package/tunnelfetch)
+[![license](https://img.shields.io/npm/l/tunnelfetch)](LICENSE)
+
+
 一个 `fetch` 形态的 HTTP 客户端，能在只暴露原始 TCP 的运行时上——主要是 Cloudflare Workers (`workerd`)——通过 HTTP CONNECT、HTTPS 或 SOCKS5 代理发出请求。
 
 零依赖。ESM。无构建步骤。`src/` 中没有任何 `node:` 导入。
@@ -295,7 +300,7 @@ CertificateError [CERT_PIN_MISMATCH]: no certificate in the chain matches any co
 - **TLS 1.0 / 1.1。** RC4 已被攻破，那里剩下的全是 CBC。浏览器自 2020 年起就拒绝这两个版本。注意其中的区别：*同时也*支持 1.0/1.1 的服务器没有问题，我们会与它协商出 1.2 或 1.3；够不着的只有*除此之外什么都不支持*的服务器。
 - **RSA 密钥传输。** 没有前向保密。
 - **ChaCha20-Poly1305。** 加上它换不来任何东西：服务器只能从我们报出的套件里选，TLS 1.3 强制要求 AES-128-GCM，而 AES-GCM 在 TLS 1.2 的实际部署中无处不在。WebCrypto 没有 ChaCha20，要提供它就得引入 `node:crypto` 依赖，兼容性收益却是零。
-- **客户端证书 (mTLS)、会话恢复、0-RTT、重协商。** 收到 `HelloRequest` 会拒绝，而不是照办。
+- **客户端证书（mTLS）、0-RTT、重协商。** `HelloRequest` 会被拒绝而不是照做。0-RTT 是决定而非遗漏:early data 可被重放，提供它等于让捕获了 POST 的攻击者可以重放它。（会话恢复本身**已经实现**——ticket 按池键保存，用 `psk_dhe_ke` 提供。）
 - **吊销信息的主动获取（下载 CRL、查询 OCSP 应答者）。** 两者都要在握手中途经代理多跑网络往返，而且 OCSP 查询会把你访问的源站告诉 CA。吊销状态**会**从服务器装订（staple）的 OCSP 响应中校验（见上文 Trust 一节）；没有实现、也不打算实现的，是替服务器去取它没有装订的东西。
 - **证书策略处理** (`policyConstraints`、`inhibitAnyPolicy`)。它们永远是 critical 的，所以一旦出现就直接拒绝，而不是被错误地校验过去。
 - **dNSName 与 iPAddress 之外的名称约束。** 标为 *critical* 且指名不支持类型的约束扩展会被拒绝；非 critical 的则按 RFC 5280 允许的那样忽略。
