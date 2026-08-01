@@ -20,7 +20,7 @@ import {
 import { TlsError, TlsUnsupportedError, codes, hex8, hex16 } from '../errors.js';
 import {
   RECORD_TYPE, HANDSHAKE_TYPE, ALERT_DESC, ALERT_LEVEL, MAX_PLAINTEXT, MAX_CIPHERTEXT,
-  LEGACY_VERSION, TLS12, TLS13, CIPHER_PARAMS,
+  LEGACY_VERSION, TLS12, TLS13, CIPHER, CIPHER_PARAMS,
 } from './constants.js';
 import { createAead } from './aead.js';
 import { trafficKeys, nextTrafficSecret } from './keyschedule.js';
@@ -106,6 +106,10 @@ async function withGrace(promise, ms) {
  *   record, TLS 1.3 only
  * @property {null | ((msg: HandshakeMessage) => void | Promise<void>)} [onPostHandshake]
  *   NewSessionTicket consumer; default is to discard
+ * @property {null | { chacha20?: import('./aead.js').AeadOptions['impl'] }} [aeadImpls] injected
+ *   AEAD implementations by name. ChaCha20-Poly1305 has no WebCrypto path on this runtime, so its
+ *   seal/open are supplied here and threaded into every createAead for the ChaCha20 suite (initial
+ *   keys and each KeyUpdate rotation). Absent for the AES-GCM-only default, which needs nothing.
  */
 
 export class RecordLayer {
@@ -122,6 +126,9 @@ export class RecordLayer {
     this._shutdownGraceMs = opts.shutdownGraceMs ?? 2000;
     this._padding = opts.padding ?? null;
     this._onPostHandshake = opts.onPostHandshake ?? null;
+    // Injected AEAD implementations (ChaCha20-Poly1305). Threaded into every createAead so a
+    // KeyUpdate rotation reaches for the same implementation the initial keys used.
+    this._aeadImpls = opts.aeadImpls ?? null;
 
     this._version = TLS13; // semantics selector; setVersion() pins it when negotiated
     /** @type {DirectionState} */
@@ -250,8 +257,20 @@ export class RecordLayer {
     } else if (!key || !iv) {
       throw new TlsError(codes.CONFIG_INVALID, 'keys need either a traffic secret or key+iv');
     }
-    const aead = await createAead({ version: this._version, cipher, key, iv });
+    const aead = await createAead({
+      version: this._version, cipher, key, iv, impl: this._implFor(cipher),
+    });
     return { aead, seq: 0n, cipher, hash: params.hash, secret: secret ?? null };
+  }
+
+  /**
+   * The injected AEAD implementation a suite needs, or null. Only ChaCha20-Poly1305 needs one on
+   * this runtime; every AES-GCM suite goes through WebCrypto and passes null.
+   * @param {number} cipher
+   * @returns {import('./aead.js').AeadOptions['impl'] | null}
+   */
+  _implFor(cipher) {
+    return cipher === CIPHER.TLS_CHACHA20_POLY1305_SHA256 ? (this._aeadImpls?.chacha20 ?? null) : null;
   }
 
   // ------------------------------------------------------------------ read side
@@ -840,7 +859,9 @@ export class RecordLayer {
     const secret = await nextTrafficSecret(s.hash, s.secret);
     const params = CIPHER_PARAMS[s.cipher];
     const { key, iv } = await trafficKeys(params.hash, secret, params.keyLen, params.ivLen);
-    const aead = await createAead({ version: this._version, cipher: s.cipher, key, iv });
+    const aead = await createAead({
+      version: this._version, cipher: s.cipher, key, iv, impl: this._implFor(s.cipher),
+    });
     this._send = { aead, seq: 0n, cipher: s.cipher, hash: s.hash, secret };
   }
 

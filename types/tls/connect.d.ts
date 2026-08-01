@@ -71,11 +71,19 @@
  * @property {object} peer
  */
 /**
- * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
- * is what allows a recorded session to be replayed in an offline test.
+ * Injectable nondeterminism and crypto primitives the platform does not provide.
+ *
+ * `randomBytes` and `generateKeyPair` supply reproducibility (a recorded session replayed in an
+ * offline test). `aead` and `kem` supply capabilities this runtime lacks entirely: ChaCha20 and
+ * ML-KEM are absent from WebCrypto here, so an implementation must be injected before the suite or
+ * group they back can be offered — a ClientHello being an offer a server may take.
  * @typedef {object} TlsDeps
  * @property {(n: number) => Uint8Array} [randomBytes]
  * @property {(algorithm: object, group: number) => Promise<CryptoKeyPair>} [generateKeyPair]
+ * @property {{ chacha20?: import('./aead.js').AeadOptions['impl'] }} [aead] injected AEAD
+ *   implementations by name; `chacha20` gates and performs TLS_CHACHA20_POLY1305_SHA256
+ * @property {{ x25519mlkem768?: import('./hybrid.js').MlKem768 }} [kem] injected KEM
+ *   implementations by name; `x25519mlkem768` gates and performs the X25519MLKEM768 hybrid group
  */
 /**
  * What a completed handshake reports about itself.
@@ -256,12 +264,30 @@ export type CapturedTicket = {
     peer: object;
 };
 /**
- * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
- * is what allows a recorded session to be replayed in an offline test.
+ * Injectable nondeterminism and crypto primitives the platform does not provide.
+ *
+ * `randomBytes` and `generateKeyPair` supply reproducibility (a recorded session replayed in an
+ * offline test). `aead` and `kem` supply capabilities this runtime lacks entirely: ChaCha20 and
+ * ML-KEM are absent from WebCrypto here, so an implementation must be injected before the suite or
+ * group they back can be offered — a ClientHello being an offer a server may take.
  */
 export type TlsDeps = {
     randomBytes?: ((n: number) => Uint8Array) | undefined;
     generateKeyPair?: ((algorithm: object, group: number) => Promise<CryptoKeyPair>) | undefined;
+    /**
+     * injected AEAD
+     * implementations by name; `chacha20` gates and performs TLS_CHACHA20_POLY1305_SHA256
+     */
+    aead?: {
+        chacha20?: import("./aead.js").AeadOptions["impl"];
+    } | undefined;
+    /**
+     * injected KEM
+     * implementations by name; `x25519mlkem768` gates and performs the X25519MLKEM768 hybrid group
+     */
+    kem?: {
+        x25519mlkem768?: import("./hybrid.js").MlKem768;
+    } | undefined;
 };
 /**
  * What a completed handshake reports about itself.

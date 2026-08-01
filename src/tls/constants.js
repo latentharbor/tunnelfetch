@@ -93,7 +93,29 @@ export const CIPHER = {
 export const CIPHER_NAME = Object.fromEntries(Object.entries(CIPHER).map(([k, v]) => [v, k]));
 
 /** Offered in ClientHello, in preference order. */
+// KNOWN NOT TO MATCH curl, which offers AES-256-GCM first (`0x1302 0x1303 0x1301`, captured off
+// the wire). The extension order and the header order were matched to curl and this was never
+// checked, though JA3 hashes it just as directly. Correcting it changes the suite negotiated on
+// every connection and a dozen tests pin the current one, so it is deliberately a separate change
+// rather than a quiet one — see the fingerprint delta table in the README.
 export const TLS13_CIPHERS = [CIPHER.TLS_AES_128_GCM_SHA256, CIPHER.TLS_AES_256_GCM_SHA384];
+
+/**
+ * curl 8.21.0 / OpenSSL 3.6.3 offers its TLS 1.3 suites in this exact order — AES-256-GCM,
+ * ChaCha20-Poly1305, AES-128-GCM — captured off the wire 2026-08-01 (`0x1302 0x1303 0x1301`).
+ * ChaCha20 is SECOND, right after AES-256-GCM; that is "curl's position" for it.
+ *
+ * TLS13_CIPHERS above leads with AES-128, which is the order this package has always offered and
+ * which the offline test server keys its default suite selection off; reordering it would change
+ * the negotiated suite across the whole suite. So this curl-faithful order is used ONLY when a
+ * ChaCha20 implementation has been injected — i.e. when the caller has opted into being able to
+ * perform every suite curl offers — and never otherwise. See connect.js.
+ */
+export const TLS13_CIPHERS_WITH_CHACHA = [
+  CIPHER.TLS_AES_256_GCM_SHA384,
+  CIPHER.TLS_CHACHA20_POLY1305_SHA256,
+  CIPHER.TLS_AES_128_GCM_SHA256,
+];
 
 export const TLS12_CIPHERS = [
   CIPHER.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -149,6 +171,11 @@ export const GROUP = {
   x25519: 0x001d,
   x448: 0x001e,
   ffdhe2048: 0x0100,
+  // Post-quantum hybrid (draft-kwiatkowski-tls-ecdhe-mlkem): ML-KEM-768 + X25519. Reachable only
+  // when an ML-KEM implementation is injected — its key exchange is not a WebCrypto primitive on
+  // this runtime — so like ChaCha20 it is never offered unless the capability was supplied. The
+  // combiner lives in hybrid.js; GROUP_PARAMS below records only the wire sizes, not an algorithm.
+  x25519mlkem768: 0x11ec,
 };
 
 export const GROUP_NAME = Object.fromEntries(Object.entries(GROUP).map(([k, v]) => [v, k]));
@@ -162,10 +189,14 @@ export const SUPPORTED_GROUPS = [GROUP.x25519, GROUP.secp256r1, GROUP.secp384r1,
 
 /**
  * WebCrypto parameters per group, discriminated on `kind` because X25519 sizes its shared
- * secret in bytes while ECDH sizes it in bits.
+ * secret in bytes while ECDH sizes it in bits, and the ML-KEM hybrid is not a WebCrypto
+ * primitive at all — it carries wire sizes only, and hybrid.js owns the crypto.
  * @typedef {{ kind: 'x25519', algorithm: { name: string }, publicLen: number, secretLen: number }
  *   | { kind: 'ec', algorithm: { name: string, namedCurve: string }, publicLen: number,
- *       secretBits: number }} GroupParams
+ *       secretBits: number }
+ *   | { kind: 'hybrid', clientShareLen: number, serverShareLen: number, secretLen: number,
+ *       mlkemPublicLen: number, mlkemSecretKeyLen: number, mlkemCiphertextLen: number,
+ *       classicalPublicLen: number, classicalSecretLen: number }} GroupParams
  */
 
 /**
@@ -182,6 +213,17 @@ export const GROUP_PARAMS = {
   },
   [GROUP.secp521r1]: {
     kind: 'ec', algorithm: { name: 'ECDH', namedCurve: 'P-521' }, publicLen: 133, secretBits: 528,
+  },
+  // X25519MLKEM768 (draft-kwiatkowski-tls-ecdhe-mlkem). The wire sizes below are FIPS 203
+  // ML-KEM-768 (ek 1184, ct 1088, dk 2400) alongside X25519 (32). The client's key_share is
+  // 1184 + 32 = 1216 bytes and the server's is 1088 + 32 = 1120; the shared secret fed to the
+  // key schedule is 32 + 32 = 64. Ordering (ML-KEM before X25519, in both the shares and the
+  // secret) is spelled out and enforced in hybrid.js — it is the whole subtlety of this group.
+  [GROUP.x25519mlkem768]: {
+    kind: 'hybrid',
+    clientShareLen: 1216, serverShareLen: 1120, secretLen: 64,
+    mlkemPublicLen: 1184, mlkemSecretKeyLen: 2400, mlkemCiphertextLen: 1088,
+    classicalPublicLen: 32, classicalSecretLen: 32,
   },
 };
 

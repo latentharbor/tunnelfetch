@@ -30,13 +30,16 @@ import { RecordLayer } from './record.js';
 import { Transcript } from './transcript.js';
 import {
   ALPN_HTTP11,
+  CIPHER,
   CIPHER_PARAMS,
+  GROUP,
   HANDSHAKE_TYPE,
   SUPPORTED_GROUPS,
   TLS12,
   TLS12_CIPHERS,
   TLS13,
   TLS13_CIPHERS,
+  TLS13_CIPHERS_WITH_CHACHA,
 } from './constants.js';
 import {
   buildClientHello,
@@ -195,11 +198,19 @@ function expectServerHello(msg, offers12) {
  */
 
 /**
- * Injectable nondeterminism. Supplying these makes a handshake byte-for-byte reproducible, which
- * is what allows a recorded session to be replayed in an offline test.
+ * Injectable nondeterminism and crypto primitives the platform does not provide.
+ *
+ * `randomBytes` and `generateKeyPair` supply reproducibility (a recorded session replayed in an
+ * offline test). `aead` and `kem` supply capabilities this runtime lacks entirely: ChaCha20 and
+ * ML-KEM are absent from WebCrypto here, so an implementation must be injected before the suite or
+ * group they back can be offered — a ClientHello being an offer a server may take.
  * @typedef {object} TlsDeps
  * @property {(n: number) => Uint8Array} [randomBytes]
  * @property {(algorithm: object, group: number) => Promise<CryptoKeyPair>} [generateKeyPair]
+ * @property {{ chacha20?: import('./aead.js').AeadOptions['impl'] }} [aead] injected AEAD
+ *   implementations by name; `chacha20` gates and performs TLS_CHACHA20_POLY1305_SHA256
+ * @property {{ x25519mlkem768?: import('./hybrid.js').MlKem768 }} [kem] injected KEM
+ *   implementations by name; `x25519mlkem768` gates and performs the X25519MLKEM768 hybrid group
  */
 
 /**
@@ -254,6 +265,9 @@ export async function connectTls({ transport, hostname, verifyPeer, options = {}
   const record = new RecordLayer(transport, {
     maxHandshakeMessage: options.maxHandshakeMessage,
     maxKeyUpdates: options.maxKeyUpdates,
+    // ChaCha20-Poly1305 has no WebCrypto path here; its seal/open are injected via deps.aead and
+    // threaded to every createAead. Null for the AES-GCM-only default, which needs nothing.
+    aeadImpls: deps.aead ?? null,
   });
   // Until the ServerHello picks, the record layer speaks the LOWEST version offered. The two
   // semantics that differ before any ServerHello are alert tolerance and CCS handling, and the
@@ -282,15 +296,36 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
   const offers13 = versions.includes(TLS13);
   const offers12 = versions.includes(TLS12);
   const alpn = options.alpn ?? [ALPN_HTTP11];
-  const groups = options.groups ?? SUPPORTED_GROUPS;
-  const offerGroups = options.offerGroups ?? DEFAULT_OFFER_GROUPS;
+
+  // The two capability-gated primitives. A ClientHello is an offer a server may take, so neither
+  // the ChaCha20 suite nor the X25519MLKEM768 group may appear on the wire unless an implementation
+  // was injected — this runtime can perform neither on its own. Both are filtered out of ANY offer
+  // list (explicit or default) when their implementation is absent, which is what makes them
+  // impossible to advertise dishonestly.
+  const chacha = deps.aead?.chacha20;
+  const mlkem = deps.kem?.x25519mlkem768;
+
+  // supported_groups, and the groups a real key_share is sent for. With ML-KEM injected the
+  // default matches curl: X25519MLKEM768 first in both, alongside x25519. Without it, the classical
+  // default is unchanged and the hybrid group is stripped from any explicit list.
+  let groups = options.groups ?? (mlkem ? [GROUP.x25519mlkem768, ...SUPPORTED_GROUPS] : SUPPORTED_GROUPS);
+  let offerGroups =
+    options.offerGroups ?? (mlkem ? [GROUP.x25519mlkem768, SUPPORTED_GROUPS[0]] : DEFAULT_OFFER_GROUPS);
+  if (!mlkem) {
+    groups = groups.filter((g) => g !== GROUP.x25519mlkem768);
+    offerGroups = offerGroups.filter((g) => g !== GROUP.x25519mlkem768);
+  }
+
   // Suites for every offered version, 1.3 first. negotiateCipher later re-checks the family of
   // the server's pick against the negotiated version, so a union offer cannot be abused to run
-  // a 1.3 suite under 1.2 or the reverse.
-  const ciphers = options.ciphers ?? [
-    ...(offers13 ? TLS13_CIPHERS : []),
+  // a 1.3 suite under 1.2 or the reverse. With ChaCha20 injected the DEFAULT switches to curl's
+  // captured TLS 1.3 order (AES-256-GCM, ChaCha20, AES-128-GCM); an explicit list keeps its own
+  // order and simply has 0x1303 filtered out when no implementation is present.
+  let ciphers = options.ciphers ?? [
+    ...(offers13 ? (chacha ? TLS13_CIPHERS_WITH_CHACHA : TLS13_CIPHERS) : []),
     ...(offers12 ? TLS12_CIPHERS : []),
   ];
+  if (!chacha) ciphers = ciphers.filter((c) => c !== CIPHER.TLS_CHACHA20_POLY1305_SHA256);
 
   // --- resumption offer ----------------------------------------------------------------------
   // Everything about the offered PSK that later steps need is derived once, up front: the Early

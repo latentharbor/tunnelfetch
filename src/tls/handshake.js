@@ -355,7 +355,7 @@ export async function continueTls13(ctx) {
   // Only psk_dhe_ke is ever offered (s4.2.9), so a key exchange happens whether or not the PSK
   // was taken; selectServerKeyShare fails closed on a ServerHello without key_share.
   const server = selectServerKeyShare(sh, keyShares);
-  const shared = await deriveSharedSecret(server.group, server.privateKey, server.keyExchange);
+  const shared = await deriveSharedSecret(server.group, server.privateKey, server.keyExchange, deps);
 
   // s7.1: with a PSK in use the Early Secret is extracted from it; otherwise from zeros. The
   // accepted offer already carries that extraction (connect.js derived it for the binder), and

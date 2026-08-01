@@ -29,6 +29,8 @@ import {
 } from '../_harness.js';
 import { rawExtension, startServer } from './_server.js';
 import { makeIdentity, testIdentity } from './_testca.js';
+import { fakeMlKem768 } from './_mlkem.js';
+import { nodeChacha20 } from './_chacha.js';
 
 const HOST = 'server.test';
 const AES128 = CIPHER.TLS_AES_128_GCM_SHA256;
@@ -179,6 +181,14 @@ async function exchange(tls, srv, clientPayload, serverPayload) {
   eq(atClient, serverPayload, 'server->client application bytes arrive intact');
 }
 
+/** Does a supported_groups extension_data (u16 list length, then u16 group ids) name `group`? */
+function hasGroup(extData, group) {
+  for (let o = 2; o + 1 < extData.byteLength; o += 2) {
+    if (((extData[o] << 8) | extData[o + 1]) === group) return true;
+  }
+  return false;
+}
+
 // ------------------------------------------------------------------ the factory itself
 
 test('the test CA mints parseable certificates whose SPKI is the signing key', () => {
@@ -244,6 +254,101 @@ test('TLS_AES_256_GCM_SHA384 drives the SHA-384 transcript end to end', async ()
   assert.equal(tls.info.cipherSuite, AES256);
   assert.equal(state.finishedVerified, true);
   await exchange(tls, srv, pattern(2000), pattern(1000).reverse());
+});
+
+test('TLS_CHACHA20_POLY1305_SHA256: full handshake through the injected AEAD, curl-ordered offer', async () => {
+  // Injecting a ChaCha20 implementation puts 0x1303 in the offer at curl's captured position —
+  // second, right after AES-256-GCM — and lets the record layer actually protect the session with
+  // it. The server needs the same implementation to protect its own flight. A round trip of real
+  // application bytes proves seal/open are threaded through every createAead (initial keys here;
+  // KeyUpdate rotation is covered in record.test.js).
+  const chacha20 = nodeChacha20();
+  const { tls, srv, state } = await connectPair({
+    identity: testIdentity('rsa-pss'),
+    deps: { aead: { chacha20 } },
+    server: { cipher: 0x1303, aeadImpls: { chacha20 } },
+  });
+  assert.equal(tls.info.cipherSuite, 0x1303, 'ChaCha20-Poly1305 was negotiated');
+  assert.equal(state.finishedVerified, true, 'the server decrypted and verified our Finished');
+  // The offer is curl's TLS 1.3 order with ChaCha20 second: AES-256-GCM, ChaCha20, AES-128-GCM.
+  assert.deepEqual(state.clientHellos[0].cipherSuites, [0x1302, 0x1303, 0x1301]);
+
+  await exchange(tls, srv, utf8('POST /v1 HTTP/1.1\r\n\r\n{"x":1}'), pattern(800));
+});
+
+test('TLS_CHACHA20_POLY1305_SHA256 is NOT offered when no implementation is injected', async () => {
+  // Without deps.aead.chacha20 the default offer is unchanged — AES-128, AES-256 — and 0x1303
+  // appears nowhere. An AEAD suite offered but not performable is a dead connection if selected.
+  const { state } = await connectPair({ identity: testIdentity('rsa-pss') });
+  assert.ok(!state.clientHellos[0].cipherSuites.includes(0x1303), 'no ChaCha20 in the offer');
+  assert.deepEqual(state.clientHellos[0].cipherSuites, [0x1301, 0x1302],
+    'the classical default order is untouched');
+});
+
+test('an explicit cipher list cannot smuggle ChaCha20 without an implementation', async () => {
+  // profiles.chrome sets tls.ciphers with 0x1303 in it; a caller could too. Capability gating
+  // overrides the list — 0x1303 is filtered from the actual offer unless an implementation is
+  // injected — so the suite is impossible to advertise dishonestly by hand-writing the list.
+  const { state } = await connectPair({
+    identity: testIdentity('rsa-pss'),
+    clientOptions: { ciphers: [0x1302, 0x1303, 0x1301] },
+  });
+  assert.ok(!state.clientHellos[0].cipherSuites.includes(0x1303));
+  assert.deepEqual(state.clientHellos[0].cipherSuites, [0x1302, 0x1301]);
+});
+
+test('an explicit groups list cannot smuggle X25519MLKEM768 without an implementation', async () => {
+  const { state } = await connectPair({
+    identity: testIdentity('rsa-pss'),
+    clientOptions: { groups: [0x11ec, GROUP.x25519], offerGroups: [0x11ec, GROUP.x25519] },
+  });
+  assert.ok(!state.clientHellos[0].keyShares.some((k) => k.group === 0x11ec),
+    'no hybrid key_share when the offerGroups list names it but no ML-KEM is injected');
+  assert.ok(!hasGroup(state.clientHellos[0].extensions.get(EXTENSION.supported_groups), 0x11ec),
+    'hybrid stripped from an explicit supported_groups too');
+});
+
+test('X25519MLKEM768: the injected hybrid group is offered, negotiated, and carries data', async () => {
+  // A ClientHello offering the hybrid needs an ML-KEM implementation injected as deps.kem; the
+  // server needs the same primitive to encapsulate. finishedVerified is the load-bearing assertion:
+  // the server checked our Finished under a key it derived by combining the two secrets on ITS OWN
+  // (hand-written, client-code-independent) side. If our concatenation order for the shares or the
+  // secret disagreed with the server's, the secrets would differ and this would be false — which is
+  // exactly how a hybrid mistake surfaces (never as an exception).
+  const kem = fakeMlKem768();
+  const { tls, srv, state } = await connectPair({
+    identity: testIdentity('rsa-pss'),
+    deps: { kem: { x25519mlkem768: kem } },
+    server: { group: GROUP.x25519mlkem768, hybridKem: kem },
+  });
+  assert.equal(tls.info.version, TLS13);
+  assert.equal(tls.info.group, GROUP.x25519mlkem768, 'the hybrid group was negotiated');
+  assert.equal(state.finishedVerified, true, 'server verified our Finished over its own transcript');
+
+  // With ML-KEM injected the default offer matches curl: a 1216-byte hybrid key_share (ek 1184 +
+  // X25519 32) AND a plain x25519 share alongside it.
+  const ch = state.clientHellos[0];
+  const hybrid = ch.keyShares.find((k) => k.group === GROUP.x25519mlkem768);
+  assert.ok(hybrid, 'a X25519MLKEM768 key_share was offered');
+  assert.equal(hybrid.keyExchange.byteLength, 1216, 'client hybrid share is 1184 + 32');
+  assert.ok(ch.keyShares.some((k) => k.group === GROUP.x25519), 'x25519 share offered alongside');
+  assert.deepEqual(ch.keyShares.map((k) => k.group), [GROUP.x25519mlkem768, GROUP.x25519],
+    'hybrid first, then x25519 — the order curl sends');
+
+  await exchange(tls, srv, utf8('hello over a post-quantum session'), pattern(500));
+});
+
+test('X25519MLKEM768 is NOT offered when no ML-KEM implementation is injected', async () => {
+  // The same client without deps.kem must fall back to the classical default: no hybrid group in
+  // supported_groups, no hybrid key_share. An offer we cannot perform is a dead connection if a
+  // server takes it, so it must be impossible to make without the capability.
+  const { state } = await connectPair({ identity: testIdentity('rsa-pss') });
+  const ch = state.clientHellos[0];
+  assert.ok(!ch.keyShares.some((k) => k.group === GROUP.x25519mlkem768),
+    'no hybrid key_share without an ML-KEM implementation');
+  assert.ok(!ch.extensions.get(EXTENSION.supported_groups)
+    || !hasGroup(ch.extensions.get(EXTENSION.supported_groups), GROUP.x25519mlkem768),
+    'no hybrid group in supported_groups without an ML-KEM implementation');
 });
 
 test('every offered group completes and carries data: x25519, P-256, P-384, P-521', async () => {

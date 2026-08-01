@@ -83,6 +83,15 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  *   yours and visible. Measured on the edge: WASM brotli decodes at about 2x native gzip, and
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
+ * @property {{ chacha20?: import('./tls/aead.js').AeadOptions['impl'] }} [ciphers] injected AEAD
+ *   implementations, by capability name. `chacha20` (seal/open, RFC 8439) is what lets
+ *   TLS_CHACHA20_POLY1305_SHA256 be offered and performed — WebCrypto has no ChaCha20 on this
+ *   runtime, and a suite offered but not performable is a dead connection if a server selects it,
+ *   so without this the suite stays out of the ClientHello. Required by `profiles.chrome`.
+ * @property {{ x25519mlkem768?: import('./tls/hybrid.js').MlKem768 }} [groups] injected key-exchange
+ *   implementations, by capability name. `x25519mlkem768` (ML-KEM-768 keygen/encapsulate/
+ *   decapsulate) is what lets the post-quantum hybrid group be offered and performed; without it
+ *   the group stays out of the ClientHello. Required by `profiles.chrome`.
  * @property {boolean} [keepAlive] default true.
  * @property {import('./profiles.js').FingerprintProfile} [profile] one coherent network identity
  *   instead of a dozen knobs that can disagree — TLS, HTTP/2, header order and default headers
@@ -403,7 +412,7 @@ async function openFreshAndSend(client, current, { hop, key, proxy, trust, tls }
       tls,
       alpn,
       resumption: resumptionFor(client, key),
-      deps: o.deps,
+      deps: tlsDeps(o),
       deadlines,
       limits: o.limits ?? {},
       now: o.now,
@@ -597,6 +606,22 @@ function serverNeverSawIt(err) {
   return err instanceof TunnelFetchError && err.code === codes.TLS_TRUNCATED && err.detail?.got === 0;
 }
 
+/**
+ * The TLS deps for a connection: the caller's injectable randomness/keygen, plus the injected
+ * crypto implementations (`ciphers` -> `aead`, `groups` -> `kem`) the TLS layer needs to offer and
+ * perform the capability-gated ChaCha20 suite and X25519MLKEM768 group. Folded in here rather than
+ * carried in `tls`, so they neither enter the pool key nor disable native-fetch delegation — they
+ * are injected primitives, not fingerprint configuration.
+ * @param {Readonly<import('./client.js').ClientOptions>} o
+ * @returns {import('./tls/connect.js').TlsDeps}
+ */
+function tlsDeps(o) {
+  const deps = { ...(o.deps ?? {}) };
+  if (o.ciphers) deps.aead = o.ciphers;
+  if (o.groups) deps.kem = o.groups;
+  return deps;
+}
+
 async function sendAndReceive(client, conn, current, { key, deadlines, reused }) {
   const o = client.options;
   const target = targetFromUrl(current.url);
@@ -638,7 +663,7 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
         trust: o.trust ?? { mode: 'system' },
         tls: o.tls ?? {},
         resumption: resumptionFor(client, key),
-        deps: o.deps,
+        deps: tlsDeps(o),
         deadlines,
         limits: o.limits ?? {},
         now: o.now,

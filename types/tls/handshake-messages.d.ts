@@ -9,13 +9,14 @@
 /**
  * Generate an ephemeral key share for one group.
  * `generateKeyPair` is injectable so a recorded handshake can be replayed with the exact private
- * key that produced it.
+ * key that produced it. X25519MLKEM768 dispatches to hybrid.js, using the injected ML-KEM
+ * implementation from `deps.kem`.
  *
  * @param {number} group
  * @param {import('./connect.js').TlsDeps} [deps]
  * @returns {Promise<KeyShare>}
  */
-export function generateKeyShare(group: number, { generateKeyPair }?: import("./connect.js").TlsDeps): Promise<KeyShare>;
+export function generateKeyShare(group: number, deps?: import("./connect.js").TlsDeps): Promise<KeyShare>;
 /**
  * ECDH/X25519 shared secret. The peer's key is imported in raw form, which is where a malformed
  * point is caught: WebCrypto rejects a point that is not on the curve, so we do not have to
@@ -23,11 +24,14 @@ export function generateKeyShare(group: number, { generateKeyPair }?: import("./
  * so it is checked here first.
  *
  * @param {number} group
- * @param {CryptoKey} privateKey our ephemeral private key for the group
+ * @param {CryptoKey | import('./hybrid.js').HybridPrivate} privateKey our ephemeral private key
+ *   for the group (a compound value for the ML-KEM hybrid)
  * @param {Uint8Array} peerKey the server's raw public key from its key_share
+ * @param {import('./connect.js').TlsDeps} [deps] carries the injected ML-KEM implementation the
+ *   hybrid group needs; unused by the classical groups
  * @returns {Promise<Uint8Array>} throws on any degenerate or malformed peer key
  */
-export function deriveSharedSecret(group: number, privateKey: CryptoKey, peerKey: Uint8Array): Promise<Uint8Array>;
+export function deriveSharedSecret(group: number, privateKey: CryptoKey | import("./hybrid.js").HybridPrivate, peerKey: Uint8Array, deps?: import("./connect.js").TlsDeps): Promise<Uint8Array>;
 export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, psk, grease, randomBytes, }: {
     hostname: any;
     keyShares: any;

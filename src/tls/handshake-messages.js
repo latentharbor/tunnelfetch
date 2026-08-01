@@ -15,6 +15,9 @@ import { greaseSource, greaseKeyShare, shuffleExtensions, isGrease } from './gre
 // der.js is a strict ASN.1 reader with no trust policy in it; the signature-format conversion
 // lives there so the certificate path builder and this file cannot drift apart.
 import { ecdsaDerToRaw } from '../trust/der.js';
+// The X25519MLKEM768 hybrid is a group like any other to the driver, but its key exchange is not
+// a WebCrypto primitive, so its keygen/derive live in their own module and are dispatched to here.
+import { HYBRID_GROUP, deriveHybridSecret, generateHybridKeyShare } from './hybrid.js';
 import {
   CIPHER_NAME,
   CIPHER_PARAMS,
@@ -77,16 +80,20 @@ const defaultRandom = (n) => crypto.getRandomValues(new Uint8Array(n));
 /**
  * Generate an ephemeral key share for one group.
  * `generateKeyPair` is injectable so a recorded handshake can be replayed with the exact private
- * key that produced it.
+ * key that produced it. X25519MLKEM768 dispatches to hybrid.js, using the injected ML-KEM
+ * implementation from `deps.kem`.
  *
  * @param {number} group
  * @param {import('./connect.js').TlsDeps} [deps]
  * @returns {Promise<KeyShare>}
  */
-export async function generateKeyShare(group, { generateKeyPair } = {}) {
+export async function generateKeyShare(group, deps = {}) {
+  if (group === HYBRID_GROUP) {
+    return generateHybridKeyShare(deps.kem?.x25519mlkem768, deps);
+  }
   const params = requireSupportedGroup(group, 'ClientHello');
   const gen =
-    generateKeyPair ??
+    deps.generateKeyPair ??
     ((algorithm) => crypto.subtle.generateKey(algorithm, false, ['deriveBits']));
   const pair = await gen(params.algorithm, group);
   const raw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
@@ -106,11 +113,17 @@ export async function generateKeyShare(group, { generateKeyPair } = {}) {
  * so it is checked here first.
  *
  * @param {number} group
- * @param {CryptoKey} privateKey our ephemeral private key for the group
+ * @param {CryptoKey | import('./hybrid.js').HybridPrivate} privateKey our ephemeral private key
+ *   for the group (a compound value for the ML-KEM hybrid)
  * @param {Uint8Array} peerKey the server's raw public key from its key_share
+ * @param {import('./connect.js').TlsDeps} [deps] carries the injected ML-KEM implementation the
+ *   hybrid group needs; unused by the classical groups
  * @returns {Promise<Uint8Array>} throws on any degenerate or malformed peer key
  */
-export async function deriveSharedSecret(group, privateKey, peerKey) {
+export async function deriveSharedSecret(group, privateKey, peerKey, deps = {}) {
+  if (group === HYBRID_GROUP) {
+    return deriveHybridSecret(deps.kem?.x25519mlkem768, privateKey, peerKey);
+  }
   const params = requireSupportedGroup(group, 'ServerHello');
   if (peerKey.byteLength !== params.publicLen) {
     throw new TlsError(
