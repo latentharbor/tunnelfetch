@@ -51,6 +51,10 @@
     "./roots": {
       "types": "./types/trust/roots.d.ts",
       "default": "./src/trust/roots.js"
+    },
+    "./profile/chrome": {
+      "types": "./types/profile/chrome.d.ts",
+      "default": "./src/profile/chrome.js"
     }
   },
   "types": "./types/index.d.ts",
