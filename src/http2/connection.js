@@ -86,6 +86,25 @@ const FORBIDDEN_H2_HEADERS = new Set([
 ]);
 
 /**
+ * Charged against the header-block cap for every fragment, on top of that fragment's payload.
+ *
+ * Without it the cap is bounded on the wrong axis and does not stop the flood it was written for.
+ * A CONTINUATION frame may carry a ZERO-length payload: legal, useless, and nine bytes on the wire.
+ * It adds nothing to a payload-byte counter while still costing an array slot, a Uint8Array and an
+ * ArrayBuffer in `fragments` — so `bytes` stayed at 0 forever, the cap never tripped, END_HEADERS
+ * never came, and the array grew until the isolate died. Roughly 10x amplification, which is the
+ * shape of CVE-2024-27316 and precisely the attack the cap was added to prevent.
+ *
+ * Charging per fragment is the same device HPACK uses (`ENTRY_OVERHEAD`, RFC 7541 s4.1): make the
+ * per-item cost visible to the accounting so that ONE bound covers both axes. A second counter for
+ * frame count would also work and is easier to get subtly wrong — two limits mean two places to
+ * forget. The value is a rough stand-in for the real per-fragment heap cost, and it only has to be
+ * non-zero to close the hole: at the 262144 default a zero-length flood dies after 1024 frames,
+ * while a legitimate 256 KiB block arriving in 16 KiB frames pays 4 KiB of overhead, 1.6%.
+ */
+const HEADER_FRAGMENT_OVERHEAD = 256;
+
+/**
  * @typedef {ReadableStream<Uint8Array> & { completed: Promise<boolean>,
  *   trailers: Promise<Headers | null> }} BodyStream
  */
@@ -739,10 +758,12 @@ export class Http2Connection {
       this._continuation = {
         streamId,
         fragments: [fragment.slice()],
-        bytes: fragment.length,
+        bytes: fragment.length + HEADER_FRAGMENT_OVERHEAD,
+        frames: 1,
         endStream,
       };
-      // The opening frame alone can exceed the cap when SETTINGS_MAX_FRAME_SIZE is large.
+      // Unreachable while `readFrame` is called with DEFAULT_MAX_FRAME_SIZE and the cap is larger,
+      // but the cap is configurable and a low one makes the opening frame able to pass it alone.
       if (!this._headerBlockWithinCap()) return;
     }
   }
@@ -755,15 +776,15 @@ export class Http2Connection {
    * @returns {boolean} true when assembly may continue
    */
   _headerBlockWithinCap() {
-    const { bytes, streamId } = this._continuation;
+    const { bytes, frames, streamId } = this._continuation;
     if (bytes <= this._maxHeaderBlockBytes) return true;
     this._continuation = null;
     this._die(
       new Http2Error(
         codes.HTTP2_PROTOCOL,
-        `header block on stream ${streamId} reached ${bytes} bytes across HEADERS and ` +
-          `CONTINUATION frames, over the ${this._maxHeaderBlockBytes} byte cap`,
-        { streamId, bytes, cap: this._maxHeaderBlockBytes },
+        `header block on stream ${streamId} reached ${bytes} charged bytes across ${frames} ` +
+          `HEADERS and CONTINUATION frames, over the ${this._maxHeaderBlockBytes} byte cap`,
+        { streamId, bytes, frames, cap: this._maxHeaderBlockBytes },
       ),
     );
     return false;
@@ -771,7 +792,8 @@ export class Http2Connection {
 
   _onContinuation(flags, payload) {
     this._continuation.fragments.push(payload.slice());
-    this._continuation.bytes += payload.length;
+    this._continuation.bytes += payload.length + HEADER_FRAGMENT_OVERHEAD;
+    this._continuation.frames += 1;
     if (!this._headerBlockWithinCap()) return;
     if (flags & FLAG.END_HEADERS) {
       const { streamId, fragments, endStream } = this._continuation;

@@ -71,6 +71,7 @@ export class Http2Connection {
         streamId: any;
         fragments: Uint8Array<ArrayBuffer>[];
         bytes: number;
+        frames: number;
         endStream: boolean;
     } | null;
     _maxHeaderBlockBytes: number;

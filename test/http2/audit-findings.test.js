@@ -65,6 +65,47 @@ test('a CONTINUATION flood is refused instead of buffered without bound', async 
   await conn.close();
 });
 
+// The cap above bounded PAYLOAD bytes, and the flood that mattered costs none.
+//
+// A CONTINUATION frame may carry a zero-length payload: legal per RFC 9113, useless, and nine bytes
+// on the wire. It added 0 to the byte counter while still pushing a Uint8Array and its ArrayBuffer
+// onto the fragment list, so the counter sat at 0 forever, `0 <= cap` held forever, END_HEADERS
+// never arrived, and the array grew until the isolate died. The sibling test above passed the whole
+// time, because its proof-of-concept happened to use 16 KiB chunks.
+//
+// The fix charges every fragment a fixed overhead, so a frame that carries nothing still costs
+// something. This test sends the payload-free version of exactly the same attack.
+test('a CONTINUATION flood made of zero-length frames is refused too', async () => {
+  const { conn, server } = connect({ client: { maxHeaderBlockBytes: 64 * 1024 } });
+  const reqP = conn.request(GET);
+  reqP.catch(() => {});
+  await awaitRequest(server, 1);
+
+  await server.sendRaw(serializeFrame(FRAME.HEADERS, 0, 1, new Uint8Array(0)));
+  const empty = new Uint8Array(0);
+  // 64 KiB of cap at 256 charged bytes per frame is 256 frames; 4096 is ample headroom and still
+  // finite, so a client that never refuses fails this test by exhausting the loop rather than by
+  // hanging it.
+  let sent = 0;
+  for (let i = 0; i < 4096; i++) {
+    if (conn._fatal) break;
+    try {
+      await server.sendRaw(serializeFrame(FRAME.CONTINUATION, 0, 1, empty));
+      sent++;
+    } catch {
+      break;
+    }
+  }
+  await sleep(30);
+
+  assert.ok(conn._fatal, `the connection buffered ${sent} zero-length CONTINUATION frames unbounded`);
+  assert.equal(conn._fatal.code, 'HTTP2_PROTOCOL');
+  assert.match(conn._fatal.message, /byte cap/);
+  assert.equal(conn._continuation, null, 'fragments are still held after the refusal');
+  await assert.rejects(reqP);
+  await conn.close();
+});
+
 // A server may answer before the client has finished uploading, so the remote half can end while
 // the local half is still in flight. Every other place that ends a half re-checks whether both are
 // done; the local-end path in _sendBody did not, so the stream stayed registered for the life of
