@@ -1071,7 +1071,10 @@ export default {
     const [host, port, user, pass] = spec.split(':');
     const proxy = { protocol: url.searchParams.get('socks') ? 'socks5' : 'http', hostname: host, port: Number(port), username: user, password: pass };
 
-    markPath('run');
+    // The sweep's size must be in the mark: cpuTime comes from the tail event, and without it
+    // every body size lands in one undifferentiated bucket.
+    markPath('run', { sizes: url.searchParams.get('sizes') ?? null,
+                      reuse: url.searchParams.get('reuse') ?? null });
     const targets = (url.searchParams.get('targets') || '').split(',').filter(Boolean);
     const results = [];
 
