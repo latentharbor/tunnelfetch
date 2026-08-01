@@ -87,18 +87,39 @@ const KNOWN_UNSUPPORTED = new Set(['br', 'zstd', 'compress', 'x-compress']);
 // size is an upper bound that is essentially never reached here: the input is pumped by a JS task
 // on the same event loop as the puller, so the decompressor typically holds one or two of its
 // 4 KiB output chunks when the read arrives. Measured on the edge over a 1 MB body of real content:
-// 93 reads, 93 of them partial, average fill 11.3 KiB — and with a 64 KiB view that is 5.8 MB of
-// throwaway buffer allocated to carry 1 MB of data.
+// 93 reads, 93 of them partial, average fill 11.3 KiB.
 //
-// Swept on the edge, ms of CPU per MB of decompressed output, all five interleaved in one isolate:
+// That partial-fill fact drives TWO decisions here:
 //
-//     4 KiB  19.33     16 KiB  13.00     64 KiB  17.67
-//     8 KiB  16.00     32 KiB  15.33
+//   1. The view is 16 KiB, not 64: a 64 KiB view carries the same ~11 KiB fill, so the extra 48 KiB
+//      is only ever allocation the read never touches.
 //
-// A clean U: too small pays per-read overhead, too large pays for allocation it never fills.
-// 64 KiB was chosen when this drain was first measured against an input fed by a native pipeTo,
-// which runs ahead and DOES fill a 64 KiB view (16 reads, none partial) — a regime the shipped
-// wiring never enters. The probe and the product disagreed, and the probe was believed.
+//   2. The backing buffer is RECYCLED across reads (see the drain loop), not freshly allocated. The
+//      old shape did `new Uint8Array(16384)` per read and enqueued a subarray of the ~11 KiB fill —
+//      but that subarray retains the whole 16 KiB buffer, so every chunk carried ~5 KiB of unfilled
+//      tail, ~1.8 MB of pure waste over a 4 MB body, on top of the 16 KiB alloc+zero each read pays.
+//      Recycling reads into one reused buffer and enqueues a slice of exactly the fill: the alloc+
+//      zero per read becomes an ~11 KiB copy, and the delivered chunks are tightly sized (no tail).
+//
+// Be precise about the payoff, because it is easy to overstate: the ~11 KiB slices ARE the payload,
+// so this does not take allocation to zero — it removes the tail waste and the per-read zero-fill.
+// Swept on the edge over 4 MB of real content (2.76:1), min CPU ms, interleaved in one isolate:
+//
+//     fresh-alloc 16 KiB   40      fresh-alloc 64 KiB   28      recycled 16 KiB   26
+//
+// So against a JS-fed drain (the shipped regime) recycling is a real ~35% saving on THIS stage. But
+// the stage is a small part of the receive pipeline, and the saving vanishes when the decompressor
+// is fed a fully-buffered input — the BYOB reads then fill the whole view, so a fresh view wastes
+// nothing and the added copy makes recycling a wash. End to end the cpuTime difference is within
+// measurement noise; the dependable win is the tighter allocation, not a cpuTime number. Kept
+// because it never regresses and correctness is unchanged.
+//
+// Handing the decompressor's readable straight to the consumer with no JS drain at all measures
+// 18 ms — near the native floor — but the drain cannot be dropped: the wrapper is what turns a
+// corrupt-stream or torn-source error into the typed HTTP_CONTENT_ENCODING the callers (and the
+// offline suite) rely on, and what propagates a consumer's cancel back to the socket so the pool
+// never reuses an abandoned body. That trade — a wrapped, typed, cancel-propagating stream over a
+// raw-but-faster one — is deliberate, and it is the floor for this stage in JavaScript.
 const DECOMPRESS_READ_BYTES = 16384;
 
 /**
@@ -193,6 +214,11 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
   /** @type {ReadableStreamBYOBReader | ReadableStreamDefaultReader<Uint8Array> | null} */
   let out = null;
   let byob = false;
+  // The BYOB backing buffer, reclaimed from each read and reused for the next. `null` means
+  // "allocate a fresh one" — the first read, and any read whose predecessor returned a buffer too
+  // small to reuse (a nonstandard impl; the standard transfers the same buffer straight back).
+  /** @type {ArrayBuffer | null} */
+  let recycled = null;
   const wrap = (e) =>
     e instanceof HttpError
       ? e
@@ -205,12 +231,15 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
   return new ReadableStream({
     async pull(c) {
       try {
-        const ds = await ready;
-        if (ds === null) {
-          c.close();
-          return;
-        }
         if (out === null) {
+          // First pull only: settle the sniff, then pick a reader. `ready` is resolved on every
+          // later pull, so awaiting it each time cost a microtask hop per output chunk — ~370 of
+          // them over a 4 MB body — for a value that does not change once setup is done.
+          const ds = await ready;
+          if (ds === null) {
+            c.close();
+            return;
+          }
           try {
             out = ds.readable.getReader({ mode: 'byob' });
             byob = true;
@@ -222,10 +251,20 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
           }
         }
         for (;;) {
-          const { value, done } = byob
-            ? await /** @type {ReadableStreamBYOBReader} */ (out)
-                .read(new Uint8Array(DECOMPRESS_READ_BYTES))
-            : await /** @type {ReadableStreamDefaultReader<Uint8Array>} */ (out).read();
+          let value, done;
+          if (byob) {
+            // Reuse the reclaimed buffer unless it is missing (first read) or was returned
+            // shrunk by a nonstandard impl, in which case allocate a fresh full-size one.
+            const buf = recycled && recycled.byteLength >= DECOMPRESS_READ_BYTES
+              ? recycled
+              : new ArrayBuffer(DECOMPRESS_READ_BYTES);
+            recycled = null; // the read detaches this buffer; it is reclaimed from the result below
+            ({ value, done } = await /** @type {ReadableStreamBYOBReader} */ (out)
+              .read(new Uint8Array(buf)));
+          } else {
+            ({ value, done } = await /** @type {ReadableStreamDefaultReader<Uint8Array>} */ (out)
+              .read());
+          }
           if (done) {
             // Clean output EOF implies the input pump already closed the decompressor
             // successfully; awaiting it here surfaces any failure that raced the close.
@@ -233,7 +272,10 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
             c.close();
             return;
           }
-          if (value.byteLength === 0) continue; // legal, carries nothing; keep reading
+          if (value.byteLength === 0) {
+            if (byob) recycled = value.buffer; // nothing delivered; reclaim the buffer
+            continue; // legal, carries nothing; keep reading
+          }
           produced += value.byteLength;
           if (produced > maxBytes) {
             // Refused BEFORE the over-long chunk is handed on, so the caller never holds more than
@@ -246,7 +288,17 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
               { coding, produced, maxBytes },
             );
           }
-          c.enqueue(value);
+          if (byob) {
+            // Reclaim the backing buffer for the next read and hand on a copy of exactly the fill,
+            // so reusing the buffer cannot overwrite bytes the consumer has not yet read. The copy
+            // is the fill only (~11 KiB); what it replaces was a full 16 KiB zero-filled allocation
+            // every read, which is the churn this recycling exists to remove.
+            recycled = value.buffer;
+            c.enqueue(value.slice());
+          } else {
+            // Default reader: the runtime owns the chunk's buffer, so there is nothing to recycle.
+            c.enqueue(value);
+          }
           return;
         }
       } catch (e) {
