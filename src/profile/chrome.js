@@ -43,8 +43,16 @@ export const chrome = Object.freeze({
   ciphers: Object.freeze({ chacha20: chacha20poly1305 }),
   groups: Object.freeze({ x25519mlkem768: mlkem768 }),
   // Chrome advertises `gzip, deflate, br, zstd`, so the identity is not presentable without these.
-  // Each bounds its own output — `decodeBody` deliberately does not cap a caller-supplied decoder,
-  // and a decoder that did not self-limit would reopen the gzip-bomb hole closed in 1.4.1.
+  // `decodeBody` now bounds a registered decoder's output by the client's `maxBodyBytes` too (not
+  // just the built-in gzip/deflate path), so these honour the caller's cap.
+  //
+  // Each also self-limits at 256 MiB, and that number is worth being blunt about: a Workers isolate
+  // has a 128 MB memory ceiling, so the self-limit is TWICE the ceiling and cannot fire before the
+  // isolate is already dead. It is a backstop against a runaway decoder, not against a bomb. On
+  // this runtime the only thing that actually stops a decompression bomb is `maxBodyBytes`, which
+  // defaults to Infinity — so a caller who fetches arbitrary origins and buffers the result with
+  // `.json()`/`.text()`/`.arrayBuffer()` should set it. An earlier version of this comment claimed
+  // the self-limit was what kept the 1.4.1 gzip-bomb hole closed for these two codings. It was not.
   decoders: Object.freeze({ br, zstd }),
 });
 

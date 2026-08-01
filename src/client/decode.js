@@ -3,7 +3,7 @@
 // the request side (what we advertise) and the response side (what we decode) live in one
 // file so they cannot drift apart.
 
-import { HttpError, codes } from '../errors.js';
+import { HttpError, LimitError, codes } from '../errors.js';
 
 /**
  * What the request layer advertises with no extra decoders registered. The target runtime's
@@ -278,6 +278,62 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
   });
 }
 
+/**
+ * Bound a caller-supplied decoder's OUTPUT at `maxBytes`, the same fail-closed way the built-in
+ * decompression stage bounds its own. A registered decoder does its own decompression, so a small
+ * coded body can still inflate far past `maxBodyBytes` in the decoder — and the package ships two
+ * such decoders itself (`br`/`zstd` in `tunnelfetch/profile/chrome`), so leaving their output
+ * unbounded made a documented guarantee ("enforced again on the DECODED output", SECURITY.md's
+ * "a peer cannot make this client allocate without bound") false for its own blessed identity: a
+ * ~50-byte brotli bomb decoded to hundreds of MB under a 1 MB cap. This is a bound, not a
+ * truncation — the over-long chunk is refused before it is handed on, exactly like the gzip path,
+ * so nothing partial is ever presented as complete. Only applied when a finite cap is set; an
+ * Infinity cap (the default) leaves the bound entirely to the caller as before.
+ *
+ * @param {ReadableStream<Uint8Array>} source the decoder's output
+ * @param {string} coding for the error message
+ * @param {number} maxBytes finite cap on decoded output
+ * @returns {ReadableStream<Uint8Array>}
+ */
+function capDecodedOutput(source, coding, maxBytes) {
+  let produced = 0;
+  const reader = source.getReader();
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) {
+            c.close();
+            return;
+          }
+          if (!value || value.byteLength === 0) continue;
+          produced += value.byteLength;
+          if (produced > maxBytes) {
+            // Refused BEFORE the over-long chunk is enqueued, so the caller never holds more than
+            // it asked for. The decoder's own error, if any, still propagates untouched below.
+            throw new LimitError(
+              codes.LIMIT_BODY,
+              `decoded body exceeded maxBodyBytes: ${produced} bytes of "${coding}" output past a ` +
+                `${maxBytes} byte cap. The coded body was within the cap; the decoded one is what a ` +
+                'decompression bomb inflates — the registered decoder for this coding does not stop it.',
+              { coding, produced, maxBytes },
+            );
+          }
+          c.enqueue(value);
+          return;
+        }
+      } catch (e) {
+        await reader.cancel(e).catch(() => {});
+        c.error(e);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
+}
+
 /** Byte at logical offset `i` across the buffered head chunks. */
 function firstBytes(chunks, i) {
   for (const c of chunks) {
@@ -302,8 +358,9 @@ function firstBytes(chunks, i) {
  *   comma-separated list names codings in the order the SERVER applied them, so decoding
  *   applies them in reverse.
  * @param {Record<string, BodyDecoder> | null} [decoders] caller-supplied codings
- * @param {number} [maxBytes] cap on DECODED output, per stage. `maxBodyBytes` alone bounded the
- *   compressed body, which a gzip bomb walks straight past.
+ * @param {number} [maxBytes] cap on DECODED output, per stage, for built-in AND registered
+ *   decoders alike. `maxBodyBytes` alone bounded the compressed body, which a decompression bomb
+ *   walks straight past. A non-finite cap leaves a registered decoder's output to the caller.
  * @returns {ReadableStream<Uint8Array>} decoded bytes
  */
 export function decodeBody(stream, contentEncoding, decoders = null, maxBytes = Infinity) {
@@ -352,8 +409,6 @@ export function decodeBody(stream, contentEncoding, decoders = null, maxBytes = 
     // point can be reached with the other's assumption.
     const fn = BUILT_IN.has(coding) ? null : custom(coding);
     if (fn) {
-      // A caller-supplied decoder is not wrapped by the cap: it is their code producing their
-      // bytes, and silently truncating its output would be worse than leaving the bound to them.
       const staged = fn(out);
       // A decoder that returns something unreadable would surface far downstream as a confusing
       // stream error; name it here, where the caller can see which coding misbehaved.
@@ -364,7 +419,10 @@ export function decodeBody(stream, contentEncoding, decoders = null, maxBytes = 
           { coding },
         );
       }
-      out = staged;
+      // The DECODED output is bounded at maxBytes just like the built-in path — a registered
+      // decoder decompresses too, so a small coded body can inflate far past the cap inside it.
+      // Fail-closed, not truncation (see capDecodedOutput). An Infinity cap is a no-op.
+      out = Number.isFinite(maxBytes) ? capDecodedOutput(staged, coding, maxBytes) : staged;
       continue;
     }
     out = decompressionStage(out, coding === 'x-gzip' ? 'gzip' : coding, maxBytes);
