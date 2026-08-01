@@ -283,7 +283,7 @@ so where a native path already exists, nothing in userland improves on it. That 
 `deflate` are not overridable: replacing them could only ever be slower, and doing it silently is
 the kind of quiet downgrade this package refuses everywhere else.
 
-Brotli itself lands at 1.9x native inflate. That gap is the price of the coding, and the wire bytes
+Brotli itself lands at 2.5x native inflate. That gap is the price of the coding, and the wire bytes
 it saves do not pay it back — see [What this cannot do](#what-this-cannot-do-and-why). Decoder names
 are validated as HTTP tokens, a decoder that throws fails the body closed rather than truncating it,
 and an unregistered coding is still refused.
@@ -620,24 +620,20 @@ Not implemented, and not planned:
 - **A public-suffix list for cookies.** Only the "no dot in the domain" guard is implemented, so
   `Domain=com` is refused but `Domain=co.uk` is not. Documented rather than faked.
 - **IDNA.** Pass A-labels (punycode); a non-ASCII hostname is rejected with a message saying so.
-- **`br` and `zstd` out of the box.** The runtime's `DecompressionStream` accepts gzip, deflate and
-  deflate-raw only — measured, not assumed. Neither is *unreachable*, though: register a decoder
-  with [`decoders`](#br-zstd-and-other-codings) and the coding is advertised and decoded. Nothing
-  ships built in, because the only way to get Brotli here is WebAssembly, and a 208 KB binary blob
-  would cost this package both its zero dependencies and its ability to be imported without a
-  bundler. Bringing your own makes that cost, and that supply chain, yours and visible.
+- **`br` and `zstd` in the default identity.** The runtime's `DecompressionStream` accepts gzip,
+  deflate and deflate-raw only — measured, not assumed — so both come from WebAssembly, and the
+  default entry point carries neither. Import
+  [`tunnelfetch/profile/chrome`](#the-chrome-identity-in-one-import) and they arrive wired in, or
+  register your own through [`decoders`](#br-zstd-and-other-codings). What the main entry will not
+  do is pull ~140 KB of compiled C into every bundle for a coding most callers never meet.
 
-  Leaving it off is safe rather than lossy: content negotiation means a server never sends what was
-  not asked for, so a Brotli-serving origin simply returns gzip. What it costs is bandwidth — the
-  same page measured 290 KB as gzip against 99 KB as `br` — and bandwidth is not what this platform
-  bills. Measured on the edge, the trade runs the wrong way: WASM Brotli decodes at about
-  **1.9x** the CPU of the runtime's native inflate, and even on the page with the largest wire
-  saving in a 14-site survey, the 186 KB saved bought back ~1.2 ms while the extra decoding cost
-  several times that. Harder compression makes it worse, not better — brotli quality 11, which is
-  what a CDN serves from cache, is 16% smaller on the wire than quality 5 and **46% more expensive
-  to decode**, because decompression work scales with the OUTPUT bytes and a denser encoding means
-  more work per byte produced. The reason to turn `br` on is matching a browser's
-  `Accept-Encoding`, not saving CPU.
+  Leaving them off is safe rather than lossy: content negotiation means a server never sends what
+  was not asked for, so a Brotli-serving origin simply returns gzip. What it costs is bandwidth —
+  the same page measured 290 KB as gzip against 99 KB as `br` — and bandwidth is not what this
+  platform bills. On CPU the trade runs the other way: brotli decodes at 2.5x native inflate, and
+  harder compression is worse rather than better, because decompression work scales with the OUTPUT
+  bytes. The reason to turn `br` on is matching a browser's `Accept-Encoding`, not saving CPU.
+
 - **Streaming request bodies.** A request body is read fully into memory before the request is
   sent, because the framing has to be declared in a `Content-Length` this client can stand behind
   and because a body may have to be replayed on a redirect. Fine for the JSON an SDK sends; wrong
@@ -755,30 +751,42 @@ the measurements above, with the charge split out so it is clear what is yours t
 | Workload | CPU/request | 10M/mo, cold | 10M/mo, warmed | 1B/mo, cold | 1B/mo, warmed |
 | --- | --- | --- | --- | --- | --- |
 | Platform `fetch` — reference; it cannot use a proxy | 0.3 ms | $5.00 | $5.00 | $307.40 | $307.40 |
-| Pooled connection, 16 KB pages | 3.3 ms | $5.93 | $5.28 | $454.60 | $389.60 |
-| Pooled connection, 1 MB pages | 9.2 ms | $7.11 | $6.46 | $572.60 | $507.60 |
-| New connection per request, 16 KB | 11 ms | $7.47 | $6.82 | $608.60 | $543.60 |
-| New connection per request, 1 MB | 14.5 ms | $8.17 | $7.52 | $678.60 | $613.60 |
-| New connection per request, 4 MB | 30 ms | $11.27 | $10.62 | $988.60 | $923.60 |
+| Pooled connection, 16 KB pages | 1.7 ms | $5.61 | $5.00 | $422.65 | $356.65 |
+| Pooled connection, 1 MB pages | 5.6 ms | $6.40 | $5.74 | $501.40 | $435.40 |
+| New connection per request, 16 KB | 6.5 ms | $6.57 | $5.91 | $518.65 | $452.65 |
+| New connection per request, 1 MB | 10.4 ms | $7.36 | $6.70 | $597.40 | $531.40 |
+| New connection per request, 4 MB | 22.4 ms | $9.76 | $9.10 | $837.40 | $771.40 |
+| Chrome identity, pooled, 1 MB pages served `br` | 9.8 ms | $7.25 | $6.59 | $586.40 | $520.40 |
+
+The CPU column comes from the re-measured model — 6.4 ms to open a connection, 1.6 ms per further
+request, ~4 ms per MB — rather than from six separately quoted figures. The Chrome row is the same
+model with brotli decoding substituted for gzip, which moves the body term from ~4 to ~8.25 ms/MB;
+its one-off 3 ms of WASM instantiation per isolate is real but disappears when amortised over the
+requests an isolate serves. Every row through 1.3.0 was 40–60% higher, because the model behind
+them predated connection reuse over HTTP/2 and a slower body path.
 
 "Cold" carries the measured fresh-isolate ramp of +4.4 ms per request amortised; "warmed" is the
 same workload with `warmup({ iterations: 5 })`, which brings the ramp down to +1.1 ms. The saving is
-$0.65/month at ten million requests and $65/month at a billion, identical across every row because
+$0.66/month at ten million requests and $66/month at a billion, identical across every row because
 the ramp is a property of the isolate rather than of the request. The reference row carries no ramp
 because the platform's own `fetch` has no JavaScript protocol stack to tier up.
 
 Four things fall out of it.
 
-**At ten million requests a month, none of this matters.** Every row lands between $5 and $11
+**At ten million requests a month, none of this matters.** Every row lands between $5 and $10
 because the included quotas swallow it — the included CPU works out to 3.0 ms per request at that
-volume, so anything that reuses connections is inside the base fee entirely, cold starts included.
+volume, so a pooled 16 KB workload is inside the base fee entirely once warmed, and everything else
+is within a few dollars of it.
 
 **At a billion, $297 of every row is the request charge**, identical across all of them and
 unchangeable by anything this package does. Only the CPU is left to optimise, and there the
-difference between reusing connections and not is $154/month on 16 KB pages.
+difference between reusing connections and not is $96/month on 16 KB pages — the single largest
+lever in the table, and it costs nothing but keeping a Client alive.
 
-**Pooled and warmed, the whole userland stack costs about 27% more than the platform's own
-`fetch`** — $390 against $307 — for something the platform's `fetch` cannot do at all.
+**Pooled and warmed, the whole userland stack costs about 16% more than the platform's own
+`fetch`** — $357 against $307 — for something the platform's `fetch` cannot do at all. It was 27%
+through 1.3.0; the gap narrowed because the cost model was re-measured over HTTP/2 with connection
+reuse, not because anything was optimised for this table.
 
 That reference row is measured, not assumed, and it is not flat. Fetching real pages of different
 sizes from the same Worker, marginal cost per request on a reused connection:
@@ -799,7 +807,7 @@ these are small numbers, so the ratios bounce between 3× and 13× and are not m
 not worth quoting to one decimal place.
 
 **`warmup()` is free on Standard and usually worth it elsewhere.** Its own cost is startup CPU,
-which Workers Standard does not bill, so the $65/month the "warmed" columns save at a billion
+which Workers Standard does not bill, so the $66/month the "warmed" columns save at a billion
 requests is a pure saving.
 Where startup CPU *is* billed — dynamic Worker loading, for instance — the 22 ms is charged once
 per isolate and spread across the requests that isolate serves: $25/month at a billion requests and
