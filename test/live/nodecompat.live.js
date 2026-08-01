@@ -56,7 +56,13 @@ async function probe(path, extraHeaders = {}) {
   const res = await fetch(`${required('PROBE_URL', BASE)}${path}`, {
     headers: { 'x-probe-token': required('PROBE_TOKEN', TOKEN), ...extraHeaders },
   });
-  assert.equal(res.status, 200, `probe ${path} answered ${res.status}`);
+  // The rig wraps its handlers and returns {error, stack} with a 500, so a bare status assertion
+  // throws away the one thing that would explain the failure. A CI run failed here with a 500 that
+  // could not be reproduced by hand, and the message said only "500 !== 200".
+  if (res.status !== 200) {
+    const body = await res.text().catch(() => '<unreadable>');
+    assert.fail(`probe ${path} answered ${res.status}: ${body.slice(0, 400)}`);
+  }
   return (await res.json()).result;
 }
 

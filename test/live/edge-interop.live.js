@@ -45,7 +45,12 @@ async function rig(query) {
       'x-proxy': required('PROXY_1', PROXY),
     },
   });
-  assert.equal(res.status, 200, `the rig answered ${res.status}; is it deployed and is the token right?`);
+  if (res.status !== 200) {
+    // Same reason as in nodecompat.live.js: the rig reports its own exception in the body, and a
+    // status-only assertion discards it.
+    const body = await res.text().catch(() => '<unreadable>');
+    assert.fail(`the rig answered ${res.status} for ${query}: ${body.slice(0, 400)}`);
+  }
   const body = await res.json();
   assert.equal(body.results.length, 1, `expected exactly one result, got ${body.results.length}`);
   return body.results[0];
