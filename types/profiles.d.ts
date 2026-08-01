@@ -63,6 +63,7 @@ export const chrome: Readonly<{
     tls: Readonly<{
         ciphers: readonly number[];
         groups: readonly number[];
+        offerGroups: readonly number[];
         sigSchemes: readonly number[];
         alpn: string[];
         extensionOrder: "shuffle";

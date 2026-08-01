@@ -64,6 +64,15 @@ export function install(options?: ClientOptions): () => void;
  *   yours and visible. Measured on the edge: WASM brotli decodes at about 2x native gzip, and
  *   the wire bytes it saves do not pay that back — see the README. The reason to turn it on is
  *   matching a browser's Accept-Encoding, not saving CPU.
+ * @property {{ chacha20?: import('./tls/aead.js').AeadOptions['impl'] }} [ciphers] injected AEAD
+ *   implementations, by capability name. `chacha20` (seal/open, RFC 8439) is what lets
+ *   TLS_CHACHA20_POLY1305_SHA256 be offered and performed — WebCrypto has no ChaCha20 on this
+ *   runtime, and a suite offered but not performable is a dead connection if a server selects it,
+ *   so without this the suite stays out of the ClientHello. Required by `profiles.chrome`.
+ * @property {{ x25519mlkem768?: import('./tls/hybrid.js').MlKem768 }} [groups] injected key-exchange
+ *   implementations, by capability name. `x25519mlkem768` (ML-KEM-768 keygen/encapsulate/
+ *   decapsulate) is what lets the post-quantum hybrid group be offered and performed; without it
+ *   the group stays out of the ClientHello. Required by `profiles.chrome`.
  * @property {boolean} [keepAlive] default true.
  * @property {import('./profiles.js').FingerprintProfile} [profile] one coherent network identity
  *   instead of a dozen knobs that can disagree — TLS, HTTP/2, header order and default headers
@@ -237,6 +246,25 @@ export type ClientOptions = {
      * matching a browser's Accept-Encoding, not saving CPU.
      */
     decoders?: Record<string, import("./client/decode.js").BodyDecoder> | undefined;
+    /**
+     * injected AEAD
+     * implementations, by capability name. `chacha20` (seal/open, RFC 8439) is what lets
+     * TLS_CHACHA20_POLY1305_SHA256 be offered and performed — WebCrypto has no ChaCha20 on this
+     * runtime, and a suite offered but not performable is a dead connection if a server selects it,
+     * so without this the suite stays out of the ClientHello. Required by `profiles.chrome`.
+     */
+    ciphers?: {
+        chacha20?: import("./tls/aead.js").AeadOptions["impl"];
+    } | undefined;
+    /**
+     * injected key-exchange
+     * implementations, by capability name. `x25519mlkem768` (ML-KEM-768 keygen/encapsulate/
+     * decapsulate) is what lets the post-quantum hybrid group be offered and performed; without it
+     * the group stays out of the ClientHello. Required by `profiles.chrome`.
+     */
+    groups?: {
+        x25519mlkem768?: import("./tls/hybrid.js").MlKem768;
+    } | undefined;
     /**
      * default true.
      */

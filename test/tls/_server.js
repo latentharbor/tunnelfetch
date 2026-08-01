@@ -39,6 +39,7 @@ import {
   ALERT_LEVEL,
   CIPHER_PARAMS,
   EXTENSION,
+  GROUP,
   HANDSHAKE_TYPE,
   HELLO_RETRY_REQUEST_RANDOM,
   SUPPORTED_GROUPS,
@@ -53,6 +54,34 @@ const EMPTY = new Uint8Array(0);
 /** `extension_type || extension_data<0..2^16-1>`, shared with the tests for misbehaviour. */
 export function rawExtension(type, data) {
   return new Builder().u16(type).vector(2, data).build();
+}
+
+/**
+ * The X25519MLKEM768 SERVER half, written here by hand so it shares no code with the client's
+ * combiner in src/tls/hybrid.js — a concatenation bug in the client cannot then be cancelled out
+ * by the identical bug on the server side (the whole reason this file re-derives the binder
+ * truncation independently too). The client share is ML-KEM ek (1184) then X25519 pub (32); the
+ * server encapsulates to the ek, agrees X25519, and returns its share (ciphertext then X25519 pub)
+ * and the shared secret (ML-KEM secret then X25519 secret) — ML-KEM first in both.
+ * @param {import('./_mlkem.js').fakeMlKem768} kem
+ * @param {Uint8Array} clientShare the client's 1216-byte key_exchange
+ */
+async function serverEncapsulateHybrid(kem, clientShare) {
+  if (clientShare.byteLength !== 1216) {
+    throw new Error(`test server: X25519MLKEM768 client share is ${clientShare.byteLength} bytes, expected 1216`);
+  }
+  const ek = clientShare.subarray(0, 1184);
+  const clientX = clientShare.subarray(1184, 1216);
+  const { cipherText, sharedSecret: mlkemSecret } = kem.encapsulate(ek);
+  const pair = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+  const serverX = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+  const peer = await crypto.subtle.importKey('raw', clientX, { name: 'X25519' }, false, []);
+  const classicalSecret = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: 'X25519', public: peer }, pair.privateKey, 256));
+  return {
+    serverShare: concat([cipherText, serverX]), // ML-KEM ciphertext (1088), then X25519 pub (32)
+    sharedSecret: concat([mlkemSecret, classicalSecret]), // ML-KEM secret (32), then X25519 (32)
+  };
 }
 
 /**
@@ -286,7 +315,13 @@ function killableTransport({ readable, writable }) {
  * Honest by default. Options, one misbehaviour each:
  *   cipher                  suite to negotiate (default: client's first of TLS13_CIPHERS)
  *   wireCipher              suite value written into ServerHello only (keys still use `cipher`)
+ *   aeadImpls               injected AEAD implementations ({ chacha20 }); required to negotiate
+ *                           TLS_CHACHA20_POLY1305_SHA256, which WebCrypto cannot do on this runtime
  *   group / serverKeyPair / serverRandom / sessionIdEcho
+ *   hybridKem               an ML-KEM-768 implementation (e.g. _mlkem.js fakeMlKem768()); required
+ *                           to negotiate X25519MLKEM768 (group 0x11ec). The server encapsulates to
+ *                           the client's share with an independent combiner, so a client-side
+ *                           concatenation bug fails here rather than cancelling itself out.
  *   shareGroup              put a key_share for this group in ServerHello even if the client
  *                           sent no share for it (stops after ServerHello: nothing to derive)
  *   omitSupportedVersions   plain TLS 1.2-shaped ServerHello (legacy_version 0x0303, no ext)
@@ -336,7 +371,9 @@ export function startServer(transport, identity, opts = {}) {
   let t = transport;
   let kill = async () => {};
   if (opts.closeAfter) ({ transport: t, kill } = killableTransport(transport));
-  const record = new RecordLayer(t);
+  // aeadImpls threads an injected ChaCha20 implementation into the server's record layer, so it
+  // can protect its own flight when the client negotiates TLS_CHACHA20_POLY1305_SHA256.
+  const record = new RecordLayer(t, { aeadImpls: opts.aeadImpls ?? null });
   record.setVersion(TLS13);
   const state = {
     clientHellos: [], // parsed ClientHello(s), each with .raw attached
@@ -486,7 +523,30 @@ async function drive(record, identity, opts, state, kill) {
     : (opts.shareGroup ?? opts.group ??
        ch.keyShares.find((k) => SUPPORTED_GROUPS.includes(k.group))?.group);
   if (group === undefined) throw new Error('test server: client offered no key share at all');
-  const serverShare = opts.serverKeyPair ?? (await generateKeyShare(group, {}));
+  const clientShare = ch.keyShares.find((k) => k.group === group);
+
+  // The server's key_share bytes, and how the shared secret comes out of them. Classical groups
+  // generate an ephemeral key here and derive after ServerHello; X25519MLKEM768 ENCAPSULATES to the
+  // client's ML-KEM key, so both its share and its secret depend on the client's share and are
+  // computed up front, via the hand-written (client-code-independent) combiner above.
+  let serverKeyExchange;
+  let deriveShared; // async () => Uint8Array
+  if (group === GROUP.x25519mlkem768) {
+    if (!opts.hybridKem) {
+      throw new Error('test server: X25519MLKEM768 negotiated but no hybridKem was supplied');
+    }
+    if (clientShare) {
+      const enc = await serverEncapsulateHybrid(opts.hybridKem, clientShare.keyExchange);
+      serverKeyExchange = enc.serverShare;
+      deriveShared = async () => enc.sharedSecret;
+    } else {
+      serverKeyExchange = new Uint8Array(1120); // shareGroup misbehaviour: nothing to encapsulate to
+    }
+  } else {
+    const serverShare = opts.serverKeyPair ?? (await generateKeyShare(group, {}));
+    serverKeyExchange = serverShare.keyExchange;
+    deriveShared = async () => deriveSharedSecret(group, serverShare.privateKey, clientShare.keyExchange);
+  }
 
   const sh = buildServerHello({
     random: opts.serverRandom ?? crypto.getRandomValues(new Uint8Array(32)),
@@ -497,7 +557,7 @@ async function drive(record, identity, opts, state, kill) {
       opts.omitSupportedVersions ? null : rawExtension(EXTENSION.supported_versions, u16(TLS13)),
       rawExtension(
         EXTENSION.key_share,
-        concat([u16(group), vector(2, serverShare.keyExchange)]), // one KeyShareEntry, no list
+        concat([u16(group), vector(2, serverKeyExchange)]), // one KeyShareEntry, no list
       ),
       // pre_shared_key: a bare selected_identity (s4.2.11). pskSelectedIdentity scripts a
       // selection outside the offered range; pskSelectUnoffered a selection with no offer at
@@ -511,7 +571,6 @@ async function drive(record, identity, opts, state, kill) {
   await record.writeHandshake([sh]);
   if (opts.compatCcs) await record.writeChangeCipherSpec();
 
-  const clientShare = ch.keyShares.find((k) => k.group === group);
   if (!clientShare) {
     // Scripted misbehaviour (shareGroup): the ServerHello named a group the client sent no
     // share for. There is nothing to derive; the client is now obliged to abort.
@@ -521,7 +580,7 @@ async function drive(record, identity, opts, state, kill) {
   }
 
   // --- key schedule ------------------------------------------------------------------------
-  const shared = await deriveSharedSecret(group, serverShare.privateKey, clientShare.keyExchange);
+  const shared = await deriveShared();
   // psk_dhe_ke: the Early Secret comes from the PSK when resuming, and the ECDHE share always
   // feeds the Handshake Secret — resumption changes the first extraction, nothing else.
   const early = await earlySecret(hash, resumption?.psk ?? null);

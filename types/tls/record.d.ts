@@ -32,6 +32,10 @@
  *   record, TLS 1.3 only
  * @property {null | ((msg: HandshakeMessage) => void | Promise<void>)} [onPostHandshake]
  *   NewSessionTicket consumer; default is to discard
+ * @property {null | { chacha20?: import('./aead.js').AeadOptions['impl'] }} [aeadImpls] injected
+ *   AEAD implementations by name. ChaCha20-Poly1305 has no WebCrypto path on this runtime, so its
+ *   seal/open are supplied here and threaded into every createAead for the ChaCha20 suite (initial
+ *   keys and each KeyUpdate rotation). Absent for the AES-GCM-only default, which needs nothing.
  */
 export class RecordLayer {
     /**
@@ -46,6 +50,9 @@ export class RecordLayer {
     _shutdownGraceMs: number;
     _padding: ((type: number, length: number) => number) | null;
     _onPostHandshake: ((msg: HandshakeMessage) => void | Promise<void>) | null;
+    _aeadImpls: {
+        chacha20?: import("./aead.js").AeadOptions["impl"];
+    } | null;
     _version: number;
     /** @type {DirectionState} */
     _send: DirectionState;
@@ -124,6 +131,13 @@ export class RecordLayer {
         key?: Uint8Array;
         iv?: Uint8Array;
     }): Promise<NonNullable<DirectionState>>;
+    /**
+     * The injected AEAD implementation a suite needs, or null. Only ChaCha20-Poly1305 needs one on
+     * this runtime; every AES-GCM suite goes through WebCrypto and passes null.
+     * @param {number} cipher
+     * @returns {import('./aead.js').AeadOptions['impl'] | null}
+     */
+    _implFor(cipher: number): import("./aead.js").AeadOptions["impl"] | null;
     /**
      * Next handshake message during the handshake phase.
      * Returns `{ type, body, raw }` (raw includes the 4-byte header, ready for the transcript),
@@ -363,6 +377,15 @@ export type RecordLayerOptions = {
      * NewSessionTicket consumer; default is to discard
      */
     onPostHandshake?: ((msg: HandshakeMessage) => void | Promise<void>) | null | undefined;
+    /**
+     * injected
+     * AEAD implementations by name. ChaCha20-Poly1305 has no WebCrypto path on this runtime, so its
+     * seal/open are supplied here and threaded into every createAead for the ChaCha20 suite (initial
+     * keys and each KeyUpdate rotation). Absent for the AES-GCM-only default, which needs nothing.
+     */
+    aeadImpls?: {
+        chacha20?: import("./aead.js").AeadOptions["impl"];
+    } | null | undefined;
 };
 import { ByteReader } from '../util/bytes.js';
 import { ByteWriter } from '../util/bytes.js';

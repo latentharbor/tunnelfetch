@@ -67,6 +67,18 @@ export const CIPHER_NAME: {
 };
 /** Offered in ClientHello, in preference order. */
 export const TLS13_CIPHERS: number[];
+/**
+ * curl 8.21.0 / OpenSSL 3.6.3 offers its TLS 1.3 suites in this exact order — AES-256-GCM,
+ * ChaCha20-Poly1305, AES-128-GCM — captured off the wire 2026-08-01 (`0x1302 0x1303 0x1301`).
+ * ChaCha20 is SECOND, right after AES-256-GCM; that is "curl's position" for it.
+ *
+ * TLS13_CIPHERS above leads with AES-128, which is the order this package has always offered and
+ * which the offline test server keys its default suite selection off; reordering it would change
+ * the negotiated suite across the whole suite. So this curl-faithful order is used ONLY when a
+ * ChaCha20 implementation has been injected — i.e. when the caller has opted into being able to
+ * perform every suite curl offers — and never otherwise. See connect.js.
+ */
+export const TLS13_CIPHERS_WITH_CHACHA: number[];
 export const TLS12_CIPHERS: number[];
 /**
  * Per-suite parameters. `hash` drives the whole key schedule; `keyLen` the AEAD key size.
@@ -90,6 +102,7 @@ export namespace GROUP {
     let x25519: number;
     let x448: number;
     let ffdhe2048: number;
+    let x25519mlkem768: number;
 }
 export const GROUP_NAME: {
     [k: string]: string;
@@ -102,10 +115,14 @@ export const GROUP_NAME: {
 export const SUPPORTED_GROUPS: number[];
 /**
  * WebCrypto parameters per group, discriminated on `kind` because X25519 sizes its shared
- * secret in bytes while ECDH sizes it in bits.
+ * secret in bytes while ECDH sizes it in bits, and the ML-KEM hybrid is not a WebCrypto
+ * primitive at all — it carries wire sizes only, and hybrid.js owns the crypto.
  * @typedef {{ kind: 'x25519', algorithm: { name: string }, publicLen: number, secretLen: number }
  *   | { kind: 'ec', algorithm: { name: string, namedCurve: string }, publicLen: number,
- *       secretBits: number }} GroupParams
+ *       secretBits: number }
+ *   | { kind: 'hybrid', clientShareLen: number, serverShareLen: number, secretLen: number,
+ *       mlkemPublicLen: number, mlkemSecretKeyLen: number, mlkemCiphertextLen: number,
+ *       classicalPublicLen: number, classicalSecretLen: number }} GroupParams
  */
 /**
  * WebCrypto parameters per group. x448 and the finite-field groups are absent by design.
@@ -228,7 +245,8 @@ export type CipherParams = {
 };
 /**
  * WebCrypto parameters per group, discriminated on `kind` because X25519 sizes its shared
- * secret in bytes while ECDH sizes it in bits.
+ * secret in bytes while ECDH sizes it in bits, and the ML-KEM hybrid is not a WebCrypto
+ * primitive at all — it carries wire sizes only, and hybrid.js owns the crypto.
  */
 export type GroupParams = {
     kind: "x25519";
@@ -245,6 +263,16 @@ export type GroupParams = {
     };
     publicLen: number;
     secretBits: number;
+} | {
+    kind: "hybrid";
+    clientShareLen: number;
+    serverShareLen: number;
+    secretLen: number;
+    mlkemPublicLen: number;
+    mlkemSecretKeyLen: number;
+    mlkemCiphertextLen: number;
+    classicalPublicLen: number;
+    classicalSecretLen: number;
 };
 /**
  * How to verify one signature scheme with WebCrypto. `format: 'ecdsa-der'` marks the schemes

@@ -77,6 +77,10 @@ export const chrome = Object.freeze({
       0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
     ]),
     groups: Object.freeze([0x11ec, 0x001d, 0x0017, 0x0018]),
+    // Chrome sends real key_shares for X25519MLKEM768 and X25519 (a GREASE entry leads, added by
+    // the grease option). Both must be generated, so both are named here; the hybrid entry is
+    // stripped, and this whole profile refused, unless an ML-KEM implementation was injected.
+    offerGroups: Object.freeze([0x11ec, 0x001d]),
     sigSchemes: Object.freeze([0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601]),
     alpn: ['h2', 'http/1.1'],
     // Measured: two hellos, identical extension set, entirely different orders. Chromium shuffles.

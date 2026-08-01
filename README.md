@@ -344,16 +344,19 @@ trades a fingerprint mismatch for a broken handshake, which is worse and fails s
 
 | curl sends | This package | Why |
 |---|---|---|
-| 30 cipher suites, incl. RSA key exchange and CBC | 6 AEAD suites | Not implemented, by design. A server selecting `TLS_RSA_WITH_AES_256_CBC_SHA` would get a dead connection |
-| `X25519MLKEM768` group and a 1216-byte key share | not offered | ML-KEM is not implemented |
+| 30 cipher suites, incl. ChaCha20, RSA key exchange and CBC | 6 AEAD suites, or 7 with ChaCha20 injected | RSA-kx and CBC are refused by design — a server selecting `TLS_RSA_WITH_AES_256_CBC_SHA` would get a dead connection. `TLS_CHACHA20_POLY1305_SHA256` is injectable via `ciphers: { chacha20 }`: WebCrypto has no ChaCha20 here, so an implementation is supplied rather than a `node:crypto` dependency taken |
+| `X25519MLKEM768` group and a 1216-byte key share | offered only when injected | ML-KEM is not a WebCrypto primitive; supply it as `groups: { x25519mlkem768 }` (what `profiles.chrome` requires) and the group and its 1216-byte hybrid key share go on the wire |
 | SHA-1 signature schemes | not offered | Refused deliberately |
 | `encrypt_then_mac` | not sent | Applies only to CBC suites, which are not offered |
 | `post_handshake_auth` | not sent | Invites a post-handshake `CertificateRequest`, which is not implemented |
 | — | `status_request` | curl does not ask for a stapled OCSP response; this package must, because a staple is its only revocation signal |
 
-Closing that gap means implementing ML-KEM, RSA key exchange and CBC suites — a different project,
-and the last two are things this package refuses on purpose. `tls.ciphers` and `tls.groups` will let
-you offer them anyway; the handshake will then fail if a server picks one, and that is yours to own.
+ChaCha20-Poly1305 and X25519MLKEM768 are reachable by **injection**: an implementation of each is
+supplied through `ciphers` / `groups`, which is precisely what `profiles.chrome` requires, and
+neither is offered unless one is — a suite or group advertised but not performable is a dead
+connection if a server takes it. RSA key exchange and CBC suites stay refused on purpose;
+`tls.ciphers` and `tls.groups` will let you offer them anyway, and the handshake will then fail if a
+server picks one, which is yours to own.
 
 A test asserts this delta is exactly the list above, so gaining one of these capabilities without
 updating the table fails the build.
@@ -381,7 +384,9 @@ res.tunnelfetch.httpVersion; // '2' if the server chose h2, '1.1' otherwise
 | `connect` | — | Socket factory. On Workers, the `connect` export of `cloudflare:sockets`. Required for anything the platform's `fetch` cannot serve. |
 | `proxy` | `null` | URL string or object. `http:`, `https:`, `socks5:`, `socks5h:`. |
 | `trust` | `{mode:'system'}` | Certificate policy; see below. |
-| `tls` | `{}` | Handshake options (`alpn`, `groups`, `ciphers`, `offerGroups`). |
+| `tls` | `{}` | Handshake options (`alpn`, `groups`, `ciphers`, `offerGroups`). Here `groups`/`ciphers` are number lists — the suite and group ids to offer, in preference order. |
+| `ciphers` | `{}` | Injected AEAD implementations by capability name: `{ chacha20 }` (a `seal`/`open` pair). WebCrypto has no ChaCha20 here, so `TLS_CHACHA20_POLY1305_SHA256` is offered only when this is supplied. Required by `profiles.chrome`. |
+| `groups` | `{}` | Injected key-exchange implementations by capability name: `{ x25519mlkem768 }` (ML-KEM-768 `keygen`/`encapsulate`/`decapsulate`). ML-KEM is not a WebCrypto primitive, so the post-quantum hybrid group is offered only when this is supplied. Required by `profiles.chrome`. |
 | `timeouts` | see below | `connectMs`, `handshakeMs`, `headersMs`, `idleMs`, `totalMs`. |
 | `cookies` | `false` | Enable a per-Client cookie jar. |
 | `maxRedirects` | `20` | |
@@ -493,9 +498,15 @@ Not implemented, and not planned:
   since 2020. Note the distinction: a server that *also* supports 1.0/1.1 is fine, because we will
   negotiate 1.2 or 1.3 with it. Only a server that supports *nothing else* is out of reach.
 - **RSA key transport.** No forward secrecy.
-- **ChaCha20-Poly1305.** It buys nothing: a server can only pick a suite we offered, TLS 1.3
-  mandates AES-128-GCM, and AES-GCM is universal in TLS 1.2 deployments. WebCrypto has no
-  ChaCha20, so offering it would mean a `node:crypto` dependency for zero compatibility gain.
+- **ChaCha20-Poly1305, unless injected.** WebCrypto has no ChaCha20 on this runtime, so it is not
+  built in — taking a `node:crypto` dependency would cost the package its "web platform only"
+  property. It is *injectable*, though: pass `ciphers: { chacha20 }` (a `seal`/`open` pair, e.g. a
+  WASM build) and `TLS_CHACHA20_POLY1305_SHA256` is offered — in curl's captured position, second
+  after AES-256-GCM — and used. Not built in because a server can only pick a suite we offered, TLS
+  1.3 mandates AES-128-GCM, and AES-GCM is universal in TLS 1.2; the reason to add it is matching a
+  browser that offers it (`profiles.chrome`), not compatibility. The post-quantum
+  **X25519MLKEM768** group is injectable the same way — `groups: { x25519mlkem768 }` — for the same
+  reason: ML-KEM is not a WebCrypto primitive here.
 - **Client certificates (mTLS), 0-RTT, renegotiation.** A `HelloRequest` is refused rather than
   honoured. 0-RTT is a decision rather than an omission: early data can be replayed, so offering
   it would let an attacker who captured a POST replay it. (Session resumption itself *is*
