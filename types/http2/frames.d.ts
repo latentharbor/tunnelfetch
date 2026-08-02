@@ -42,11 +42,25 @@ export function rstStreamFrame(streamId: any, errorCode: any): Uint8Array<ArrayB
 export function pingFrame(opaque: any, ack?: boolean): Uint8Array<ArrayBufferLike>;
 /** A GOAWAY frame (RFC 9113 s6.8). */
 export function goawayFrame(lastStreamId: any, errorCode: any, debug?: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBufferLike>;
-/** A HEADERS frame carrying a full (already-fragmented-if-needed) block. No PADDED, no PRIORITY —
- *  a client that emits neither is exactly what curl does. */
-export function headersFrame(streamId: any, block: any, { endStream, endHeaders }?: {
+/**
+ * A HEADERS frame carrying a full (already-fragmented-if-needed) block. Never PADDED.
+ *
+ * PRIORITY is emitted only when `priority` is supplied, because whether a client sends it is part
+ * of its identity: curl does not, Chromium does — flags 0x25 with `80 00 00 00 ff`, captured in
+ * test/tls/_captured-h2.js. RFC 9113 s5.3.2 deprecates the mechanism and this package ignores
+ * every PRIORITY frame it receives, but a frame-level fingerprinter reads whether the flag is set,
+ * so refusing to emit it would make the Chromium identity wrong in a way nothing else could fix.
+ *
+ * The five bytes are exclusive (1 bit) + stream dependency (31) + weight (8). The weight is sent
+ * as-is: RFC 7540 s6.3 defines the wire byte as weight-minus-one, so Chromium's 255 is a weight of
+ * 256, and passing the byte through keeps this function free of an off-by-one nobody would see.
+ *
+ * @param {{ exclusive?: boolean, streamDependency?: number, weight: number } | null} [opts.priority]
+ */
+export function headersFrame(streamId: any, block: any, { endStream, endHeaders, priority }?: {
     endStream?: boolean | undefined;
     endHeaders?: boolean | undefined;
+    priority?: null | undefined;
 }): Uint8Array<ArrayBufferLike>;
 /** A CONTINUATION frame (RFC 9113 s6.10), for a header block that overflows one frame. */
 export function continuationFrame(streamId: any, block: any, endHeaders: any): Uint8Array<ArrayBufferLike>;

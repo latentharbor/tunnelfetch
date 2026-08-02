@@ -74,6 +74,11 @@ export const chrome: Readonly<{
     http2HpackIndexing: Readonly<{
         ':path': "without";
     }>;
+    http2HeadersPriority: Readonly<{
+        exclusive: true;
+        streamDependency: 0;
+        weight: 255;
+    }>;
     http2PseudoHeaderOrder: readonly string[];
     headerOrder: readonly string[];
     headers: readonly string[][];

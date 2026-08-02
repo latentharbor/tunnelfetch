@@ -516,6 +516,9 @@ function registerHttp2(client, key, conn) {
       ...(client.options.http2HpackIndexing
         ? { hpackIndexing: client.options.http2HpackIndexing }
         : {}),
+      ...(client.options.http2HeadersPriority
+        ? { headersPriority: client.options.http2HeadersPriority }
+        : {}),
       onClose: () => {
         client._h2conns.delete(h2);
         // Only drop the keyed entry if it is still this connection; a newer one may have replaced it.

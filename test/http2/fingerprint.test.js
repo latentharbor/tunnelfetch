@@ -20,6 +20,7 @@ import { readFrame, parseSettings, parseWindowUpdate } from '../../src/http2/fra
 import { FRAME } from '../../src/http2/constants.js';
 import { applyProfile } from '../../src/profiles.js';
 import { chrome as chromeProfile } from '../../src/profile/chrome.js';
+import { curl as curlProfile } from '../../src/profiles.js';
 
 /**
  * Drive a connection and read the exact frames it writes as its preface flight. A real peer keeps
@@ -241,4 +242,70 @@ test('the chrome profile declares the HPACK indexing that was captured from Chro
   // The ORDER differs — curl is :method,:scheme,:authority,:path and Chromium is m,a,s,p — which is
   // the pseudo-header order each profile already declares, now confirmed against a recording.
   assert.deepEqual(folded.http2PseudoHeaderOrder, [':method', ':authority', ':scheme', ':path']);
+});
+
+// ---------------------------------------------------------------------------------------------
+// PRIORITY on the request HEADERS, asserted as WIRE BYTES through the whole chain.
+//
+// Three bugs in this area have had one shape: a value declared in a profile and not read, or read
+// under another name, or read from a different source than the one advertised. `http2ConnectionWindow`
+// was dead. The SETTINGS flight was one curl's above another's. The flow-control window was
+// advertised at 64 KiB and accounted at 10 MiB, which hung every large body.
+//
+// Every one of those would have been caught by a test that folded the profile the way the Client
+// folds it and then read the bytes off the wire. So that is what these do, rather than asserting
+// that an option arrived somewhere.
+test('the chrome profile puts Chromium\'s PRIORITY on the wire, byte for byte', async () => {
+  const folded = applyProfile({ profile: chromeProfile, http2: true });
+  const { a, b } = duplexPair();
+  const conn = new Http2Connection(a, {
+    settings: folded.http2Settings,
+    connectionWindow: folded.http2ConnectionWindow,
+    pseudoHeaderOrder: folded.http2PseudoHeaderOrder,
+    hpackIndexing: folded.http2HpackIndexing,
+    headersPriority: folded.http2HeadersPriority,
+  });
+  const reader = new ByteReader(b.readable);
+  await reader.readExactly(24, 'preface');
+  await readFrame(reader); // SETTINGS
+  await readFrame(reader); // WINDOW_UPDATE
+  const req = conn.request({
+    method: 'GET', scheme: 'https', authority: 'origin.example', path: '/deep/path', headers: [],
+  });
+  req.catch(() => {});
+  const headers = await readFrame(reader);
+
+  assert.equal(headers.type, FRAME.HEADERS);
+  assert.ok(headers.flags & 0x20, 'PRIORITY flag is not set');
+  // 0x80 0x00 0x00 0x00 0xff — exclusive, dependency 0, weight byte 255. Recorded from Chromium.
+  assert.deepEqual(
+    [...headers.payload.subarray(0, 5)],
+    [0x80, 0x00, 0x00, 0x00, 0xff],
+    'the priority block is not the one captured from Chromium',
+  );
+  await conn.close().catch(() => {});
+});
+
+test('the curl profile sets no PRIORITY, because curl does not', async () => {
+  const folded = applyProfile({ profile: curlProfile, http2: true });
+  const { a, b } = duplexPair();
+  const conn = new Http2Connection(a, {
+    settings: folded.http2Settings,
+    pseudoHeaderOrder: folded.http2PseudoHeaderOrder,
+    hpackIndexing: folded.http2HpackIndexing,
+    headersPriority: folded.http2HeadersPriority,
+  });
+  const reader = new ByteReader(b.readable);
+  await reader.readExactly(24, 'preface');
+  await readFrame(reader);
+  await readFrame(reader);
+  const req = conn.request({
+    method: 'GET', scheme: 'https', authority: 'origin.example', path: '/deep/path', headers: [],
+  });
+  req.catch(() => {});
+  const headers = await readFrame(reader);
+  assert.equal(headers.flags & 0x20, 0, 'the curl identity gained a PRIORITY flag');
+  // The block must start at byte 0 — no five bytes of priority in front of it.
+  assert.equal(headers.payload[0], 0x82, ':method is not the first thing in the block');
+  await conn.close().catch(() => {});
 });
