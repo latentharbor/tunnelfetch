@@ -15,6 +15,15 @@ const EMPTY = new Uint8Array(0);
  * so a large view never delays delivery; it only lets bytes the transport has already buffered
  * arrive in one crossing instead of many.
  */
+// Swept on the edge against a real proxied socket, ms of CPU per 4 MB body at the record layer:
+//
+//     16 KiB  42.0     64 KiB  38.5     256 KiB  46.5     1 MiB  57.0
+//
+// A U with its floor on the current value, and going LARGER is worse — 1 MiB costs 48% more than
+// the default, because allocating the view outgrows the boundary crossings it saves. Recorded so
+// the next person to reach for this knob does not have to re-run the sweep to find there is nothing
+// in it: the 42 ms this layer costs on a 4 MB body is the price of moving bytes off a real socket,
+// of which the AEAD is under 2 ms. It is not a tuning problem.
 const BYOB_PULL_BYTES = 65536;
 
 /** Raised when the peer stops sending in the middle of a structure we must read whole. */
@@ -50,8 +59,15 @@ export class UnexpectedEofError extends TunnelFetchError {
  * ReadableStream in this package and its tests) take the default-reader path unchanged.
  */
 export class ByteReader {
-  /** @param {ReadableStream<Uint8Array>} readable */
-  constructor(readable) {
+  /**
+   * @param {ReadableStream<Uint8Array>} readable
+   * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because it
+   *   decides how many times a body crosses the runtime boundary on the way in, and that turned out
+   *   to be the largest single cost in a large response — 42 ms of a 106 ms 4 MB request is socket
+   *   reads and record decryption, of which the AEAD itself is under 2 ms.
+   */
+  constructor(readable, pullBytes = BYOB_PULL_BYTES) {
+    this._pullBytes = pullBytes > 0 ? pullBytes : BYOB_PULL_BYTES;
     /** @type {ReadableStreamBYOBReader | null} */
     this._byob = null;
     try {
@@ -100,7 +116,7 @@ export class ByteReader {
   async _pull() {
     if (this._eof) return false;
     const { value, done } = this._byob
-      ? await this._byob.read(new Uint8Array(BYOB_PULL_BYTES))
+      ? await this._byob.read(new Uint8Array(this._pullBytes))
       : await this._reader.read();
     if (done) {
       this._eof = true;

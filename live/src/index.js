@@ -871,6 +871,61 @@ async function cryptoBench(op, n, params = null) {
     return { op, mb, variant, bytes: buf.byteLength };
   }
 
+
+  if (op === 'slice-cost') {
+    // What the h2 receive path pays for `recvQueue.push(data.slice())`: one copy of every DATA
+    // payload. Priced on its own so the decision to remove a defensive copy from security-critical
+    // framing code is made against a number rather than a feeling.
+    const bytes = Math.round(mb * 1048576);
+    const chunk = Math.round(Number(params?.get?.('fsz') ?? 16384));
+    const src2 = new Uint8Array(bytes);
+    const keep = [];
+    for (let o = 0; o < bytes; o += chunk) {
+      const view = src2.subarray(o, Math.min(o + chunk, bytes));
+      keep.push(params?.get?.('copy') === '0' ? view : view.slice());
+    }
+    let n = 0;
+    for (const k of keep) n += k.byteLength;
+    assertBytes(n, bytes, op);
+    return { op, mb, chunk, copies: keep.length, bytes: n };
+  }
+
+  if (op === 'plaintext-shape') {
+    // The record layer hands its plaintext up as `new ReadableStream({ pull })` at highWaterMark 0.
+    // That is a JS layer in the byte path, and replacing a JS layer is the shape that won for the
+    // decode stage. `identity` pushes the same chunks through Cloudflare's native relay instead.
+    // Not a drop-in: highWaterMark 0 is deliberate (an eager pull parks a socket read on every
+    // connection before a request is written), so this measures whether the prize is worth
+    // redesigning back-pressure for.
+    const bytes = Math.round(mb * 1048576);
+    const chunk = Math.round(Number(params?.get?.('fsz') ?? 16384));
+    const shape = params?.get?.('shape') ?? 'js';
+    const total = Math.ceil(bytes / chunk);
+    let sent = 0;
+    let out;
+    if (shape === 'identity') {
+      const t = new IdentityTransformStream();
+      out = t.readable;
+      (async () => {
+        const w = t.writable.getWriter();
+        while (sent < total) { sent++; await w.write(new Uint8Array(chunk)); }
+        await w.close();
+      })().catch(() => {});
+    } else {
+      out = new ReadableStream({
+        async pull(c) {
+          if (sent >= total) { c.close(); return; }
+          sent++;
+          c.enqueue(new Uint8Array(chunk));
+        },
+      }, { highWaterMark: 0 });
+    }
+    const rd = out.getReader();
+    let got = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; got += value.byteLength; }
+    return { op, mb, shape, chunks: total, bytes: got };
+  }
+
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
     const fix = await bodyFixture(mb, src);
@@ -1665,6 +1720,87 @@ export default {
         }
       }));
     }
+
+    if (url.searchParams.get('depth')) {
+      // The same ladder as the isolated benches, but over a REAL proxied socket.
+      //
+      // Every bench so far fed its layer from an in-memory stream. The shipped path reads from
+      // cloudflare:sockets, where the chunking is decided by the kernel and the network and every
+      // read crosses the runtime boundary. That difference is the leading suspect for the two
+      // thirds of a 4 MB request that the isolated ladder does not account for, and it cannot be
+      // measured by anything that does not open a socket.
+      //
+      //   tls     openConnection (proxy CONNECT + handshake + record layer), h1 request, drain
+      //           the PLAINTEXT. Everything below HTTP framing.
+      //   h2      the same connection with ALPN h2 + Http2Connection, body drained, NOT decoded.
+      //   client  the real Client with decompress:false — adds client.js plumbing over `h2`.
+      //   full    the real Client, decoding, maxBodyBytes Infinity.
+      const depth = url.searchParams.get('depth');
+      const target = url.searchParams.get('target');
+      const reps = Number(url.searchParams.get('reps') ?? 1);
+      markPath('depth', { depth, target, reps: String(reps), pull: url.searchParams.get('pull') ?? null });
+      const href = `https://${target}`;
+      let bytes = 0;
+      try {
+
+      if (depth === 'tls' || depth === 'h2') {
+        const pb = Number(url.searchParams.get('pull') ?? 0);
+        const conn2 = await openConnection({
+          url: href, connect, proxy,
+          alpn: depth === 'h2' ? ['h2'] : ['http/1.1'],
+          ...(pb > 0 ? { tls: { pullBytes: pb } } : {}),
+        });
+        try {
+          if (depth === 'h2') {
+            const h2 = new Http2Connection(conn2, {});
+            for (let i = 0; i < reps; i++) {
+              const u = new URL(href);
+              const r = await h2.request({ method: 'GET', scheme: 'https', authority: u.host,
+                path: u.pathname + u.search + (u.search ? '&' : '?') + 'i=' + i,
+                headers: [['accept-encoding', 'gzip']] });
+              const rd = r.body.getReader();
+              for (;;) { const { done, value } = await rd.read(); if (done) break; bytes += value.byteLength; }
+            }
+            await h2.close().catch(() => {});
+          } else {
+            // No HTTP parsing at all, which is the entire point of this depth: pipeline `reps`
+            // requests, mark the last Connection: close, then read to EOF counting bytes. What is
+            // being priced is the socket and the TLS record layer and nothing above them.
+            //
+            // The first version sent one request, ignored `reps`, and made the differenced cost a
+            // meaningless ~1 ms. The second parsed Content-Length, which this origin does not send
+            // (Cloudflare gzips on the fly and chunks). Reading to EOF needs neither.
+            const u = new URL(href);
+            const w = conn2.writable.getWriter();
+            let req = '';
+            for (let i = 0; i < reps; i++) {
+              req += `GET ${u.pathname}${u.search}&i=${i} HTTP/1.1\r\nHost: ${u.host}\r\n` +
+                `Accept-Encoding: gzip\r\nConnection: ${i === reps - 1 ? 'close' : 'keep-alive'}\r\n\r\n`;
+            }
+            await w.write(enc.encode(req));
+            w.releaseLock();
+            const rd = conn2.readable.getReader();
+            for (;;) { const { done, value } = await rd.read(); if (done) break; bytes += value.byteLength; }
+          }
+        } finally { await conn2.close?.(); }
+        return Response.json({ depth, target, reps, bytes });
+      }
+
+      const client = new Client({ connect, proxy, forceTunnel: true,
+        ...(depth === 'client' ? { decompress: false } : { maxBodyBytes: Infinity }),
+        timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 } });
+      try {
+        for (let i = 0; i < reps; i++) {
+          const r = await client.fetch(`${href}${href.includes('?') ? '&' : '?'}i=${i}`);
+          bytes += (await r.arrayBuffer()).byteLength;
+        }
+      } finally { await client.close(); }
+      return Response.json({ depth, target, reps, bytes });
+      } catch (e) {
+        return Response.json({ depth, error: String(e?.stack ?? e?.message ?? e).slice(0, 400) }, { status: 500 });
+      }
+    }
+
     if (url.searchParams.get('sizecmp')) {
       // Platform fetch against this package, same real origins, same run. A size-controlled origin
       // of our own is unusable here: Cloudflare error 1042 refuses a Worker fetching a Worker on
@@ -1672,7 +1808,7 @@ export default {
       const which = url.searchParams.get('sizecmp'); // 'native' | 'pkg'
       const target = url.searchParams.get('target');
       const reps = Number(url.searchParams.get('reps') ?? 1);
-      markPath('sizecmp', { which, target, reps });
+      markPath('sizecmp', { which, target, reps, cap: url.searchParams.get('cap') ?? null });
       let bytes = 0, status = 0;
       if (which === 'native') {
         for (let i = 0; i < reps; i++) {
@@ -1681,7 +1817,12 @@ export default {
           bytes += (await r.arrayBuffer()).byteLength;
         }
       } else {
+        // cap=0 means maxBodyBytes: Infinity, which is what enables the native decode relay added
+        // in 1.7.0. Without it the default 32 MiB applies and the counting wrapper is used, so the
+        // two are the honest before/after for that change on a real end-to-end path.
+        const capRaw = Number(url.searchParams.get('cap') ?? -1);
         const client = new Client({ proxy, connect,
+          ...(capRaw === 0 ? { maxBodyBytes: Infinity } : capRaw > 0 ? { maxBodyBytes: capRaw } : {}),
           timeouts: { connectMs: 10000, handshakeMs: 15000, headersMs: 25000, idleMs: 25000 } });
         try {
           for (let i = 0; i < reps; i++) {
