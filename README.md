@@ -677,8 +677,21 @@ carrying around:
 | 256 KB | 18.2 ms | 16.7 ms | 24.2 ms |
 | 1 MB | 54.8 ms | 53.3 ms | 60.8 ms |
 | 4 MB | 119.8 ms | 118.3 ms | 125.8 ms |
-| **First request in a fresh isolate** | +46 ms | — | — |
-| **…after `warmup({ iterations: 5 })`** | +16 ms | — | — |
+
+The cold-start cost is a **total**, not something to add to a row above:
+
+| First request in a fresh isolate | cost of that request | excess over the warm floor, whole ramp |
+| --- | --- | --- |
+| without `warmup()` | **46 ms** | 61 ms (≈ 4.4 ms/request over an isolate's early life) |
+| `warmup()` once | 22 ms | 40 ms (≈ 2.8 ms/request) |
+| `warmup({ iterations: 5 })` | **16 ms** | 15 ms (≈ 1.1 ms/request) |
+
+Both figures used to appear in the table above as "+46 ms" and "+16 ms", which turned a total into
+an increment and doubled the documented cold start. The `+` is refutable from the numbers alone: a
+first request that cost 9.2 + 16 would carry 16 ms of excess by itself, which is more than the 15 ms
+of excess the *whole* ramp contains. These were measured on a small body; a cold isolate's first
+4 MB request has never been measured and is certainly worse, since far more of the decode loop runs
+interpreted.
 
 Measured through a proxy against a size-controlled origin, eight rounds per size, HTTP/2, gzip on
 the wire. Connection and per-request terms were separated by varying the reuse count rather than
@@ -694,13 +707,25 @@ window is 32 KiB, so a repeat period that large does not compress away.
 
 The correction is large. Body-heavy rows are **two to three times** what this table said through
 1.4.0, and no amount of care about medians or minimums would have caught it, because the numbers
-were internally consistent — they were answers to the wrong question. A second, independent
-measurement agrees: fetching a real 3.6 MB file from a CDN costs 142 ms, against 120 ms predicted
-here.
+were internally consistent — they were answers to the wrong question.
 
-Two cautions on reading it. The 2.8:1 content is slightly *less* compressible than a typical page,
-so these are mildly conservative rather than optimistic. And CPU on this platform varies by up to
-~1.5× between isolates, so the shape matters more than any single figure.
+**Read the two right-hand columns as derived, because they are.** Only the pooled column is measured
+per size; "new connection" is the pooled figure plus a flat 7.5 ms and "averaged over 5 pages" is
+the pooled figure plus 1.5 ms, which is why the deltas are identical to one decimal across a 4000×
+range in body size. That 7.5 ms also does not agree with the 9.8 ms quoted just above it, and the
+2.25 ms per further request is larger than the entire 1.7 ms a pooled 1 KB request costs, which
+would make a 1 KB body cost negative. The two came from different sweeps, and combining them is the
+cross-sweep comparison this document tells you never to make. **Treat the connection term as
+somewhere in 7–10 ms and do not do arithmetic with it.**
+
+An independent check was quoted here as agreement and is not: a real 3.6 MB file from a CDN cost
+142 ms against the ~120 ms this table predicts for 4 MB. That is the model under-predicting by
+roughly 20%, in the same direction as the error it had just replaced. It belongs here as a caution,
+not as corroboration.
+
+Two further cautions. The 2.76:1 content is slightly *less* compressible than a typical page, so
+these are mildly conservative rather than optimistic. And CPU on this platform varies by up to ~1.5×
+between isolates, so the shape matters more than any single figure.
 
 ### What the optional switches cost
 
@@ -841,7 +866,42 @@ EC chain carries two P-384 links, so **an all-ECDSA chain validates in ~3.5 ms a
 an RSA one**. If you control the origin, its certificate's key type is worth a thought.
 
 For small responses, decoding is dominated by constructing the `DecompressionStream`, not by the
-bytes: ~2 ms for a 559-byte body, so for small JSON `decompress: false` can be cheaper than gzip.
+bytes: ~2 ms for a 559-byte body. That is a real fixed cost, but the advice this README used to
+draw from it — that `decompress: false` can be cheaper for small JSON — **is backwards for anything
+that is not tiny, and it was never measured against the alternative.**
+
+Cost here scales with **wire** bytes, not decoded bytes, because every wire byte is decrypted,
+reframed and moved across JS stream boundaries before the decompressor ever sees it. Measured on
+the edge: receiving a 4 MB body **uncompressed** costs the same as receiving the 1.5 MB gzip of it
+*and inflating that*. Turning compression off trades a decompression you would have paid for 2.7×
+the bytes through the entire receive pipeline. **Leave compression on.** The fixed ~2 ms only wins
+below roughly the size where a single wire read covers the whole body.
+
+### Cost parity with the platform's `fetch` is not reachable, and here is the floor
+
+Two independent investigations reached this separately, which is the main reason it is stated this
+flatly.
+
+`gz-native` — the runtime's own `DecompressionStream` inflating 1.5 MB of gzip into 4 MB, collected
+natively, with **no JS drain and no receive stack whatsoever** — costs **16 ms**, reproduced across
+five independent sweeps. The platform's entire 4 MB `fetch`, TLS and HTTP and inflate included,
+costs about **3.6 ms**.
+
+So the cheapest way this package could possibly turn that gzip into bytes is already **4.4× the
+platform's whole request**, before one byte of TLS or HTTP/2 is touched. The asymmetry is not about
+code quality: **Cloudflare bills the CPU of a `DecompressionStream` running in your isolate and does
+not bill the equivalent gunzip inside its own `fetch`.** Nothing written in JavaScript goes below a
+billed native floor.
+
+The remaining ~30× is the JS-orchestrated record layer, HTTP/2 demultiplexing and stream pipeline —
+roughly **80% of the per-request cost at 4 MB, against 20% for decode**. An earlier version of this
+section put the emphasis on decoding; that was wrong, and it sent optimisation effort at the smaller
+of the two.
+
+What would close it is a primitive that does not exist: a `startTls` that verifies the **origin**
+hostname rather than the `connect()` peer, which would let the platform's own `fetch` run inside the
+tunnel. That is the missing piece this whole package exists to work around, and it is worth
+understanding as a **capability gap in the runtime, not a performance bug here**.
 
 For large bodies the per-byte cost is not really per byte — it is per stream-boundary crossing.
 The runtime's `DecompressionStream` emits 4096-byte chunks and its sockets deliver reads of at
