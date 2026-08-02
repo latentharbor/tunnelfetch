@@ -997,6 +997,48 @@ async function cryptoBench(op, n, params = null) {
     return { op, error: 'unknown variant' };
   }
 
+
+  if (op === 'race-cost') {
+    // The per-chunk cost of DeadlineController.race, both ways, in one isolate.
+    //
+    // The old shape registered and unregistered an abort listener on every call — invisible across
+    // the few dozen chunks of a 4 MB body, and the dominant per-event cost on an SSE stream where a
+    // single completion is a hundred thousand chunks of a few hundred bytes. The new shape creates
+    // one rejecting promise for the controller's lifetime and races against it.
+    const n = Math.max(1, Number(params?.get?.('n') ?? 20000));
+    const variant = params?.get?.('variant') ?? 'shared';
+    const ac = new AbortController();
+    const sig = ac.signal;
+    let shared = null;
+    const sharedP = () => {
+      if (!shared) {
+        shared = new Promise((_, rej) => sig.addEventListener('abort', () => rej(sig.reason), { once: true }));
+        shared.catch(() => {});
+      }
+      return shared;
+    };
+    let sink = 0;
+    for (let i = 0; i < n; i++) {
+      const p = Promise.resolve(i);
+      let v;
+      if (variant === 'listener') {
+        // the old race(), verbatim in shape
+        v = await new Promise((resolve, reject) => {
+          const onAbort = () => reject(sig.reason);
+          sig.addEventListener('abort', onAbort, { once: true });
+          p.then((x) => { sig.removeEventListener('abort', onAbort); resolve(x); },
+                 (e) => { sig.removeEventListener('abort', onAbort); reject(e); });
+        });
+      } else if (variant === 'shared') {
+        v = await Promise.race([p, sharedP()]);
+      } else {
+        v = await p;   // floor: the await itself, no deadline machinery at all
+      }
+      sink += v & 1;
+    }
+    return { op, n, variant, sink };
+  }
+
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
     const fix = await bodyFixture(mb, src);
@@ -1814,6 +1856,10 @@ export default {
 
       const body = JSON.stringify({
         model, stream: true, max_completion_tokens: maxTok,
+        // Ask the API for its own token accounting instead of inferring it from byte counts. Every
+        // token figure in this rig until now was an estimate from response size, and one of them
+        // was wrong by an order of magnitude.
+        stream_options: { include_usage: true },
         // A deterministic prompt that reliably produces a long stream: the point is event COUNT.
         // Ask for far more than the budget allows, so max_completion_tokens is what actually
         // decides the length and every arm streams exactly the same number of tokens.
@@ -1821,16 +1867,26 @@ export default {
         // measurement in this rig until now was receive-side; a 20K-token request is ~80 KB of JSON
         // that has to be serialised, buffered, encrypted and framed before anything comes back, and
         // that cost has never been measured.
-        messages: [{ role: 'user', content:
+        // `echo` forces genuinely long output: the model is asked to reproduce a block it was just
+        // given, which it will do mechanically for as long as the budget allows. "Count to N" does
+        // not work — this model stops on its own at ~1000 tokens regardless of the budget, which is
+        // how a whole set of measurements ended up being the same workload three times over.
+        messages: url.searchParams.get('mode') === 'echo'
+          ? [{ role: 'user', content: 'Repeat the following block back to me VERBATIM, in full, with no commentary:\n\n'
+              + Array.from({ length: Math.max(1, Math.round(padTok/8)) },
+                  (_, i) => `${i+1}. the quick brown fox jumps over the lazy dog near the river bank`).join('\n') }]
+          : [{ role: 'user', content:
           (padTok > 0 ? 'Ignore this reference block.\n' + 'lorem ipsum dolor sit amet '.repeat(Math.round(padTok/5)) + '\n' : '')
           + `Count from 1 to 20000, one number per line.` }],
       });
       const headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` };
       const url2 = 'https://api.openai.com/v1/chat/completions';
 
-      let events = 0, bytes = 0, status = 0;
+      let events = 0, bytes = 0, status = 0, firstChunk = '', firstEvent = '', usage = null;
+      let encSeen = null;
       const drain = async (res) => {
         status = res.status;
+        encSeen = res.headers.get('content-encoding') ?? 'none';
         const rd = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -1839,9 +1895,18 @@ export default {
           if (done) break;
           bytes += value.byteLength;
           buf += dec.decode(value, { stream: true });
+          if (firstChunk.length < 300) firstChunk += buf.slice(0, 300);
           // Count SSE events the way a consumer would, so the parse cost is in the measurement.
           let i;
-          while ((i = buf.indexOf('\n\n')) >= 0) { events++; buf = buf.slice(i + 2); }
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            events++;
+            const ev = buf.slice(0, i);
+            if (ev.includes('"usage"')) { try {
+              usage = JSON.parse(ev.replace(/^data:\s*/, '')).usage ?? usage;
+            } catch {} }
+            if (!firstEvent && ev.startsWith('data:')) firstEvent = ev.slice(0, 220);
+            buf = buf.slice(i + 2);
+          }
         }
       };
 
@@ -1853,11 +1918,15 @@ export default {
         // and nothing else. AI APIs do not need multiplexing, so the cheaper framing may just win.
         const client = new Client({ connect, proxy, forceTunnel: true, maxBodyBytes: Infinity,
           ...(url.searchParams.get('h1') ? { http2: false } : {}),
+          // `nodec` strips the decode stage. If an SSE stream arrives gzipped, every ~282-byte
+          // event goes through the decompressor, and that would be the whole gap to native fetch.
+          // Differencing this against the default says whether the cost is decode or transport.
+          ...(url.searchParams.get('nodec') ? { decompress: false } : {}),
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 60000, idleMs: 60000 } });
         try { await drain(await client.fetch(url2, { method: 'POST', headers, body })); }
         finally { await client.close(); }
       }
-      return Response.json({ which, h1: !!url.searchParams.get('h1'), model, tok: maxTok, inp: padTok, reqBytes: body.length, status, events, bytes,
+      return Response.json({ which, h1: !!url.searchParams.get('h1'), model, tok: maxTok, inp: padTok, reqBytes: body.length, status, events, bytes, usage, firstEvent, enc: encSeen,
         proto: null });
     }
 

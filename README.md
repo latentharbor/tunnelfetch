@@ -1084,6 +1084,38 @@ For scale: at these sizes the model's own bill is about **$0.0088 per request**,
 CPU is **0.011%** of what you pay. Turn h2 off because it is free, not because it will show up on an
 invoice.
 
+### Streaming APIs, and what they cost
+
+An SSE response from an LLM API is the opposite shape to everything else measured here: a small body
+arriving as one event per output token rather than a large one in a few chunks. The per-chunk costs
+that are a footnote for a 4 MB page are the whole bill here.
+
+Measured against a real streaming endpoint through a proxy, with the API's own `usage` block as the
+token count rather than an estimate from response size:
+
+| | per event | per 1M output tokens |
+| --- | --- | --- |
+| this package | **250–310 µs** | $5,000–6,200 |
+| platform `fetch` — reference; it cannot use a proxy | ~105 µs | $2,100 |
+
+Events map to output tokens roughly 1:1, so a 128K-token completion is about **35 s of CPU**. That
+is spread across the minutes the model takes to generate it — utilisation is 2–5%, so it is a
+billing question, not a capacity one.
+
+**As a share of what you pay, it is constant.** CPU and the model's output charge both scale with
+output tokens, so the ratio does not move with length: at $0.6/M output it is **~0.9% of the model
+bill**, at any size. Input tokens appear only in the denominator and push it lower.
+
+A range is given rather than a figure because this measurement repeats to about ±20%. Two things
+were tried and did not survive that: HTTP/1.1 came out ahead of HTTP/2 in one sweep and behind in
+the next, and turning decoding off measured both faster and slower. **Neither is a recommendation.**
+
+Splitting the gap to the platform's own `fetch`: decoding is a small part of it and the transport is
+~155 µs per event, spread across the record layer, framing, the byte reader, the body stream and the
+deadline wrapper — a few tens of microseconds each, with no single layer to remove. That is why the
+`IdentityTransformStream` win on large bodies has no equivalent here: there, one JavaScript layer
+could be deleted outright; here there are seven, each small.
+
 ### Plan limits
 
 On the paid plan the 30 s default CPU limit is not the binding constraint — that is roughly 3 000
