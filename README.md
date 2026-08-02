@@ -426,10 +426,22 @@ pinned in `test/tls/fingerprint.test.js` and `test/http2/fingerprint.test.js`.
 | Supported groups | `x25519, secp256r1, secp384r1, secp521r1` | `tls.groups` |
 | Signature algorithms | ECDSA and RSA-PSS/PKCS#1 over SHA-256/384/512 | `tls.sigSchemes` |
 | ALPN | `h2, http/1.1` | `tls.alpn` |
-| HTTP/2 `SETTINGS` ids **and order** | curl's: `MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
+| HTTP/2 `SETTINGS` ids **and order** | curl's: `MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH`. The **values** differ by default — see below | `http2Settings` |
 | h2 preface, `WINDOW_UPDATE`, pseudo-header order | curl's, byte-for-byte | `http2ConnectionWindow`, `http2PseudoHeaderOrder` |
 | HPACK representation | curl's (`:path` without indexing, the rest incremental) | `http2HpackIndexing` |
 | `Accept-Encoding` | `gzip, deflate` — curl's | `decoders` appends |
+
+**The default `SETTINGS` values are this package's, not curl's, and that is a deliberate trade.**
+`profiles.curl` carries curl 8.21.0's real `INITIAL_WINDOW_SIZE` of **64 KiB**, captured and pinned
+in `test/tls/_captured-h2.js`. The connection default without a profile is **10 MiB**, which is what
+curl 8.7.1 sent and what this package keeps for throughput: a 64 KiB stream window means far more
+`WINDOW_UPDATE` round trips on a large body, and the cost work in this README shows body transfer is
+where the money is. **That throughput difference has not been measured**, so if you are moving large
+bodies under `profiles.curl`, measure it before relying on it — or set `http2Settings` yourself.
+
+Until 1.6.2 the profile carried curl **8.7.1's** window while presenting curl **8.21.0's**
+ClientHello: one named client, two source versions, and a split identity that only a capture could
+find, because each half was individually true of some curl.
 
 Extension order matters because JA3 and JA4 hash the extension list **in wire order**, so it is most
 of what a fingerprinter reads. `pre_shared_key` is forced last whatever you ask for: RFC 8446

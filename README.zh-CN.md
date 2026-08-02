@@ -334,10 +334,19 @@ curl（8.7.1 / nghttp2），照线上抓包原样复刻。这么做是实证需�
 | supported_groups | `x25519, secp256r1, secp384r1, secp521r1` | `tls.groups` |
 | 签名算法 | SHA-256/384/512 上的 ECDSA 与 RSA-PSS/PKCS#1 | `tls.sigSchemes` |
 | ALPN | `h2, http/1.1` | `tls.alpn` |
-| HTTP/2 `SETTINGS` 的 id **与顺序** | curl 的：`MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
+| HTTP/2 `SETTINGS` 的 id **与顺序** | curl 的：`MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH`。**取值**默认不同——见下 | `http2Settings` |
 | h2 前导、`WINDOW_UPDATE`、伪头顺序 | curl 的，逐字节一致 | `http2ConnectionWindow`、`http2PseudoHeaderOrder` |
 | HPACK 表示 | curl 的（`:path` 不索引，其余 incremental） | `http2HpackIndexing` |
 | `Accept-Encoding` | `gzip, deflate`——curl 的 | `decoders` 会追加 |
+
+**默认的 `SETTINGS` 取值是本包自己的，不是 curl 的，这是一个有意的取舍。** `profiles.curl` 带的是
+curl 8.21.0 实测的 `INITIAL_WINDOW_SIZE` = **64 KiB**，抓包固化在 `test/tls/_captured-h2.js`。而不加
+profile 时连接的默认值是 **10 MiB**——那是 curl 8.7.1 发的值，本包为吞吐保留它：64 KiB 的流窗口意味着大
+body 上要多得多的 `WINDOW_UPDATE` 往返，而本文档的成本部分已经说明，钱就花在 body 传输上。**这个吞吐差异
+我没有实测过**，所以如果你在 `profiles.curl` 下搬大 body，先测再依赖，或者自己设 `http2Settings`。
+
+1.6.2 之前，这个 profile 带着 curl **8.7.1** 的窗口，却呈现 curl **8.21.0** 的 ClientHello：同一个具名
+客户端，两个来源版本——一个只有抓包才能发现的身份分裂，因为两半各自都真的属于某个 curl。
 
 扩展顺序之所以要紧，是因为 JA3 和 JA4 哈希的正是**线上顺序**的扩展列表，那是指纹识别读到的主要内容。`pre_shared_key` 无论你怎么配都强制排最后：RFC 8446 §4.2.11 把 binder 的转录定义为"截到 binder 之前的那段 hello"，只有后面不跟东西时这个范围才成立。
 

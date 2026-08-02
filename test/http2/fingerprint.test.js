@@ -221,15 +221,24 @@ test('chrome and curl do not silently share an h2 preface', async () => {
   await b.conn.close();
 });
 
-// HPACK indexing is the one h2 fingerprint field the chrome capture does NOT cover, and this test
-// records that rather than letting it stay invisible. `_hpackIndexing` falls back to curl's
-// `:path`-without-indexing inside the connection, so the chrome profile currently presents curl's
-// HPACK representation. Closing that needs a capture, not a guess — see the README.
-test('the chrome profile has no captured HPACK indexing, and inherits curl\'s', async () => {
+// HPACK indexing WAS the one h2 field the chrome capture did not cover. 1.6.1 recorded that as a
+// gap and refused to guess; 1.6.2 captured it, and the answer was that Chromium and curl emit the
+// same representations. The guess would have been right, which is not a reason to have guessed.
+//
+// This test replaces the one that pinned the absence — that one existed to make supplying a value a
+// deliberate act, and it did its job by failing the moment a value appeared.
+test('the chrome profile declares the HPACK indexing that was captured from Chromium', async () => {
+  const { CHROME_HPACK, CURL_HPACK } = await import('../tls/_captured-h2.js');
   const folded = applyProfile({ profile: chromeProfile, http2: true });
-  assert.equal(
-    folded.http2HpackIndexing,
-    undefined,
-    'chrome now declares HPACK indexing — capture it, then assert the captured value here instead',
-  );
+  assert.deepEqual(folded.http2HpackIndexing, { ':path': 'without' });
+
+  // Both recordings agree, field for field, on how a request's pseudo-headers are represented:
+  // :path without indexing, everything else indexed or incremental. The profile's single entry is
+  // the whole of the difference from the package's default.
+  const shape = (h) => h.slice(0, 4).map((f) => f.kind);
+  assert.deepEqual(shape(CURL_HPACK), ['indexed', 'indexed', 'incremental', 'without']);
+  assert.deepEqual(shape(CHROME_HPACK), ['indexed', 'incremental', 'indexed', 'without']);
+  // The ORDER differs — curl is :method,:scheme,:authority,:path and Chromium is m,a,s,p — which is
+  // the pseudo-header order each profile already declares, now confirmed against a recording.
+  assert.deepEqual(folded.http2PseudoHeaderOrder, [':method', ':authority', ':scheme', ':path']);
 });

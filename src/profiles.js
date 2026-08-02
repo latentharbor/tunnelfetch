@@ -53,7 +53,14 @@ export const curl = Object.freeze({
   headerOrder: CURL_HEADER_ORDER,
   headers: Object.freeze([['User-Agent', 'curl/8.21.0']]),
   // Captured: MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH, in that order.
-  http2Settings: Object.freeze([[3, 100], [4, 10485760], [2, 0]]),
+  //
+  // INITIAL_WINDOW_SIZE is 65536 and used to be 10485760, which was curl 8.7.1's value. curl changed
+  // it between 8.7.1 and 8.21.0, and this profile's TLS half is captured from 8.21.0 — so the
+  // package was presenting one curl's ClientHello above a different curl's SETTINGS. A split
+  // identity inside a single named client, and one only a capture could find: both halves were
+  // internally consistent and each was individually true of SOME curl. See test/tls/_captured-h2.js,
+  // which holds both recordings side by side for exactly this reason.
+  http2Settings: Object.freeze([[3, 100], [4, 65536], [2, 0]]),
   http2PseudoHeaderOrder: Object.freeze([':method', ':scheme', ':authority', ':path']),
   http2HpackIndexing: Object.freeze({ ':path': 'without' }),
   requires: Object.freeze([]),
@@ -104,14 +111,18 @@ export const chrome = Object.freeze({
   // both fingerprints are exactly what the browser normally sends.
   http2Settings: Object.freeze([[1, 65536], [2, 0], [4, 6291456], [6, 262144]]),
   http2ConnectionWindow: 15663105 + 65535,
-  // NOT captured: http2HpackIndexing. So this identity currently presents curl's HPACK
-  // representation (`:path` without indexing, everything else incremental) under a Chromium
-  // ClientHello, which is the split identity this whole module exists to prevent — narrowed to one
-  // field, but real, and named here rather than left to be discovered. It is not in `requires`
-  // because refusing the profile outright over one uncaptured field would take away the working
-  // 90% of the identity, and because the honest fix is a capture rather than a guess: this package
-  // does not invent fingerprint values. See test/http2/fingerprint.test.js, which pins the absence
-  // so that supplying it later is a deliberate act.
+  // Captured in 1.6.2, and the answer was that there was nothing to change: Chromium emits `:path`
+  // WITHOUT indexing and everything else incrementally, byte-identical in representation to curl.
+  // 1.6.1 recorded this as an uncaptured gap and refused to guess at it; the guess would in fact
+  // have been right, which is not a reason to have guessed. It is declared explicitly now so the
+  // identity states its own value instead of inheriting one by accident.
+  http2HpackIndexing: Object.freeze({ ':path': 'without' }),
+  // STILL a real difference, and newly found by the same capture: Chromium sets the PRIORITY flag
+  // on its request HEADERS frame (flags 0x25) and carries the five deprecated priority bytes.
+  // This package never sets it (see frames.js headersFrame), so the frame layout differs from
+  // Chromium's even where every value above it matches. Not in `requires` because it is a framing
+  // detail this package deliberately does not emit — RFC 9113 s5.3.2 deprecates it — but it is a
+  // signal a frame-level fingerprinter reads, and it is written down here rather than discovered.
   //
   // The connection window immediately above was DEAD until 1.6.1 — declared here, copied by
   // nothing, passed by nothing, and read under a different name — so every connection using this
