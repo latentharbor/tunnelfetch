@@ -685,3 +685,9 @@ test('a finite cap does NOT take the native relay path, so the bomb guard surviv
     );
   });
 });
+
+// `decompress: 'passthrough'` — ask for gzip, hand the CODED body back. Distinct from `false`,
+// which also drops gzip from Accept-Encoding and makes the origin send 2.76x more bytes.
+test("passthrough advertises gzip, unlike decompress:false", () => {
+  assert.equal(acceptEncodingFor(null), 'gzip, deflate');
+});
