@@ -434,10 +434,20 @@ pinned in `test/tls/fingerprint.test.js` and `test/http2/fingerprint.test.js`.
 **The default `SETTINGS` values are this package's, not curl's, and that is a deliberate trade.**
 `profiles.curl` carries curl 8.21.0's real `INITIAL_WINDOW_SIZE` of **64 KiB**, captured and pinned
 in `test/tls/_captured-h2.js`. The connection default without a profile is **10 MiB**, which is what
-curl 8.7.1 sent and what this package keeps for throughput: a 64 KiB stream window means far more
-`WINDOW_UPDATE` round trips on a large body, and the cost work in this README shows body transfer is
-where the money is. **That throughput difference has not been measured**, so if you are moving large
-bodies under `profiles.curl`, measure it before relying on it — or set `http2Settings` yourself.
+curl 8.7.1 sent and what this package keeps: a 64 KiB stream window means one `WINDOW_UPDATE` per
+32 KiB consumed instead of one per 5 MiB.
+
+**Measured, on a 8.7 MB body over h2 against a real origin, both windows interleaved in one
+isolate: the 64 KiB window costs about +1.4 ms of CPU per decompressed MB** — roughly **6–7%** on
+top of the ~21.7 ms/MB this package spends moving a large body. That is the price of the accurate
+fingerprint, and for most callers it is worth paying; if you are moving large bodies and do not need
+to look like curl, set `http2Settings` yourself.
+
+Two cautions on that number. The minimum-of-samples rule this document recommends elsewhere **fails
+here**: with unequal sample counts and a lossy origin the minima moved between +2 ms and +13 ms
+across sweeps, because the arm with more samples gets a lower minimum for free. The figure above is
+p25 and median, which agreed with each other and with the arithmetic — 8.7 MB at a 32 KiB replenish
+threshold is ~276 extra frames, and ~276 × ~47 µs is ~13 ms.
 
 Until 1.6.2 the profile carried curl **8.7.1's** window while presenting curl **8.21.0's**
 ClientHello: one named client, two source versions, and a split identity that only a capture could
