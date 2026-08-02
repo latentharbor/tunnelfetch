@@ -689,7 +689,7 @@ request**, and the body cost is what is left.
 origin they came from tiled a 150-byte HTML fragment, which gzip compressed **220:1** — so a "1 MB
 body" was four kilobytes on the wire, and every measurement taken against it priced decompression
 while erasing the per-wire-byte cost of TLS records and streaming entirely. Real pages compress
-around 4:1. The origin now tiles 256 KiB of real minified JavaScript, which lands at 2.8:1: gzip's
+around 4:1. The origin now tiles 154 KiB of real minified JavaScript, which lands at 2.76:1: gzip's
 window is 32 KiB, so a repeat period that large does not compress away.
 
 The correction is large. Body-heavy rows are **two to three times** what this table said through
