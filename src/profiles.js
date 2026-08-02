@@ -95,6 +95,19 @@ export const chrome = Object.freeze({
   // both fingerprints are exactly what the browser normally sends.
   http2Settings: Object.freeze([[1, 65536], [2, 0], [4, 6291456], [6, 262144]]),
   http2ConnectionWindow: 15663105 + 65535,
+  // NOT captured: http2HpackIndexing. So this identity currently presents curl's HPACK
+  // representation (`:path` without indexing, everything else incremental) under a Chromium
+  // ClientHello, which is the split identity this whole module exists to prevent — narrowed to one
+  // field, but real, and named here rather than left to be discovered. It is not in `requires`
+  // because refusing the profile outright over one uncaptured field would take away the working
+  // 90% of the identity, and because the honest fix is a capture rather than a guess: this package
+  // does not invent fingerprint values. See test/http2/fingerprint.test.js, which pins the absence
+  // so that supplying it later is a deliberate act.
+  //
+  // The connection window immediately above was DEAD until 1.6.1 — declared here, copied by
+  // nothing, passed by nothing, and read under a different name — so every connection using this
+  // profile sent curl's 1000 MiB increment. Four places had to agree and no test checked that they
+  // did. There is one now.
   // m,a,s,p — NOT curl's m,s,a,p. Measured, and a difference that would have been easy to miss.
   http2PseudoHeaderOrder: Object.freeze([':method', ':authority', ':scheme', ':path']),
   headerOrder: Object.freeze([
@@ -174,7 +187,11 @@ export function applyProfile(options) {
   for (const kind of ['ciphers', 'groups', 'decoders']) {
     if (p[kind]) out[kind] = { ...p[kind], ...(options[kind] ?? {}) };
   }
-  for (const key of ['headerOrder', 'http2Settings', 'http2PseudoHeaderOrder', 'http2HpackIndexing']) {
+  // Every h2 fingerprint field a profile can carry must be listed here. `http2ConnectionWindow`
+  // was missing, which made it dead config: the chrome profile declared Chromium's ~15 MiB window
+  // and every chrome connection sent curl's 1000 MiB one.
+  for (const key of ['headerOrder', 'http2Settings', 'http2ConnectionWindow',
+                     'http2PseudoHeaderOrder', 'http2HpackIndexing']) {
     if (options[key] === undefined && p[key] != null) out[key] = p[key];
   }
   // Profile headers are DEFAULTS: a request that sets its own User-Agent keeps it. They are folded

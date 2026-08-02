@@ -427,7 +427,8 @@ pinned in `test/tls/fingerprint.test.js` and `test/http2/fingerprint.test.js`.
 | Signature algorithms | ECDSA and RSA-PSS/PKCS#1 over SHA-256/384/512 | `tls.sigSchemes` |
 | ALPN | `h2, http/1.1` | `tls.alpn` |
 | HTTP/2 `SETTINGS` ids **and order** | curl's: `MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
-| h2 preface, `WINDOW_UPDATE`, pseudo-header order, HPACK representation | curl's, byte-for-byte | fixed |
+| h2 preface, `WINDOW_UPDATE`, pseudo-header order | curl's, byte-for-byte | `http2ConnectionWindow`, `http2PseudoHeaderOrder` |
+| HPACK representation | curl's (`:path` without indexing, the rest incremental) | `http2HpackIndexing` |
 | `Accept-Encoding` | `gzip, deflate` — curl's | `decoders` appends |
 
 Extension order matters because JA3 and JA4 hash the extension list **in wire order**, so it is most

@@ -501,6 +501,15 @@ function registerHttp2(client, key, conn) {
       // `tls`, and one being reachable while the other was not made "the fingerprint is
       // configurable" only half true.
       ...(client.options.http2Settings ? { settings: client.options.http2Settings } : {}),
+      // The connection-level WINDOW_UPDATE that follows the preface. It is part of the h2
+      // fingerprint and it was DEAD: `profiles.chrome` declared `http2ConnectionWindow`, nothing
+      // copied it out of the profile, nothing passed it here, and the connection reads an option
+      // spelled `connectionWindow`. The identifier appeared in exactly two places in the whole
+      // repository — the profile and its type declaration — so a Chromium ClientHello was followed
+      // by curl's 1000 MiB window increment, which is about as distinctive as an h2 client gets.
+      ...(client.options.http2ConnectionWindow
+        ? { connectionWindow: client.options.http2ConnectionWindow }
+        : {}),
       ...(client.options.http2PseudoHeaderOrder
         ? { pseudoHeaderOrder: client.options.http2PseudoHeaderOrder }
         : {}),
