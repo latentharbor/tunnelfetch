@@ -926,6 +926,36 @@ async function cryptoBench(op, n, params = null) {
     return { op, mb, shape, chunks: total, bytes: got };
   }
 
+
+  if (op === 'native-decode-probe') {
+    // Does the runtime decode a Content-Encoding on a Response we construct ourselves? If it does,
+    // the whole decode stage could be C++ with no JS in the byte path at all. Probing rather than
+    // reading docs, because what matters is what workerd does, not what the spec allows.
+    const fix = await bodyFixture(1, 'real');
+    const out = {};
+    const tryIt = async (name, fn) => {
+      try {
+        const n = await fn();
+        out[name] = n === fix.text.byteLength ? `DECODED (${n})`
+          : n === fix.gz.byteLength ? `passthrough (${n}, still gzip)` : `other (${n})`;
+      } catch (e) { out[name] = 'threw: ' + String(e?.message ?? e).slice(0, 90); }
+    };
+    await tryIt('Response + content-encoding', async () =>
+      (await new Response(fix.gz, { headers: { 'content-encoding': 'gzip' } }).arrayBuffer()).byteLength);
+    await tryIt('Response + encodeBody:manual', async () =>
+      (await new Response(fix.gz, { headers: { 'content-encoding': 'gzip' }, encodeBody: 'manual' }).arrayBuffer()).byteLength);
+    await tryIt('Response + encodeBody:automatic', async () =>
+      (await new Response(fix.gz, { headers: { 'content-encoding': 'gzip' }, encodeBody: 'automatic' }).arrayBuffer()).byteLength);
+    // A Request is the other side of the same machinery.
+    await tryIt('Request + content-encoding', async () =>
+      (await new Request('https://x/', { method: 'POST', body: fix.gz,
+        headers: { 'content-encoding': 'gzip' } }).arrayBuffer()).byteLength);
+    out.plain = (await new Response(fix.gz).arrayBuffer()).byteLength;
+    out.expectDecoded = fix.text.byteLength;
+    out.expectGzip = fix.gz.byteLength;
+    return { op, ...out };
+  }
+
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
     const fix = await bodyFixture(mb, src);
@@ -1786,12 +1816,24 @@ export default {
         return Response.json({ depth, target, reps, bytes });
       }
 
+      // depth=passthru: the real Client, still ASKING for gzip, but handing the body back coded.
+      // `decompress: false` alone also drops gzip from Accept-Encoding, so the wire grows 2.76x —
+      // it loses on both sides. Asking for gzip and passing it through is the combination that does
+      // not exist as an option today, and it is the one a proxy actually wants: the caller forwards
+      // the bytes with their Content-Encoding intact and never pays to decode them.
+      //
+      // Subtracting it from `full` gives the decode stage on the real path; subtracting `h2` from
+      // it gives what client.js costs BELOW decode — 41 ms of a 4 MB request that has never been
+      // looked at, and which I wrongly called exhausted.
       const client = new Client({ connect, proxy, forceTunnel: true,
-        ...(depth === 'client' ? { decompress: false } : { maxBodyBytes: Infinity }),
+        ...(depth === 'client' ? { decompress: false }
+          : depth === 'passthru' ? { decompress: false }
+          : { maxBodyBytes: Infinity }),
         timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 } });
       try {
         for (let i = 0; i < reps; i++) {
-          const r = await client.fetch(`${href}${href.includes('?') ? '&' : '?'}i=${i}`);
+          const r = await client.fetch(`${href}${href.includes('?') ? '&' : '?'}i=${i}`,
+            depth === 'passthru' ? { headers: { 'accept-encoding': 'gzip' } } : undefined);
           bytes += (await r.arrayBuffer()).byteLength;
         }
       } finally { await client.close(); }

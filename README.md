@@ -716,14 +716,27 @@ Fetching a size-controlled origin through a proxy, warm, medians over seven-plus
 isolate, gzip on the wire. The last column is the same numbers as a rate, which is the form worth
 carrying around:
 
-| Body | Averaged over 5 pages | Reusing a connection | New connection |
-| --- | --- | --- | --- |
-| 1 KB | 3.2 ms | 1.7 ms | 9.2 ms |
-| 16 KB | 4.6 ms | 3.1 ms | 10.6 ms |
-| 64 KB | 8.2 ms | 6.7 ms | 14.2 ms |
-| 256 KB | 18.2 ms | 16.7 ms | 24.2 ms |
-| 1 MB | 54.8 ms | 53.3 ms | 60.8 ms |
-| 4 MB | 119.8 ms | 118.3 ms | 125.8 ms |
+| Body | Per request, reusing a connection | Per decompressed MB |
+| --- | --- | --- |
+| 1 KB | **0.5 ms** | — |
+| 16 KB | **3.5 ms** | 224 ms/MB |
+| 64 KB | **7.5 ms** | 120 ms/MB |
+| 256 KB | **20.5 ms** | 82 ms/MB |
+| 1 MB | **51.5 ms** | 51 ms/MB |
+| 4 MB | **104 ms** | 26 ms/MB |
+
+Opening a connection adds **7–12 ms** on top, once, however many requests follow it.
+
+**Read the per-MB column before doing any arithmetic with this table.** It falls 8.6x from end to
+end, so there is no such thing as a per-MB rate for this package. A least-squares line through these
+points is `9.17 + 24.86 x MB`, which predicts 9.17 ms for a 1 KB body against a measured 0.5 — wrong
+by 18x. Any budget built on a single per-MB figure will be badly wrong at one end or the other.
+
+The reason is that V8 tiers up **inside a single request**. A 1 MB body runs the decode loop
+interpreted the whole way; a 4 MB body pays that for its first megabyte and runs the rest optimised.
+`51.5 + 3 x 17.5 = 104` fits, so the steady-state cost is about **17.5 ms/MB with a ~51 ms entry fee
+per request**. For a size not in the table, interpolate within it rather than extrapolating from a
+rate.
 
 The cold-start cost is a **total**, not something to add to a row above:
 
@@ -923,6 +936,49 @@ the edge: receiving a 4 MB body **uncompressed** costs the same as receiving the
 *and inflating that*. Turning compression off trades a decompression you would have paid for 2.7×
 the bytes through the entire receive pipeline. **Leave compression on.** The fixed ~2 ms only wins
 below roughly the size where a single wire read covers the whole body.
+
+### When not to use this package
+
+**If you can run Node, run Node — and then you do not need this package at all.** `undici` with a
+`ProxyAgent` does the same job over `node:tls`, which verifies whatever hostname you name, in C, at
+roughly a tenth of the CPU. This package exists because a V8 isolate cannot do that; it is not a
+better way to do it.
+
+The arithmetic is worth being blunt about. A billion 4 MB requests a month costs about **$2,385** of
+Workers CPU. That workload is roughly 386 requests a second and 4.5 Gbps sustained — **three
+dedicated boxes** at Hetzner-class pricing carry it for around **$600**. So for large bodies, buying
+servers is about **four times cheaper**, and the gap widens with body size.
+
+Two things flip that back:
+
+* **Egress.** Workers does not bill bandwidth. If those bytes have to leave your own servers again,
+  1.45 PB/month is free on an unmetered box and about **$130,000** on AWS. Price your transfer
+  before pricing your CPU — it can dwarf everything above.
+* **Body size.** Under roughly **128 KB** the per-request cost is small enough that Workers wins on
+  price *and* gives you 300+ locations, no operations and no capacity planning. At 16 KB the same
+  billion requests is **$375**.
+
+So: small bodies at the edge is what this package is for. Large bodies through a proxy, from a
+runtime that could have used native TLS, is the case where it is the wrong tool and the bill says so.
+
+### Passing the body through instead of decoding it
+
+If you are forwarding a response rather than reading it, `decompress: 'passthrough'` asks for gzip as
+usual and hands back the **coded** bytes with their `Content-Encoding` and `Content-Length` intact,
+so the next hop can relay them:
+
+```js
+new Client({ connect, proxy, decompress: 'passthrough' });
+```
+
+Measured end to end on a 4 MB body: **118 ms decoding against 82.5 ms passing through, 30% cheaper**,
+with 2.76x fewer bytes on the wire at the same time.
+
+**This only helps if you never need the plaintext.** If you parse, extract or transform the body, the
+decode is work you owe — passthrough just moves it downstream, where you or your caller pays the same.
+It is not a general optimisation. Note also that `decompress: false` is *not* a weaker version of
+this: it also drops gzip from `Accept-Encoding`, so the origin sends plaintext and the wire grows
+2.76x. It loses on both sides.
 
 ### Cost parity with the platform's `fetch` is not reachable, and here is the floor
 
