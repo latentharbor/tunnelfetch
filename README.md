@@ -819,16 +819,21 @@ Workers Standard bills $5/month including 10 million requests and 30 million CPU
 $0.30 per additional million requests and $0.02 per additional million CPU milliseconds. Applying
 the measurements above, with the charge split out so it is clear what is yours to change:
 
-| Workload | CPU/request | 10M/mo, cold | 10M/mo, warmed | 1B/mo, cold | 1B/mo, warmed |
-| --- | --- | --- | --- | --- | --- |
-| Platform `fetch`, 16 KB — reference; it cannot use a proxy | 0.3 ms | $5.00 | $5.00 | $307.40 | $307.40 |
-| Platform `fetch`, 4 MB — same reference, measured | 3.2 ms | $5.04 | $5.04 | $365.40 | $365.40 |
-| Pooled connection, 16 KB pages | 3.1 ms | $5.90 | $5.24 | $451.20 | $385.20 |
-| New connection per request, 16 KB | 10.6 ms | $7.41 | $6.75 | $602.20 | $536.20 |
-| Pooled connection, 1 MB pages | 53.3 ms | $15.94 | $15.28 | $1455.20 | $1389.20 |
-| New connection per request, 1 MB | 60.8 ms | $17.45 | $16.79 | $1606.20 | $1540.20 |
-| Pooled connection, 4 MB pages | 118.3 ms | $28.94 | $28.28 | $2755.20 | $2689.20 |
-| New connection per request, 4 MB | 125.8 ms | $30.45 | $29.79 | $2906.20 | $2840.20 |
+| Workload | CPU/request | 10M/mo | 1B/mo |
+| --- | --- | --- | --- |
+| Platform `fetch`, 16 KB — reference; it cannot use a proxy | 0.3 ms | $8.06 | $311.00 |
+| Platform `fetch`, 4 MB — same reference, measured | 3.2 ms | $8.64 | $369.00 |
+| Pooled connection, 16 KB pages | 3.5 ms | $8.70 | $375.00 |
+| New connection per request, 16 KB | 13.5 ms | $10.70 | $575.00 |
+| Pooled connection, 1 MB pages | 51.5 ms | $18.30 | $1,335.00 |
+| New connection per request, 1 MB | 61.5 ms | $20.30 | $1,535.00 |
+| Pooled connection, 4 MB pages | 104 ms | $28.80 | $2,385.00 |
+| New connection per request, 4 MB | 114 ms | $30.80 | $2,585.00 |
+
+These follow the CPU table above and nothing else. An earlier version of this section was computed
+from a superseded set of measurements and was left behind when that table was replaced, so the
+document quoted 118.3 ms and 104 ms for the same row in two places. Any figure here that does not
+fall out of the table above is a bug in this README.
 
 The reference row is given at two sizes because the platform's own `fetch` is **not flat** — it
 scales at about 0.82 ms per decompressed MB, measured on a size ladder from one CDN so that only the
@@ -851,14 +856,14 @@ The rows above are the default identity: gzip on the wire, AES-256-GCM, x25519. 
 bundles every change together, which is not much use for deciding. Priced one at a time against a
 pooled 1 MB workload at a billion requests a month, warmed:
 
-| Change from the baseline | CPU/request | 1B/mo, warmed | Δ | Paid when |
+| Change from the baseline | CPU/request | 1B/mo | Δ | Paid when |
 | --- | --- | --- | --- | --- |
-| baseline — gzip, AES-256-GCM, x25519 | 53.3 ms | $1,389 | — | always |
-| origin serves `br` instead of gzip | 57.6 ms | $1,474 | **+$85** | the origin chooses `br` |
-| server selects ChaCha20-Poly1305 | 56.3 ms | $1,448 | **+$59** | the server picks it over AES |
-| origin serves `zstd` instead of gzip | 56.1 ms | $1,444 | **+$55** | the origin chooses `zstd` |
-| X25519MLKEM768, 1 request per connection | 61.0 ms | $1,542 | **+$153** | every handshake |
-| X25519MLKEM768, 20 requests per connection | 53.3 ms | $1,390 | **+$0.15** | the same handshake, amortised |
+| baseline — gzip, AES-256-GCM, x25519 | 51.5 ms | $1,335 | — | always |
+| origin serves `br` instead of gzip | 55.8 ms | $1,421 | **+$86** | the origin chooses `br` |
+| server selects ChaCha20-Poly1305 | 54.5 ms | $1,395 | **+$60** | the server picks it over AES |
+| origin serves `zstd` instead of gzip | 54.3 ms | $1,391 | **+$56** | the origin chooses `zstd` |
+| X25519MLKEM768, 1 request per connection | 59.2 ms | $1,489 | **+$154** | every handshake |
+| X25519MLKEM768, 20 requests per connection | 51.5 ms | $1,335 | **+$0.15** | the same handshake, amortised |
 
 The last two rows are the same 0.15 ms of ML-KEM, and the difference between them is entirely
 connection reuse — which is the point worth taking from this table. Post-quantum key exchange is

@@ -956,6 +956,47 @@ async function cryptoBench(op, n, params = null) {
     return { op, ...out };
   }
 
+
+  if (op === 'zlib-probe') {
+    // node:zlib is a C++ binding in workerd, not a polyfill, and gunzipSync takes maxOutputLength —
+    // a size cap enforced INSIDE the native call. If that works it falsifies the reasoning in
+    // src/client/decode.js, which says a cap and a JS-free byte path are mutually exclusive because
+    // counting needs the bytes in JavaScript. Counting in C++ is a third option I did not know about.
+    //
+    // The trade it asks for is real: gunzipSync is synchronous and buffering, so it needs the whole
+    // coded body in memory and gives up streaming. That is only acceptable for a caller who was
+    // going to buffer anyway — .text() or .arrayBuffer() on the whole thing.
+    const fix = await bodyFixture(mb, src);
+    const variant = params?.get?.('variant') ?? 'sync';
+    const cap = Number(params?.get?.('cap') ?? 0) || Infinity;
+    const zlib = await import('node:zlib');
+    const z = zlib.default ?? zlib;
+    if (variant === 'probe') {
+      return { op, has: Object.keys(z).filter((k) => /gunzip|inflate|createGunzip/.test(k)).join(','),
+               typeofSync: typeof z.gunzipSync };
+    }
+    if (variant === 'sync') {
+      const out = z.gunzipSync(fix.gz, Number.isFinite(cap) ? { maxOutputLength: cap } : undefined);
+      assertBytes(out.byteLength ?? out.length, fix.text.byteLength, op);
+      return { op, mb, variant, cap: String(cap), bytes: out.byteLength ?? out.length };
+    }
+    if (variant === 'sync-text') {
+      const out = z.gunzipSync(fix.gz, Number.isFinite(cap) ? { maxOutputLength: cap } : undefined);
+      const t = new TextDecoder().decode(out);
+      assertBytes(t.length, fix.text.byteLength, op);
+      return { op, mb, variant, bytes: t.length };
+    }
+    if (variant === 'capfail') {
+      // Does maxOutputLength actually REFUSE, or is it advisory? A cap that does not fire is worse
+      // than no cap, because it reads as protection.
+      try {
+        z.gunzipSync(fix.gz, { maxOutputLength: 1024 });
+        return { op, variant, result: 'NO ERROR — the cap did not fire' };
+      } catch (e) { return { op, variant, result: 'refused: ' + String(e?.message ?? e).slice(0, 90) }; }
+    }
+    return { op, error: 'unknown variant' };
+  }
+
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
     const fix = await bodyFixture(mb, src);
@@ -1751,6 +1792,61 @@ export default {
       }));
     }
 
+
+    if (url.searchParams.get('sse')) {
+      // The AI-gateway shape, which every other bench in this file gets wrong by construction.
+      //
+      // Everything else here moves a large body in a few large chunks. An SSE completion moves a
+      // SMALL body in hundreds of tiny events, each its own TLS record and h2 DATA frame — so the
+      // per-chunk costs this rig has measured as constants (about 0.028 ms fixed per record, about
+      // 17 us per stream-boundary crossing) stop being a footnote and become the whole bill. That
+      // was an extrapolation; this measures it.
+      //
+      // Two token budgets, differenced: the connection, the handshake, the request and the
+      // response head are in both and cancel, leaving the cost of the extra events alone.
+      const which = url.searchParams.get('sse');       // 'pkg' | 'native'
+      const maxTok = Number(url.searchParams.get('tok') ?? 128);
+      const model = url.searchParams.get('model') ?? 'gpt-5.6-luna';
+      const key = request.headers.get('x-openai-key');
+      if (!key) return new Response('need x-openai-key', { status: 400 });
+      markPath('sse', { which, tok: String(maxTok), model });
+
+      const body = JSON.stringify({
+        model, stream: true, max_completion_tokens: maxTok,
+        // A deterministic prompt that reliably produces a long stream: the point is event COUNT.
+        messages: [{ role: 'user', content: `Count from 1 to 400, one number per line.` }],
+      });
+      const headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` };
+      const url2 = 'https://api.openai.com/v1/chat/completions';
+
+      let events = 0, bytes = 0, status = 0;
+      const drain = async (res) => {
+        status = res.status;
+        const rd = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          bytes += value.byteLength;
+          buf += dec.decode(value, { stream: true });
+          // Count SSE events the way a consumer would, so the parse cost is in the measurement.
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) { events++; buf = buf.slice(i + 2); }
+        }
+      };
+
+      if (which === 'native') {
+        await drain(await fetch(url2, { method: 'POST', headers, body }));
+      } else {
+        const client = new Client({ connect, proxy, forceTunnel: true, maxBodyBytes: Infinity,
+          timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 60000, idleMs: 60000 } });
+        try { await drain(await client.fetch(url2, { method: 'POST', headers, body })); }
+        finally { await client.close(); }
+      }
+      return Response.json({ which, model, tok: maxTok, status, events, bytes });
+    }
+
     if (url.searchParams.get('depth')) {
       // The same ladder as the isolated benches, but over a REAL proxied socket.
       //
@@ -1823,8 +1919,10 @@ export default {
       // the bytes with their Content-Encoding intact and never pays to decode them.
       //
       // Subtracting it from `full` gives the decode stage on the real path; subtracting `h2` from
-      // it gives what client.js costs BELOW decode — 41 ms of a 4 MB request that has never been
-      // looked at, and which I wrongly called exhausted.
+      // it gives what client.js costs below decode. That split HAS now been measured — 16.5 ms of
+      // client.js against 35.5 ms of decode on a 4 MB body — so the 41 ms this comment used to call
+      // unexamined is accounted for. Left here because the shape of the ladder is what makes it
+      // measurable, not because the number is still open.
       const client = new Client({ connect, proxy, forceTunnel: true,
         ...(depth === 'client' ? { decompress: false }
           : depth === 'passthru' ? { decompress: false }
