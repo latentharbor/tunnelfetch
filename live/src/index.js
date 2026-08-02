@@ -16,6 +16,10 @@ import { decodeChunked } from '../../src/http1/chunked.js';
 import { ByteReader } from '../../src/util/bytes.js';
 import { parseCertificate } from '../../src/trust/x509.js';
 import { decodeBody } from '../../src/client/decode.js';
+import { Http2Connection } from '../../src/http2/connection.js';
+import { settingsFrame, headersFrame, dataFrame, windowUpdateFrame } from '../../src/http2/frames.js';
+import { encodeHeaderBlock } from '../../src/http2/hpack.js';
+
 import { chrome as chromeProfile } from '../../src/profile/chrome.js';
 import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js';
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
@@ -684,6 +688,188 @@ async function cryptoBench(op, n, params = null) {
   // Where do ~25 ms per MB of body go? Each op below prices ONE slice of the decompressed-side
   // pipeline over identical bytes, so differences between ops attribute cost to a specific layer.
   // Every op asserts the byte count it delivered; a wrong count throws and the run is discarded.
+
+
+  if (op === 'h2-recv' || op === 'h2-recv-idle') {
+    // The HTTP/2 receive layer, priced on its own.
+    //
+    // The decomposition had a hole: the record layer is ~4 ms for a 4 MB body's worth of records
+    // and the decode stage is ~49 ms, which leaves most of a 118 ms page unattributed. Everything
+    // between them — frame parsing, flow control, the per-DATA `recvQueue.push(data.slice())`, and
+    // the body stream's pull — had never been measured, because doing it needs a real
+    // Http2Connection fed real frames rather than a probe that stands in for one.
+    //
+    // So: a genuine Http2Connection over a plain duplex, fed a prebuilt server flight (SETTINGS,
+    // response HEADERS, then DATA frames of `fsz` bytes each), with its body drained and NOT
+    // decoded. No TLS, because the record layer is already priced separately and stacking them
+    // would just re-measure it. h2-recv-idle adds withIdleDeadline, which the client wraps every
+    // body in, so the difference prices that wrapper on this path rather than on a synthetic one.
+    const wire = Math.round(mb * 1048576);          // bytes of body to deliver
+    const fsz = Number(params?.get?.('fsz') ?? 16384); // DATA frame size
+    const idle = op === 'h2-recv-idle';
+
+    const ab = new TransformStream();
+    const ba = new TransformStream();
+    const client = { readable: ba.readable, writable: ab.writable };
+    const server = { readable: ab.readable, writable: ba.writable };
+
+    const conn = new Http2Connection(client, {});
+    const w = server.writable.getWriter();
+    // Drain what the client writes (preface, SETTINGS, WINDOW_UPDATEs) so it never blocks.
+    (async () => { const r = server.readable.getReader();
+      for (;;) { const { done } = await r.read(); if (done) break; } })().catch(() => {});
+
+    await w.write(settingsFrame([[3, 100], [4, 65536], [2, 0]]));
+    const req = conn.request({ method: 'GET', scheme: 'https', authority: 'o.example',
+                               path: '/', headers: [] });
+    req.catch(() => {});
+    await w.write(headersFrame(1, encodeHeaderBlock([{ name: ':status', value: '200' }]), {
+      endStream: false, endHeaders: true }));
+    const head = await req;
+
+    const chunk = new Uint8Array(fsz);
+    const pump = (async () => {
+      let sent = 0;
+      while (sent < wire) {
+        const n = Math.min(fsz, wire - sent);
+        sent += n;
+        // The peer must be allowed to keep sending: this prices the RECEIVE path, not flow
+        // control back-pressure, so the window is reopened generously from the server side.
+        await w.write(dataFrame(1, chunk.subarray(0, n), sent >= wire));
+        await w.write(windowUpdateFrame(0, n));
+        await w.write(windowUpdateFrame(1, n));
+      }
+    })();
+    pump.catch(() => {});
+
+    let src = head.body;
+    if (idle) { const dl = new DeadlineController({ idleMs: 60000 }, {});
+                src = withIdleDeadline(src, dl); }
+    if (params?.get?.('via') === 'identity') {
+      // Route the h2 body through Cloudflare's native IdentityTransformStream. The shipped path
+      // copies every DATA payload (`recvQueue.push(data.slice())`) into a JS array and dequeues it
+      // on pull; if the bytes can live in the runtime instead, that copy and that queue go away.
+      // This does not remove the copy — the connection still makes it — so it measures only the
+      // downstream half, which is the part a redesign could actually reach.
+      const t = new IdentityTransformStream();
+      src.pipeTo(t.writable).catch(() => {});
+      src = t.readable;
+    }
+    const rd = src.getReader();
+    let got = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; got += value.byteLength; }
+    await pump.catch(() => {});
+    assertBytes(got, wire, op);
+    await conn.close().catch(() => {});
+    return { op, mb, fsz, frames: Math.ceil(wire / fsz), bytes: got };
+  }
+
+
+  if (op === 'gz-nativepipe') {
+    // Can the decode stage get JS out of the byte path entirely?
+    //
+    // The shipped stage reads every chunk in JS: it has to, because `maxBodyBytes` is enforced on
+    // DECODED output and counting requires seeing bytes. This prices the alternative — sniff the
+    // two bytes the deflate/empty check needs, then hand the REST to a native pipe and return the
+    // decompressor's own readable, so no JS callback runs per chunk.
+    //
+    //   variant=pipe    sniff 2 bytes, native pipeTo for the rest, return ds.readable
+    //   variant=hop     same, but ds.readable piped natively into a TransformStream first — what a
+    //                   synchronous-return API contract would actually force
+    //   variant=stage   the shipped decodeBody, for the same isolate and the same fixture
+    const variant = params?.get?.('variant') ?? 'pipe';
+    const fix = await bodyFixture(mb, src);
+    const source = fixedSource(fix.gz, Number(params?.get?.('ick') ?? 65536));
+
+    if (variant === 'stage') {
+      const buf = await new Response(decodeBody(source, 'gzip')).arrayBuffer();
+      assertBytes(buf.byteLength, fix.text.byteLength, op);
+      return { op, mb, variant, bytes: buf.byteLength };
+    }
+
+    const rdr = source.getReader();
+    const head = [];
+    let headLen = 0;
+    while (headLen < 2) {
+      const { value, done } = await rdr.read();
+      if (done) break;
+      if (value?.byteLength) { head.push(value); headLen += value.byteLength; }
+    }
+    const ds = new DecompressionStream('gzip');
+    // The remainder never touches JS again: releaseLock hands the source back so pipeTo can run
+    // inside the runtime.
+    const w = ds.writable.getWriter();
+    for (const c of head) await w.write(c);
+    w.releaseLock();
+    const rest = new ReadableStream({
+      start(c) { for (const _ of []) c.enqueue(_); },
+      async pull(c) {
+        const { value, done } = await rdr.read();
+        if (done) { c.close(); return; }
+        c.enqueue(value);
+      },
+    });
+    const pump = rest.pipeTo(ds.writable);
+    pump.catch(() => {});
+
+    let out = ds.readable;
+    if (variant === 'hop') {
+      // An identity TransformStream, which is the obvious way to satisfy a synchronous return.
+      const t = new TransformStream();
+      out.pipeTo(t.writable).catch(() => {});
+      out = t.readable;
+    } else if (variant === 'hop-hwm') {
+      // Same, but with a queue deep enough that the decompressor's 4 KiB chunks do not each wait
+      // on backpressure. If chunk GRANULARITY is what makes `hop` slow, this moves.
+      const t = new TransformStream({}, { highWaterMark: 64 }, { highWaterMark: 64 });
+      out.pipeTo(t.writable).catch(() => {});
+      out = t.readable;
+    } else if (variant === 'hop-identity') {
+      // Cloudflare's own IdentityTransformStream: byte-oriented, and its readable half supports
+      // BYOB reads. The standard `new TransformStream()` is JS-backed and passes every 4 KiB
+      // decompressor chunk through its queue individually, which is why `hop` costs MORE than the
+      // wrapper it was meant to replace. If this one is native, a synchronous return costs nothing.
+      const t = new IdentityTransformStream();
+      out.pipeTo(t.writable).catch(() => {});
+      out = t.readable;
+    } else if (variant === 'hop-identity-byob') {
+      // Same, drained with 16 KiB BYOB reads rather than handed to Response — the shape a caller
+      // who wants chunks (rather than .arrayBuffer()) would actually see.
+      const t = new IdentityTransformStream();
+      out.pipeTo(t.writable).catch(() => {});
+      const rr = t.readable.getReader({ mode: 'byob' });
+      let n = 0;
+      for (;;) {
+        const { value, done } = await rr.read(new Uint8Array(16384));
+        if (done) break;
+        n += value.byteLength;
+      }
+      await pump.catch(() => {});
+      assertBytes(n, fix.text.byteLength, op);
+      return { op, mb, variant, bytes: n };
+    } else if (variant === 'byob-nocount') {
+      // The shipped stage's SHAPE — a pull-driven wrapper doing 16 KiB BYOB reads — with the
+      // counting and the error wrapping removed. Differencing this against `stage` says whether
+      // the cost is the wrapper or the bookkeeping inside it, which decides whether there is
+      // anything to optimise short of changing the return contract.
+      const rr = ds.readable.getReader({ mode: 'byob' });
+      out = new ReadableStream({
+        async pull(c) {
+          for (;;) {
+            const { value, done } = await rr.read(new Uint8Array(16384));
+            if (done) { c.close(); return; }
+            if (value.byteLength === 0) continue;
+            c.enqueue(value);
+            return;
+          }
+        },
+      });
+    }
+    const buf = await new Response(out).arrayBuffer();
+    await pump.catch(() => {});
+    assertBytes(buf.byteLength, fix.text.byteLength, op);
+    return { op, mb, variant, bytes: buf.byteLength };
+  }
 
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
@@ -1377,7 +1563,7 @@ export default {
       const t0 = Date.now();
       try {
         for (let i = 0; i < reps; i++) {
-          const r = await client.fetch(`https://${target}?i=${i}`);
+          const r = await client.fetch(`https://${target}${target.includes('?') ? '&' : '?'}i=${i}`);
           status = r.status;
           proto = r.tunnelfetch?.httpVersion ?? null;
           bytes += (await r.arrayBuffer()).byteLength;
@@ -1490,7 +1676,7 @@ export default {
       let bytes = 0, status = 0;
       if (which === 'native') {
         for (let i = 0; i < reps; i++) {
-          const r = await fetch(`https://${target}?i=${i}`, { cf: { cacheTtl: 0 } });
+          const r = await fetch(`https://${target}${target.includes('?') ? '&' : '?'}i=${i}`, { cf: { cacheTtl: 0 } });
           status = r.status;
           bytes += (await r.arrayBuffer()).byteLength;
         }
@@ -1499,7 +1685,7 @@ export default {
           timeouts: { connectMs: 10000, handshakeMs: 15000, headersMs: 25000, idleMs: 25000 } });
         try {
           for (let i = 0; i < reps; i++) {
-            const r = await client.fetch(`https://${target}?i=${i}`);
+            const r = await client.fetch(`https://${target}${target.includes('?') ? '&' : '?'}i=${i}`);
             status = r.status;
             bytes += (await r.arrayBuffer()).byteLength;
           }

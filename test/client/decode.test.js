@@ -630,3 +630,58 @@ test('a gzip body still takes the native path even if a decoder was smuggled pas
   const out = decodeBody(readableFrom([packed]), 'gzip', { gzip: upperDecoder });
   assert.equal(latin1(await collect(out)), 'native please');
 });
+
+// The native fast path. `IdentityTransformStream` is a Cloudflare extension, so it does not exist
+// in the runtime these tests run in — which means without this block the path would ship having
+// never executed anywhere but the edge. A standard TransformStream is semantically identical (it
+// is only slower, which is the entire reason the real one is worth using), so it stands in.
+const withIdentity = async (fn) => {
+  const had = Object.prototype.hasOwnProperty.call(globalThis, 'IdentityTransformStream');
+  const prev = globalThis.IdentityTransformStream;
+  globalThis.IdentityTransformStream = TransformStream;
+  try {
+    return await fn();
+  } finally {
+    if (had) globalThis.IdentityTransformStream = prev;
+    else delete globalThis.IdentityTransformStream;
+  }
+};
+
+test('the native relay path delivers the whole body, uncapped', async () => {
+  const gz = await compress(PAYLOAD, 'gzip');
+  const out = await withIdentity(() =>
+    collect(decodeBody(readableFrom([gz]), 'gzip', null, Infinity)));
+  assert.deepEqual(out, PAYLOAD, 'the relayed body differs from the original');
+});
+
+test('the native relay path still reports which coding failed', async () => {
+  // A truncated gzip must not read as a complete body. The relay is aborted rather than closed, so
+  // the consumer sees the typed error instead of a short read that looks like success.
+  const gz = await compress(PAYLOAD, 'gzip');
+  const truncated = gz.subarray(0, gz.byteLength - 8);
+  await withIdentity(async () => {
+    await assert.rejects(
+      () => collect(decodeBody(readableFrom([truncated]), 'gzip', null, Infinity)),
+      (e) => e.code === 'HTTP_CONTENT_ENCODING' && /gzip/.test(e.message),
+      'a truncated body came back without a typed error',
+    );
+  });
+});
+
+test('a zero-byte body is still zero bytes on the native relay path', async () => {
+  const out = await withIdentity(() => collect(decodeBody(readableFrom([]), 'gzip', null, Infinity)));
+  assert.equal(out.byteLength, 0);
+});
+
+test('a finite cap does NOT take the native relay path, so the bomb guard survives it', async () => {
+  // The two are mutually exclusive: counting needs the bytes in JS, the relay keeps them out of it.
+  // If a refactor ever routed a capped body through the relay, this is what would catch it.
+  const bomb = await compress(new Uint8Array(4 * 1024 * 1024), 'gzip');
+  await withIdentity(async () => {
+    await assert.rejects(
+      () => collect(decodeBody(readableFrom([bomb]), 'gzip', null, 64 * 1024)),
+      (e) => e.code === 'LIMIT_BODY',
+      'a capped body was relayed past its cap',
+    );
+  });
+});
