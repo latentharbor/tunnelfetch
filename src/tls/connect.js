@@ -265,6 +265,7 @@ export async function connectTls({ transport, hostname, verifyPeer, options = {}
   const record = new RecordLayer(transport, {
     maxHandshakeMessage: options.maxHandshakeMessage,
     maxKeyUpdates: options.maxKeyUpdates,
+    pullBytes: options.pullBytes,
     // ChaCha20-Poly1305 has no WebCrypto path here; its seal/open are injected via deps.aead and
     // threaded to every createAead. Null for the AES-GCM-only default, which needs nothing.
     aeadImpls: deps.aead ?? null,

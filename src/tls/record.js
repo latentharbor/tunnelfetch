@@ -118,7 +118,7 @@ export class RecordLayer {
    * @param {RecordLayerOptions} [opts]
    */
   constructor({ readable, writable }, opts = {}) {
-    this._r = new ByteReader(readable);
+    this._r = new ByteReader(readable, opts.pullBytes);
     this._w = new ByteWriter(writable);
     this._maxHandshakeMessage = opts.maxHandshakeMessage ?? 1 << 17;
     this._maxKeyUpdates = opts.maxKeyUpdates ?? 32;

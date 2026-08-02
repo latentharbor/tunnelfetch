@@ -83,8 +83,15 @@ export class UnexpectedEofError extends TunnelFetchError {
  * ReadableStream in this package and its tests) take the default-reader path unchanged.
  */
 export class ByteReader {
-    /** @param {ReadableStream<Uint8Array>} readable */
-    constructor(readable: ReadableStream<Uint8Array>);
+    /**
+     * @param {ReadableStream<Uint8Array>} readable
+     * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because it
+     *   decides how many times a body crosses the runtime boundary on the way in, and that turned out
+     *   to be the largest single cost in a large response — 42 ms of a 106 ms 4 MB request is socket
+     *   reads and record decryption, of which the AEAD itself is under 2 ms.
+     */
+    constructor(readable: ReadableStream<Uint8Array>, pullBytes?: number);
+    _pullBytes: number;
     /** @type {ReadableStreamBYOBReader | null} */
     _byob: ReadableStreamBYOBReader | null;
     _reader: ReadableStreamBYOBReader | ReadableStreamDefaultReader<Uint8Array<ArrayBufferLike>> | null;
