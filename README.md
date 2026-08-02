@@ -1093,10 +1093,15 @@ that are a footnote for a 4 MB page are the whole bill here.
 Measured against a real streaming endpoint through a proxy, with the API's own `usage` block as the
 token count rather than an estimate from response size:
 
-| | per event | per 1M output tokens |
-| --- | --- | --- |
-| this package | **250–310 µs** | $5,000–6,200 |
-| platform `fetch` — reference; it cannot use a proxy | ~105 µs | $2,100 |
+| | per event | CPU per 1M output tokens | cost per 1M output tokens |
+| --- | --- | --- | --- |
+| this package | **250–310 µs** | 250–310 s | **$0.0050–0.0062** |
+| platform `fetch` — reference; it cannot use a proxy | ~105 µs | 105 s | $0.0021 |
+
+Those are half a cent per million output tokens against **$0.60** of model charge for the same
+tokens. An earlier version of this table read "$5,000–6,200" — the same digits with the decimal
+point six places out, from writing a per-million-*requests* figure into a per-million-*tokens*
+column. The ratio quoted below was computed correctly and is unaffected; the table was not.
 
 Events map to output tokens roughly 1:1, so a 128K-token completion is about **35 s of CPU**. That
 is spread across the minutes the model takes to generate it — utilisation is 2–5%, so it is a
