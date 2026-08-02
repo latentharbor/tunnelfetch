@@ -16,7 +16,9 @@ test('the curl profile supplies every layer at once', () => {
   const c = new Client({ profile: profiles.curl });
   assert.equal(c.options.tls.grease, false, 'curl does not GREASE');
   assert.deepEqual(c.options.headerOrder, CURL_HEADER_ORDER);
-  assert.deepEqual(c.options.http2Settings, [[3, 100], [4, 10485760], [2, 0]]);
+  // 65536, captured from curl 8.21.0 — the build this profile's TLS half comes from. curl 8.7.1
+  // sent 10485760 and this profile carried that value while claiming 8.21.0's ClientHello.
+  assert.deepEqual(c.options.http2Settings, [[3, 100], [4, 65536], [2, 0]]);
   assert.deepEqual(c.options.http2PseudoHeaderOrder, [':method', ':scheme', ':authority', ':path']);
 });
 

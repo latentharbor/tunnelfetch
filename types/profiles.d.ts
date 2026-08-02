@@ -71,6 +71,9 @@ export const chrome: Readonly<{
     }>;
     http2Settings: readonly number[][];
     http2ConnectionWindow: number;
+    http2HpackIndexing: Readonly<{
+        ':path': "without";
+    }>;
     http2PseudoHeaderOrder: readonly string[];
     headerOrder: readonly string[];
     headers: readonly string[][];
