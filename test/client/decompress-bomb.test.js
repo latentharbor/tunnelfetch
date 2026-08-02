@@ -82,3 +82,46 @@ test('without a cap the body still decodes whole, so the guard is not a silent t
   ).arrayBuffer();
   assert.equal(under.byteLength, 2 * 1024 * 1024, 'a body under the cap was truncated');
 });
+
+// The cap above only protects a caller who SET one. Until 1.6.0 `maxBodyBytes` defaulted to
+// Infinity, so every caller who had not thought about it was exposed to exactly the bomb this file
+// is about — and the bundled br/zstd decoders self-limit at 256 MiB, twice the 128 MB a Workers
+// isolate gets, so the fallback could not fire before the isolate died. The default is now finite.
+
+test('a client that sets no maxBodyBytes is still bounded, by the default', async () => {
+  // Past the 32 MiB default from a body small enough that no origin would look suspicious.
+  const packed = await bomb(33 * 1024 * 1024);
+  assert.ok(packed.byteLength < 256 * 1024, `the compressed body is small: ${packed.byteLength}`);
+
+  const server = sequenceServer([
+    response({ body: packed, headers: { 'content-encoding': 'gzip' } }),
+  ]);
+  const net = fakeNetwork(server.handler);
+  // No maxBodyBytes. This is the shape of every caller who has not read the option list.
+  const client = new Client({ connect: net.connect, forceTunnel: true });
+
+  await assert.rejects(
+    async () => {
+      const res = await client.fetch('http://origin.example/');
+      await res.arrayBuffer();
+    },
+    (e) => e.code === 'LIMIT_BODY',
+    'a 33 MiB decompressed body was delivered to a client that set no cap',
+  );
+  await client.close();
+});
+
+test('Infinity still opts out, so a large stream is not broken by the new default', async () => {
+  // The default must be a default, not a ceiling: moving big files is a legitimate use of a proxy
+  // client, and a caller who says Infinity has made that decision.
+  const packed = await bomb(33 * 1024 * 1024);
+  const server = sequenceServer([
+    response({ body: packed, headers: { 'content-encoding': 'gzip' } }),
+  ]);
+  const net = fakeNetwork(server.handler);
+  const client = new Client({ connect: net.connect, forceTunnel: true, maxBodyBytes: Infinity });
+
+  const res = await client.fetch('http://origin.example/');
+  assert.equal((await res.arrayBuffer()).byteLength, 33 * 1024 * 1024);
+  await client.close();
+});

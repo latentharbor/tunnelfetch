@@ -53,9 +53,11 @@ export function install(options?: ClientOptions): () => void;
  * @property {import('./client/cookies.js').CookieJar} [jar] supply a jar directly, e.g. to share
  *   one across Clients or to persist it.
  * @property {number} [maxRedirects] default 20.
- * @property {number} [maxBodyBytes] the most body this client will produce. Checked against
- *   Content-Length before a byte is read, enforced on the raw stream, and enforced again on the
- *   DECODED output — a compressed body within the cap can decompress far past it.
+ * @property {number} [maxBodyBytes] the most body this client will produce, **default 32 MiB**.
+ *   Checked against Content-Length before a byte is read, enforced on the raw stream, and enforced
+ *   again on the DECODED output — a compressed body within the cap can decompress far past it, and
+ *   a registered decoder's output is bounded by it too. Pass `Infinity` to opt out, which is the
+ *   right choice for streaming large files and the wrong one for fetching URLs you do not control.
  * @property {boolean} [decompress] gzip/deflate. Default true.
  * @property {Record<string, import('./client/decode.js').BodyDecoder>} [decoders] extra
  *   content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
@@ -229,9 +231,11 @@ export type ClientOptions = {
      */
     maxRedirects?: number | undefined;
     /**
-     * the most body this client will produce. Checked against
-     * Content-Length before a byte is read, enforced on the raw stream, and enforced again on the
-     * DECODED output — a compressed body within the cap can decompress far past it.
+     * the most body this client will produce, **default 32 MiB**.
+     * Checked against Content-Length before a byte is read, enforced on the raw stream, and enforced
+     * again on the DECODED output — a compressed body within the cap can decompress far past it, and
+     * a registered decoder's output is bounded by it too. Pass `Infinity` to opt out, which is the
+     * right choice for streaming large files and the wrong one for fetching URLs you do not control.
      */
     maxBodyBytes?: number | undefined;
     /**
