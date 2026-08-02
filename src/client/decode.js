@@ -190,17 +190,53 @@ function decompressionStage(source, coding, maxBytes = Infinity) {
   })();
   ready.catch(() => {});
 
+  // The fast path: hand the decompressor's output to the runtime and never touch a chunk in JS.
+  //
+  // Measured on the edge, CPU per MB of decompressed output, all shapes interleaved in one isolate:
+  //
+  //     this wrapper, BYOB reads + counting        7.00
+  //     the same wrapper with counting removed     7.33   (counting is free; the WRAPPER is not)
+  //     a standard `new TransformStream()` hop    13.33   (JS-backed: every 4 KiB chunk queues)
+  //     an IdentityTransformStream hop             3.67   (native, and BYOB on its readable)
+  //     DecompressionStream + native collect       3.33   (the floor)
+  //
+  // So a native identity hop is 48% cheaper than this wrapper and lands within noise of the floor,
+  // while the standard TransformStream — the obvious way to write the same thing — is nearly twice
+  // as expensive as doing nothing at all. The difference is that one is C++ and one is JavaScript;
+  // nothing about the API surface says so.
+  //
+  // It applies only when there is no cap, and that is not a limitation to be worked around: the cap
+  // is enforced by counting bytes, counting requires seeing them in JS, and seeing them in JS is
+  // exactly the cost being removed. The two are mutually exclusive. `maxBodyBytes: Infinity` is
+  // already a caller saying they will bound the body themselves, so giving that caller the fast
+  // path is coherent — you gave up the guard, you get the speed — rather than a compromise.
+  if (maxBytes === Infinity && typeof globalThis.IdentityTransformStream === 'function') {
+    const relay = new globalThis.IdentityTransformStream();
+    (async () => {
+      const ds = await ready;
+      if (ds === null) {
+        await relay.writable.close().catch(() => {});
+        return;
+      }
+      // preventAbort: pipeTo's default is to abort the destination with the SOURCE's error, which
+      // would hand the consumer a bare zlib message from a stream it never asked about. Keeping
+      // the abort here is what lets the coding be named, the same as on the wrapper path.
+      await ds.readable.pipeTo(relay.writable, { preventAbort: true });
+      if (pumpDone) await pumpDone;
+      await relay.writable.close();
+    })().catch(async (e) => {
+      // The consumer sees the same typed error it would have seen through the wrapper; the relay is
+      // errored rather than closed so a truncated body can never read as a complete one.
+      await srcReader.cancel(wrapCoding(coding, e)).catch(() => {});
+      await relay.writable.abort(wrapCoding(coding, e)).catch(() => {});
+    });
+    return relay.readable;
+  }
+
   /** @type {ReadableStreamBYOBReader | ReadableStreamDefaultReader<Uint8Array> | null} */
   let out = null;
   let byob = false;
-  const wrap = (e) =>
-    e instanceof HttpError
-      ? e
-      : new HttpError(
-          codes.HTTP_CONTENT_ENCODING,
-          `decoding "${coding}" failed: ${e?.message ?? e}`,
-          { coding },
-        );
+  const wrap = (e) => wrapCoding(coding, e);
 
   return new ReadableStream({
     async pull(c) {
@@ -332,6 +368,14 @@ function capDecodedOutput(source, coding, maxBytes) {
       await reader.cancel(reason).catch(() => {});
     },
   });
+}
+
+/** Name the coding in a decode failure, so a caller sees which one misbehaved rather than a bare
+ *  zlib message from somewhere downstream. */
+function wrapCoding(coding, e) {
+  return e instanceof HttpError
+    ? e
+    : new HttpError(codes.HTTP_CONTENT_ENCODING, `decoding "${coding}" failed: ${e?.message ?? e}`, { coding });
 }
 
 /** Byte at logical offset `i` across the buffered head chunks. */

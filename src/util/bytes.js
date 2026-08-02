@@ -398,10 +398,38 @@ export function equal(a, b) {
  */
 export function timingSafeEqual(a, b) {
   if (a.byteLength !== b.byteLength) return false;
+  // Prefer the runtime's own, which is compiled rather than interpreted and therefore actually has
+  // the property this function is named for. `crypto.subtle.timingSafeEqual` is a non-standard
+  // Cloudflare extension, so it is FEATURE-DETECTED rather than assumed — this package runs on
+  // Node, Deno and Bun as well, and inferring a capability from a runtime name is the mistake it
+  // refuses to make everywhere else. Detected once, at module load, because doing it per call would
+  // put a property lookup on a path whose whole point is uniform timing.
+  if (NATIVE_TIMING_SAFE_EQUAL) return NATIVE_TIMING_SAFE_EQUAL(a, b);
   let diff = 0;
   for (let i = 0; i < a.byteLength; i++) diff |= a[i] ^ b[i];
   return diff === 0;
 }
+
+/**
+ * The runtime's constant-time compare, bound once, or null where there is none.
+ *
+ * Bound with a probe rather than a typeof check: a property that exists but throws on real input
+ * would otherwise be discovered inside a TLS Finished verification, where the failure mode is a
+ * dead connection on a path that is supposed to be the careful one.
+ */
+const NATIVE_TIMING_SAFE_EQUAL = (() => {
+  const fn = globalThis.crypto?.subtle?.timingSafeEqual;
+  if (typeof fn !== 'function') return null;
+  try {
+    const one = Uint8Array.of(1, 2, 3);
+    const two = Uint8Array.of(1, 2, 4);
+    if (fn.call(globalThis.crypto.subtle, one, one) !== true) return null;
+    if (fn.call(globalThis.crypto.subtle, one, two) !== false) return null;
+  } catch {
+    return null;
+  }
+  return (a, b) => fn.call(globalThis.crypto.subtle, a, b);
+})();
 
 const HEX = '0123456789abcdef';
 /**
