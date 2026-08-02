@@ -1806,15 +1806,24 @@ export default {
       // response head are in both and cancel, leaving the cost of the extra events alone.
       const which = url.searchParams.get('sse');       // 'pkg' | 'native'
       const maxTok = Number(url.searchParams.get('tok') ?? 128);
+      const padTok = Number(url.searchParams.get('inp') ?? 0);
       const model = url.searchParams.get('model') ?? 'gpt-5.6-luna';
       const key = request.headers.get('x-openai-key');
       if (!key) return new Response('need x-openai-key', { status: 400 });
-      markPath('sse', { which, tok: String(maxTok), model });
+      markPath('sse', { which, tok: String(maxTok), inp: String(padTok), model, h1: url.searchParams.get('h1') ?? null });
 
       const body = JSON.stringify({
         model, stream: true, max_completion_tokens: maxTok,
         // A deterministic prompt that reliably produces a long stream: the point is event COUNT.
-        messages: [{ role: 'user', content: `Count from 1 to 400, one number per line.` }],
+        // Ask for far more than the budget allows, so max_completion_tokens is what actually
+        // decides the length and every arm streams exactly the same number of tokens.
+        // `inp` pads the prompt to a target token count so the WRITE path is exercised too. Every
+        // measurement in this rig until now was receive-side; a 20K-token request is ~80 KB of JSON
+        // that has to be serialised, buffered, encrypted and framed before anything comes back, and
+        // that cost has never been measured.
+        messages: [{ role: 'user', content:
+          (padTok > 0 ? 'Ignore this reference block.\n' + 'lorem ipsum dolor sit amet '.repeat(Math.round(padTok/5)) + '\n' : '')
+          + `Count from 1 to 20000, one number per line.` }],
       });
       const headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` };
       const url2 = 'https://api.openai.com/v1/chat/completions';
@@ -1839,12 +1848,17 @@ export default {
       if (which === 'native') {
         await drain(await fetch(url2, { method: 'POST', headers, body }));
       } else {
+        // h1 vs h2 is a real question for this shape: an SSE event over h2 is a DATA frame with
+        // flow control and a WINDOW_UPDATE behind it, while over h1 it is a chunked-encoding chunk
+        // and nothing else. AI APIs do not need multiplexing, so the cheaper framing may just win.
         const client = new Client({ connect, proxy, forceTunnel: true, maxBodyBytes: Infinity,
+          ...(url.searchParams.get('h1') ? { http2: false } : {}),
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 60000, idleMs: 60000 } });
         try { await drain(await client.fetch(url2, { method: 'POST', headers, body })); }
         finally { await client.close(); }
       }
-      return Response.json({ which, model, tok: maxTok, status, events, bytes });
+      return Response.json({ which, h1: !!url.searchParams.get('h1'), model, tok: maxTok, inp: padTok, reqBytes: body.length, status, events, bytes,
+        proto: null });
     }
 
     if (url.searchParams.get('depth')) {
