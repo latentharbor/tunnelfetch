@@ -79,6 +79,7 @@ export class Http2Connection {
     _settingsFlight: Array<[number, number]> | null;
     _pseudoHeaderOrder: string[] | null;
     _hpackIndexing: Record<string, "without" | "incremental" | "never"> | null;
+    _headersPriority: any;
     _expectFirstSettings: boolean;
     _fatal: any;
     _goaway: {

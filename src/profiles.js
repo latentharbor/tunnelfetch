@@ -117,12 +117,15 @@ export const chrome = Object.freeze({
   // have been right, which is not a reason to have guessed. It is declared explicitly now so the
   // identity states its own value instead of inheriting one by accident.
   http2HpackIndexing: Object.freeze({ ':path': 'without' }),
-  // STILL a real difference, and newly found by the same capture: Chromium sets the PRIORITY flag
-  // on its request HEADERS frame (flags 0x25) and carries the five deprecated priority bytes.
-  // This package never sets it (see frames.js headersFrame), so the frame layout differs from
-  // Chromium's even where every value above it matches. Not in `requires` because it is a framing
-  // detail this package deliberately does not emit — RFC 9113 s5.3.2 deprecates it — but it is a
-  // signal a frame-level fingerprinter reads, and it is written down here rather than discovered.
+  // Chromium sets PRIORITY on its request HEADERS (flags 0x25) and carries the five deprecated
+  // priority bytes: `80 00 00 00 ff`, i.e. exclusive, dependency 0, weight byte 255. Captured, in
+  // test/tls/_captured-h2.js. 1.6.2 found the difference and documented it; 1.6.5 emits it.
+  //
+  // RFC 9113 s5.3.2 deprecates the mechanism and this package still IGNORES every PRIORITY frame it
+  // receives — sending it is a statement about identity, not a request to be prioritised, and those
+  // are different things. curl sets no priority, so `profiles.curl` leaves this unset and the
+  // default stays "do not send".
+  http2HeadersPriority: Object.freeze({ exclusive: true, streamDependency: 0, weight: 255 }),
   //
   // The connection window immediately above was DEAD until 1.6.1 — declared here, copied by
   // nothing, passed by nothing, and read under a different name — so every connection using this
@@ -211,7 +214,7 @@ export function applyProfile(options) {
   // was missing, which made it dead config: the chrome profile declared Chromium's ~15 MiB window
   // and every chrome connection sent curl's 1000 MiB one.
   for (const key of ['headerOrder', 'http2Settings', 'http2ConnectionWindow',
-                     'http2PseudoHeaderOrder', 'http2HpackIndexing']) {
+                     'http2PseudoHeaderOrder', 'http2HpackIndexing', 'http2HeadersPriority']) {
     if (options[key] === undefined && p[key] != null) out[key] = p[key];
   }
   // Profile headers are DEFAULTS: a request that sets its own User-Agent keeps it. They are folded

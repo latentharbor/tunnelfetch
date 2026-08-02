@@ -16,6 +16,7 @@ import { decodeChunked } from '../../src/http1/chunked.js';
 import { ByteReader } from '../../src/util/bytes.js';
 import { parseCertificate } from '../../src/trust/x509.js';
 import { decodeBody } from '../../src/client/decode.js';
+import { chrome as chromeProfile } from '../../src/profile/chrome.js';
 import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js';
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
 import { RAW_BYTES, BR, BR11, GZ, ZSTD } from './codec-fixture.js';
@@ -1362,8 +1363,12 @@ export default {
       const target = url.searchParams.get('target');
       const reps = Number(url.searchParams.get('reps') ?? 1);
       markPath('h2window', { win: String(win), target, reps: String(reps) });
+      // `prof=chrome` folds the whole Chromium identity in, which is how a PRIORITY-bearing HEADERS
+      // frame gets tested against a server that is not ours.
+      const prof = url.searchParams.get('prof');
       const client = new Client({
         connect, forceTunnel: true,
+        ...(prof === 'chrome' ? { profile: chromeProfile } : {}),
         http2Settings: [[3, 100], [4, win], [2, 0]],
         maxBodyBytes: Infinity,
         timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 },

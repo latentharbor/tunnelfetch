@@ -266,6 +266,9 @@ export class Http2Connection {
     // fields go into the HPACK dynamic table. Both default to curl's, both captured off the wire.
     this._pseudoHeaderOrder = opts.pseudoHeaderOrder ?? null;
     this._hpackIndexing = opts.hpackIndexing ?? null;
+    // Whether to set PRIORITY on the request HEADERS, and with what. null means do not set it,
+    // which is curl's behaviour and stays the default.
+    this._headersPriority = opts.headersPriority ?? null;
     this._expectFirstSettings = true;
 
     this._fatal = null; // set once; rejects every stream and every future request
@@ -449,14 +452,18 @@ export class Http2Connection {
    *  run is one write, so no other frame can interleave it (RFC 9113 s6.10). */
   _sendHeaderBlock(streamId, block, endStream) {
     const max = this._peerMaxFrameSize;
+    // Priority rides the opening HEADERS and nothing else: a CONTINUATION has no flags but
+    // END_HEADERS (RFC 9113 s6.10), so putting it anywhere else would be malformed rather than
+    // merely wrong-looking.
+    const priority = this._headersPriority;
     if (block.length <= max) {
-      this._write(headersFrame(streamId, block, { endStream, endHeaders: true }));
+      this._write(headersFrame(streamId, block, { endStream, endHeaders: true, priority }));
       return;
     }
     const frames = [];
     let o = 0;
     const first = block.subarray(0, max);
-    frames.push(headersFrame(streamId, first, { endStream, endHeaders: false }));
+    frames.push(headersFrame(streamId, first, { endStream, endHeaders: false, priority }));
     o = max;
     while (o < block.length) {
       const chunk = block.subarray(o, Math.min(o + max, block.length));

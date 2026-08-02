@@ -152,13 +152,43 @@ export function goawayFrame(lastStreamId, errorCode, debug = EMPTY) {
   return serializeFrame(FRAME.GOAWAY, 0, 0, payload);
 }
 
-/** A HEADERS frame carrying a full (already-fragmented-if-needed) block. No PADDED, no PRIORITY —
- *  a client that emits neither is exactly what curl does. */
-export function headersFrame(streamId, block, { endStream = false, endHeaders = true } = {}) {
+/**
+ * A HEADERS frame carrying a full (already-fragmented-if-needed) block. Never PADDED.
+ *
+ * PRIORITY is emitted only when `priority` is supplied, because whether a client sends it is part
+ * of its identity: curl does not, Chromium does — flags 0x25 with `80 00 00 00 ff`, captured in
+ * test/tls/_captured-h2.js. RFC 9113 s5.3.2 deprecates the mechanism and this package ignores
+ * every PRIORITY frame it receives, but a frame-level fingerprinter reads whether the flag is set,
+ * so refusing to emit it would make the Chromium identity wrong in a way nothing else could fix.
+ *
+ * The five bytes are exclusive (1 bit) + stream dependency (31) + weight (8). The weight is sent
+ * as-is: RFC 7540 s6.3 defines the wire byte as weight-minus-one, so Chromium's 255 is a weight of
+ * 256, and passing the byte through keeps this function free of an off-by-one nobody would see.
+ *
+ * @param {{ exclusive?: boolean, streamDependency?: number, weight: number } | null} [opts.priority]
+ */
+export function headersFrame(
+  streamId,
+  block,
+  { endStream = false, endHeaders = true, priority = null } = {},
+) {
   let flags = 0;
   if (endStream) flags |= FLAG.END_STREAM;
   if (endHeaders) flags |= FLAG.END_HEADERS;
-  return serializeFrame(FRAME.HEADERS, flags, streamId, block);
+  if (!priority) return serializeFrame(FRAME.HEADERS, flags, streamId, block);
+
+  flags |= FLAG.PRIORITY;
+  const dep = priority.streamDependency ?? 0;
+  const head = new Uint8Array(5);
+  head[0] = ((dep >>> 24) & 0x7f) | (priority.exclusive ? 0x80 : 0);
+  head[1] = (dep >>> 16) & 0xff;
+  head[2] = (dep >>> 8) & 0xff;
+  head[3] = dep & 0xff;
+  head[4] = priority.weight & 0xff;
+  const payload = new Uint8Array(5 + block.length);
+  payload.set(head, 0);
+  payload.set(block, 5);
+  return serializeFrame(FRAME.HEADERS, flags, streamId, payload);
 }
 
 /** A CONTINUATION frame (RFC 9113 s6.10), for a header block that overflows one frame. */
