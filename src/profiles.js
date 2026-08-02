@@ -10,8 +10,17 @@
 // it declares what it REQUIRES — because a profile that quietly drops the half of itself this
 // runtime cannot perform would recreate exactly the incoherence it exists to prevent.
 //
-// The values are captured, not recalled. curl 8.21.0 / OpenSSL 3.6.3 and Chromium, both read off
-// the wire on 2026-08-01. See test/tls/fingerprint.test.js and test/tls/grease.test.js.
+// The values are captured, not recalled — and as of 1.6.2 the captures are COMMITTED, in
+// test/tls/_captured-hellos.js, recorded by scripts/capture-clienthello.mjs from curl 8.21.0 /
+// OpenSSL 3.6.3 and from Chromium. Until then the claim had no artifact behind it: the tests
+// compared the builder against the constants below, which catches drift and cannot catch the
+// constants being wrong about the client they name.
+//
+// Two things that check found, both now asserted rather than assumed:
+//   * curl's TLS backend is part of its identity. macOS system curl (8.7.1, LibreSSL) sends SEVEN
+//     extensions where the OpenSSL build sends twelve, so "curl" alone does not name a fingerprint.
+//   * Chromium leads signature_algorithms with ML-DSA-44/65/87 (0x0904/5/6), which this package
+//     cannot verify and therefore must not offer. The omission is correct and was undocumented.
 
 import { ConfigError, codes } from './errors.js';
 import { CURL_EXTENSION_ORDER, SHUFFLE_EXTENSIONS } from './tls/handshake-messages.js';
