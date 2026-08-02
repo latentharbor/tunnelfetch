@@ -31,6 +31,27 @@ import { ALPN_H2, ALPN_HTTP11 } from './http2/constants.js';
 const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
 
 /**
+ * The default cap on a response body, raw and decoded alike. **This has a default because a
+ * runtime with a hard memory ceiling makes "no limit" a way to be killed by a peer, not a freedom.**
+ *
+ * It used to be `Infinity`. That left every caller who had not thought about it open to a
+ * decompression bomb: 53 coded bytes reaching 32 MB is real and measured, and the bundled `br`/`zstd`
+ * decoders self-limit at 256 MiB, which is TWICE the 128 MB a Workers isolate gets. A cap above the
+ * ceiling cannot fire before the isolate dies, so the practical protection was none. A client whose
+ * entire purpose is fetching URLs it does not control should not ship that as its default.
+ *
+ * 32 MiB is a quarter of the ceiling, so a body buffered to the cap by `.arrayBuffer()`/`.json()`
+ * still leaves the isolate room to survive and report it. It is also two orders of magnitude above
+ * any HTML page or API response, so the callers it interrupts are the ones deliberately moving large
+ * files — who get a message naming the option and can raise it or set `Infinity` to opt out.
+ *
+ * This bounds the WIRE body too, not only the decoded one, so it is a real behaviour change and not
+ * only a bomb guard: a 50 MB download now needs an explicit `maxBodyBytes`. That is the intended
+ * trade — an unasked-for limit is discoverable the first time it bites, an unasked-for OOM is not.
+ */
+const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
  * A `fetch`-shaped function. Deliberately the platform's own signature: being assignable to
  * `typeof fetch` is what lets an SDK accept this in place of the global without adapting.
  * @typedef {(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>} FetchLike
@@ -72,9 +93,11 @@ const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
  * @property {import('./client/cookies.js').CookieJar} [jar] supply a jar directly, e.g. to share
  *   one across Clients or to persist it.
  * @property {number} [maxRedirects] default 20.
- * @property {number} [maxBodyBytes] the most body this client will produce. Checked against
- *   Content-Length before a byte is read, enforced on the raw stream, and enforced again on the
- *   DECODED output — a compressed body within the cap can decompress far past it.
+ * @property {number} [maxBodyBytes] the most body this client will produce, **default 32 MiB**.
+ *   Checked against Content-Length before a byte is read, enforced on the raw stream, and enforced
+ *   again on the DECODED output — a compressed body within the cap can decompress far past it, and
+ *   a registered decoder's output is bounded by it too. Pass `Infinity` to opt out, which is the
+ *   right choice for streaming large files and the wrong one for fetching URLs you do not control.
  * @property {boolean} [decompress] gzip/deflate. Default true.
  * @property {Record<string, import('./client/decode.js').BodyDecoder>} [decoders] extra
  *   content-codings this client can read, e.g. `{ br: (s) => ... }`. Registering one is what
@@ -686,7 +709,7 @@ async function sendAndReceive(client, conn, current, { key, deadlines, reused })
     client.jar.setFromResponse(current.url, headInfo.setCookie);
   }
 
-  const raw = readResponseBody(reader, framing, { maxBytes: o.maxBodyBytes ?? Infinity });
+  const raw = readResponseBody(reader, framing, { maxBytes: o.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES });
 
   // The connection goes back to the pool only when the body reaches the end its framing declared.
   // `completed` resolving false means the caller cancelled and the stream position is unknown.
@@ -827,7 +850,7 @@ function decodeResponseBody(body, headers, options) {
   if (options.decompress === false) return body;
   const encoding = headers.get('content-encoding');
   if (!encoding) return body;
-  return decodeBody(body, encoding, options.decoders ?? null, options.maxBodyBytes ?? Infinity);
+  return decodeBody(body, encoding, options.decoders ?? null, options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
 }
 
 function buildResponse(headInfo, body, framing, conn) {

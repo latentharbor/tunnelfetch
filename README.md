@@ -487,7 +487,7 @@ res.tunnelfetch.httpVersion; // '2' if the server chose h2, '1.1' otherwise
 | `timeouts` | see below | `connectMs`, `handshakeMs`, `headersMs`, `idleMs`, `totalMs`. |
 | `cookies` | `false` | Enable a per-Client cookie jar. |
 | `maxRedirects` | `20` | |
-| `maxBodyBytes` | `Infinity` | Enforced from `Content-Length` before a byte is read. |
+| `maxBodyBytes` | **`32 MiB`** | Enforced from `Content-Length` before a byte is read, on the raw stream, and on the DECODED output — including a decoder you registered. `Infinity` opts out; see [the note on the default](#the-body-cap-has-a-default-now). |
 | `decompress` | `true` | Decode `Content-Encoding` at all. gzip and deflate are built in. |
 | `decoders` | `{}` | Extra codings, e.g. `{ br: fn }`. Each is added to `Accept-Encoding`. See [`br`, `zstd`](#br-zstd-and-other-codings). |
 | `keepAlive` | `true` | |
@@ -500,6 +500,30 @@ carries a non-standard `tunnelfetch` property with `{proxied, proxy, tls, httpVe
 
 `client.close()` releases every pooled socket. A `Client` that is not closed leaks sockets for the
 lifetime of the isolate.
+
+#### The body cap has a default now
+
+**`maxBodyBytes` defaulted to `Infinity` through 1.5.0. From 1.6.0 it is 32 MiB, and that is a
+breaking change** — a download larger than 32 MiB now needs an explicit `maxBodyBytes`, compressed
+or not, because this option bounds the wire body as well as the decoded one.
+
+The reason is that "no limit" is not a freedom on a runtime with a hard memory ceiling; it is a way
+to be killed by a peer. A 53-byte brotli body decoding to 32 MB is measured here, not hypothetical,
+and the bundled `br`/`zstd` decoders self-limit at 256 MiB — **twice the 128 MB a Workers isolate
+gets**, so that fallback cannot fire before the isolate is already dead. A client whose entire
+purpose is fetching URLs you do not control should not ship "unbounded" as the setting you get for
+not having read this table.
+
+32 MiB is a quarter of the ceiling, so a body buffered to the cap by `.arrayBuffer()` still leaves
+the isolate room to survive and report it, and it is two orders of magnitude above any page or API
+response. If you are deliberately moving large files, say so:
+
+```js
+new Client({ connect, proxy, maxBodyBytes: Infinity });   // or any number you have thought about
+```
+
+The trade is deliberate: an unasked-for limit is discoverable the first time it bites, and names the
+option in its error. An unasked-for OOM is neither.
 
 ### Trust — the `verify=` knob
 

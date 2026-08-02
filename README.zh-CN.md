@@ -381,7 +381,7 @@ res.tunnelfetch.httpVersion; // 服务器选了 h2 就是 '2'，否则是 '1.1'
 | `timeouts` | 见下文 | `connectMs`、`handshakeMs`、`headersMs`、`idleMs`、`totalMs`。 |
 | `cookies` | `false` | 启用该 Client 专属的 cookie jar。 |
 | `maxRedirects` | `20` | |
-| `maxBodyBytes` | `Infinity` | 在读入任何字节之前就按 `Content-Length` 强制执行。 |
+| `maxBodyBytes` | **`32 MiB`** | 在读入任何字节之前就按 `Content-Length` 强制执行,并在原始流和**解码后的输出**上各执行一次——包括你自己注册的解码器。传 `Infinity` 可以退出;见[关于这个默认值](#正文上限现在有默认值了)。 |
 | `decompress` | `true` | 是否解码 `Content-Encoding`。gzip 与 deflate 内置。 |
 | `decoders` | `{}` | 额外的编码，如 `{ br: fn }`；每一个都会被加进 `Accept-Encoding`。见 [`br`、`zstd`](#brzstd-与其它编码)。 |
 | `keepAlive` | `true` | |
@@ -392,6 +392,26 @@ res.tunnelfetch.httpVersion; // 服务器选了 h2 就是 '2'，否则是 '1.1'
 `client.fetch(input, init)` 接受并返回平台的 `Request`/`Response`。响应上带有一个非标准的 `tunnelfetch` 属性，内容为 `{proxied, proxy, tls, httpVersion, framing}`。
 
 `client.close()` 释放池中全部 socket。不关闭的 `Client` 会在 isolate 的整个生命周期里泄漏 socket。
+
+#### 正文上限现在有默认值了
+
+**`maxBodyBytes` 在 1.5.0 及以前默认是 `Infinity`,从 1.6.0 起是 32 MiB,这是一个破坏性变更**——下载超过
+32 MiB 的内容现在需要显式设置 `maxBodyBytes`,压没压缩都一样,因为这个选项同时约束线上正文和解码后的正文。
+
+理由是:在一个有硬性内存上限的运行时里,「不设限」不是自由,是一条被对端杀死的路径。53 字节的 brotli 正文解码出
+32 MB,这是实测的,不是假想;而内置的 `br`/`zstd` 解码器自限在 256 MiB——**是 Workers isolate 那 128 MB 的
+两倍**,所以那道兜底根本不可能在 isolate 死掉之前触发。一个存在意义就是去抓你控制不了的 URL 的客户端,不该把
+「无上限」作为「没读过这张表就会拿到」的默认值。
+
+32 MiB 是天花板的四分之一,所以即使被 `.arrayBuffer()` 整个缓冲到上限,isolate 也还有余量活下来并报告出来;
+而它比任何页面或 API 响应都高两个数量级。如果你确实要搬大文件,就明说:
+
+```js
+new Client({ connect, proxy, maxBodyBytes: Infinity });   // 或者任何一个你想清楚了的数字
+```
+
+这个取舍是有意的:一个没被要求的上限,在第一次挡住你的时候是可发现的,而且错误信息里会点名那个选项;一次没被
+要求的 OOM 两者都不是。
 
 ### Trust — `verify=` 旋钮
 

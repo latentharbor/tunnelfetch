@@ -36,7 +36,11 @@ The properties worth attacking:
 - **Credentials stay put.** Proxy credentials must not appear in errors, logs, or the `tunnelfetch`
   response detail. Session tickets are keyed to the full pool key and are dropped on `close()`.
 - **A peer cannot make this client allocate without bound.** Response heads, proxy replies, and
-  bodies all have caps that are enforced before the bytes are read.
+  bodies all have caps that are enforced before the bytes are read, and every one of them has a
+  finite DEFAULT. `maxBodyBytes` defaulted to `Infinity` through 1.5.0, which made this claim false
+  for any caller who had not set it: a 53-byte brotli body reaching 32 MB is measured, not
+  hypothetical. It is 32 MiB from 1.6.0. A caller may still pass `Infinity`, and that is then their
+  decision rather than this package's default.
 - **Ambiguity is an error.** Conflicting framing, a truncated body, an unknown record type, a
   header the parser cannot agree on — all must throw rather than guess.
 
