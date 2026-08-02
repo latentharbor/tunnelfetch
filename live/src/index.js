@@ -20,9 +20,14 @@ import { DeadlineController, withIdleDeadline } from '../../src/util/deadline.js
 import { BENCH_CHAIN, BENCH_ANCHOR, BENCH_HOSTNAME } from './bench-chain.js';
 import { RAW_BYTES, BR, BR11, GZ, ZSTD } from './codec-fixture.js';
 import { gunzipSync } from 'fflate';
-import { zstd as zstdFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/zstd-dec.wasm.js';
+// These two used to be imported by ABSOLUTE PATH out of a `.claude/worktrees/agent-…` directory —
+// gitignored, machine-specific and transient — which meant the instrument that produced this
+// README's codec figures could not be loaded from a clean checkout of the repository that quotes
+// them. The files are byte-identical to the ones the package ships (verified by sha256), so this
+// now imports those: one less copy, and the rig measures the decoder that actually ships.
+import { zstd as zstdFree } from '../../src/profile/vendor/zstd-dec.js';
 import { chacha20poly1305 as chachaWasm } from '../../src/profile/vendor/chacha20poly1305.js';
-import { br as brotliFree } from '/Users/gang/Documents/worker-packages/.claude/worktrees/agent-a8b01be372a75f1c6/wasmdecode/dist/brotli-dec.wasm.js';
+import { br as brotliFree } from '../../src/profile/vendor/brotli-dec.js';
 import brotliJs from 'brotli/decompress.js';
 import { ungzip as pakoUngzip } from 'pako';
 import brotliWasm from 'brotli-dec-wasm/web/bg.wasm';
