@@ -1047,43 +1047,6 @@ subject DN, and only the one anchor a chain lands on is ever decoded, so startup
 the 380 KB bundle (133 KB gzipped) and a request that imports but does not use the package costs
 0 ms.
 
-### Streaming APIs: turn HTTP/2 off
-
-An SSE response from an LLM API is the opposite shape to everything else measured here: a small body
-arriving as hundreds of tiny events rather than a large one arriving in a few chunks. Over HTTP/2
-each of those events is a DATA frame with flow control and a `WINDOW_UPDATE` behind it; over
-HTTP/1.1 it is a chunked-encoding chunk and nothing else. These APIs do not multiplex, so the
-cheaper framing simply wins:
-
-```js
-new Client({ connect, proxy, http2: false });
-```
-
-Measured against a real streaming endpoint through a proxy, 20K tokens in and 8K tokens out:
-
-| | CPU/request | per 1M requests |
-| --- | --- | --- |
-| HTTP/2 | 32 ms | $0.94 |
-| **HTTP/1.1** | **28 ms** | **$0.86** |
-| platform `fetch` — reference; it cannot use a proxy | 5 ms | $0.40 |
-
-**13% for one option, and nothing is given up** — a request that never opens a second stream gains
-nothing from multiplexing.
-
-Two things about this shape are worth knowing because they are counter-intuitive:
-
-**The cost is flat in output length.** 512 tokens and 8000 tokens cost within 2 ms of each other.
-Events are batched by the server and V8 tiers up inside the request, and the two together flatten
-the curve completely. An earlier version of this section modelled it as linear from two nearby
-points and predicted a break-even 15x lower than the truth; do not extrapolate this from a slope.
-
-**The request body is cheap.** A 20K-token prompt is ~108 KB of JSON to serialise, buffer, encrypt
-and frame, and it costs 4 ms on h1 or 6 ms on h2 — 15–20% of the request, not the dominant term.
-
-For scale: at these sizes the model's own bill is about **$0.0088 per request**, so this package's
-CPU is **0.011%** of what you pay. Turn h2 off because it is free, not because it will show up on an
-invoice.
-
 ### Streaming APIs, and what they cost
 
 An SSE response from an LLM API is the opposite shape to everything else measured here: a small body
