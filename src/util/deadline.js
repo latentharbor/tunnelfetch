@@ -178,22 +178,31 @@ export class DeadlineController {
    * Reject as soon as the signal aborts, resolve when `promise` settles first.
    * The abort reason is preserved so the caller sees the typed TimeoutError, not a generic abort.
    */
+  /**
+   * A promise that rejects when this controller aborts, created once and reused.
+   *
+   * `race` used to register and unregister an abort listener PER CALL, which is per chunk on a body
+   * stream. That is invisible on a 4 MB response — a few dozen chunks — and it is the dominant
+   * per-event cost on an SSE stream, where a single completion can be a hundred thousand chunks of
+   * a few hundred bytes each. The signal does not change over the life of the controller, so one
+   * registration is enough.
+   *
+   * Pre-observed, because a rejection nobody has awaited yet is an unhandled rejection.
+   */
+  get _abortPromise() {
+    if (!this.__abortP) {
+      this.__abortP = new Promise((_, reject) => {
+        if (this.aborted) reject(this.signal.reason);
+        else this.signal.addEventListener('abort', () => reject(this.signal.reason), { once: true });
+      });
+      this.__abortP.catch(() => {});
+    }
+    return this.__abortP;
+  }
+
   race(promise) {
     if (this.aborted) return Promise.reject(this.signal.reason);
-    return new Promise((resolve, reject) => {
-      const onAbort = () => reject(this.signal.reason);
-      this.signal.addEventListener('abort', onAbort, { once: true });
-      promise.then(
-        (v) => {
-          this.signal.removeEventListener('abort', onAbort);
-          resolve(v);
-        },
-        (e) => {
-          this.signal.removeEventListener('abort', onAbort);
-          reject(e);
-        },
-      );
-    });
+    return Promise.race([promise, this._abortPromise]);
   }
 }
 
