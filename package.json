@@ -1,6 +1,6 @@
 {
   "name": "tunnelfetch",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "A fetch-shaped HTTP client that can route through HTTP CONNECT / HTTPS / SOCKS5 proxies on runtimes with only raw TCP, such as Cloudflare Workers. Implements TLS in userland because the runtime cannot verify a tunnelled peer.",
   "keywords": [
     "fetch",
