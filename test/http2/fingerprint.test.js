@@ -1,4 +1,10 @@
 // The h2 client fingerprint, pinned to curl 8.7.1 / nghttp2 1.69.0 as captured on a live ALPN h2
+// handshake. NOTE the version: the TLS half of this fingerprint is attributed to curl 8.21.0 /
+// OpenSSL 3.6.3 in the README and in src/profiles.js, and these two captures were taken from
+// different curl builds. nghttp2's h2 preface has been stable across that range, so the bytes
+// below are believed current — but 'believed' is the operative word, and one identity quoting
+// two source versions is a discrepancy a reader deserves to see rather than a detail to tidy
+// away. Neither capture has an artifact committed anywhere in this repository.
 // handshake. This is empirical, not aesthetic: HTTP/2 exists in this package for ACCESS — some
 // sites challenge HTTP/1.1 as a bot signal and let curl's h2 through — and a naive h2 fingerprint
 // can fail exactly where curl's succeeds. If any of these bytes drift from curl's, that is a
@@ -12,6 +18,8 @@ import { ByteReader, concat } from '../../src/util/bytes.js';
 import { duplexPair } from '../_harness.js';
 import { readFrame, parseSettings, parseWindowUpdate } from '../../src/http2/frames.js';
 import { FRAME } from '../../src/http2/constants.js';
+import { applyProfile } from '../../src/profiles.js';
+import { chrome as chromeProfile } from '../../src/profile/chrome.js';
 
 /**
  * Drive a connection and read the exact frames it writes as its preface flight. A real peer keeps
@@ -169,4 +177,59 @@ test('HPACK indexing is configurable, and defaults to curl\'s', () => {
   assert.equal(custom.find((f) => f.name === ':path').indexing, 'incremental');
   assert.equal(custom.find((f) => f.name === 'a').indexing, 'never');
   assert.equal(custom.find((f) => f.name === ':scheme').indexing, 'incremental', 'unlisted fields moved');
+});
+
+// The Chrome identity's h2 half, asserted through `applyProfile` rather than by hand.
+//
+// Nothing in this repository pinned a single Chrome h2 value before, and that is exactly how the
+// connection window came to be dead config: `profiles.chrome` declared Chromium's ~15 MiB window,
+// `applyProfile` did not copy it, the client never passed it, and the connection reads an option
+// spelled differently — so every Chrome-profile connection sent curl's 1000 MiB increment under a
+// Chromium ClientHello. Four places had to agree and nothing checked that they did.
+//
+// These drive the profile through the same folding the Client uses, so a field that stops being
+// propagated fails here rather than on someone's wire.
+test('the chrome profile reaches the connection: its SETTINGS and its window, not curl\'s', async () => {
+  const folded = applyProfile({ profile: chromeProfile, http2: true });
+  const { conn, settings, windowUpdate } = await capturePreface({
+    settings: folded.http2Settings,
+    connectionWindow: folded.http2ConnectionWindow,
+  });
+
+  // Captured off the wire from Chrome 150: HEADER_TABLE_SIZE, ENABLE_PUSH, INITIAL_WINDOW_SIZE,
+  // MAX_HEADER_LIST_SIZE — ids and order both, since the order is part of the fingerprint.
+  assert.deepEqual(parseSettings(settings.payload), [[0x1, 65536], [0x2, 0], [0x4, 6291456], [0x6, 262144]]);
+
+  // 15663105 + 65535 = 15728640. curl's is 1048576000, so a wrong wiring is not a subtle miss.
+  const inc = parseWindowUpdate(windowUpdate.payload);
+  assert.equal(inc, 15728640 - 65535, `connection window increment was ${inc}`);
+  assert.notEqual(inc, 1048510465, 'the chrome profile sent curl\'s connection window');
+  await conn.close();
+});
+
+test('chrome and curl do not silently share an h2 preface', async () => {
+  // The failure mode a profile exists to prevent is a Chromium ClientHello above another client's
+  // framing. This asserts the two prefaces differ at all — a regression that made the chrome
+  // profile fall back to curl's defaults would collapse them into one.
+  const chrome = applyProfile({ profile: chromeProfile, http2: true });
+  const a = await capturePreface({ settings: chrome.http2Settings,
+                                   connectionWindow: chrome.http2ConnectionWindow });
+  const b = await capturePreface(); // curl: the package defaults
+  assert.notDeepEqual(parseSettings(a.settings.payload), parseSettings(b.settings.payload));
+  assert.notEqual(parseWindowUpdate(a.windowUpdate.payload), parseWindowUpdate(b.windowUpdate.payload));
+  await a.conn.close();
+  await b.conn.close();
+});
+
+// HPACK indexing is the one h2 fingerprint field the chrome capture does NOT cover, and this test
+// records that rather than letting it stay invisible. `_hpackIndexing` falls back to curl's
+// `:path`-without-indexing inside the connection, so the chrome profile currently presents curl's
+// HPACK representation. Closing that needs a capture, not a guess — see the README.
+test('the chrome profile has no captured HPACK indexing, and inherits curl\'s', async () => {
+  const folded = applyProfile({ profile: chromeProfile, http2: true });
+  assert.equal(
+    folded.http2HpackIndexing,
+    undefined,
+    'chrome now declares HPACK indexing — capture it, then assert the captured value here instead',
+  );
 });

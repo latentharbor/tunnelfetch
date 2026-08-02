@@ -335,7 +335,8 @@ curl（8.7.1 / nghttp2），照线上抓包原样复刻。这么做是实证需�
 | 签名算法 | SHA-256/384/512 上的 ECDSA 与 RSA-PSS/PKCS#1 | `tls.sigSchemes` |
 | ALPN | `h2, http/1.1` | `tls.alpn` |
 | HTTP/2 `SETTINGS` 的 id **与顺序** | curl 的：`MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH` | `http2Settings` |
-| h2 前导、`WINDOW_UPDATE`、伪头顺序、HPACK 表示 | curl 的，逐字节一致 | 固定 |
+| h2 前导、`WINDOW_UPDATE`、伪头顺序 | curl 的，逐字节一致 | `http2ConnectionWindow`、`http2PseudoHeaderOrder` |
+| HPACK 表示 | curl 的（`:path` 不索引，其余 incremental） | `http2HpackIndexing` |
 | `Accept-Encoding` | `gzip, deflate`——curl 的 | `decoders` 会追加 |
 
 扩展顺序之所以要紧，是因为 JA3 和 JA4 哈希的正是**线上顺序**的扩展列表，那是指纹识别读到的主要内容。`pre_shared_key` 无论你怎么配都强制排最后：RFC 8446 §4.2.11 把 binder 的转录定义为"截到 binder 之前的那段 hello"，只有后面不跟东西时这个范围才成立。
