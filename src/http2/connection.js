@@ -201,7 +201,21 @@ export class Http2Connection {
 
     // Our advertised settings. The defaults ARE the fingerprint (see constants.js); overrides
     // exist for tests, and shifting them shifts what the server sees, so production leaves them.
-    this._ourInitialWindow = opts.initialWindowSize ?? CLIENT_INITIAL_WINDOW_SIZE;
+    // The window we ADVERTISE and the window we ACCOUNT FOR must be the same number, and until
+    // 1.6.3 they were two independent settings that silently disagreed.
+    //
+    // `opts.settings` is the SETTINGS flight, which is how a fingerprint profile states its
+    // identity; SETTINGS_INITIAL_WINDOW_SIZE (id 4) inside it is what the peer is told. This field
+    // is what `_replenish` measures against — it only emits a WINDOW_UPDATE once the consumer has
+    // drained half of it. Take them from different places and a profile advertising 64 KiB against
+    // a default accounting of 10 MiB sets a replenish threshold of 5 MiB that a 64 KiB window can
+    // never reach: the peer sends one window's worth, stops, and no WINDOW_UPDATE ever comes. Every
+    // response larger than the advertised window hangs until the idle deadline fires.
+    //
+    // That is not hypothetical — `profiles.curl` gained curl 8.21.0's real 65536 in 1.6.2 and this
+    // is what it did. One source of truth: if the flight names id 4, that IS the window.
+    const advertised = (opts.settings ?? []).find(([id]) => id === 0x4)?.[1];
+    this._ourInitialWindow = opts.initialWindowSize ?? advertised ?? CLIENT_INITIAL_WINDOW_SIZE;
     this._ourConnWindow = opts.connectionWindow ?? CLIENT_CONNECTION_WINDOW;
     this._ourMaxConcurrent = opts.maxConcurrentStreams ?? CLIENT_MAX_CONCURRENT_STREAMS;
     this._ourHeaderTableSize = opts.maxHeaderTableSize ?? DEFAULT_HEADER_TABLE_SIZE;

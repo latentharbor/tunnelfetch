@@ -1348,6 +1348,39 @@ export default {
     if (!env.PROBE_TOKEN || request.headers.get('x-probe-token') !== env.PROBE_TOKEN) {
       return new Response('forbidden', { status: 403 });
     }
+
+    if (url.searchParams.get('h2window')) {
+      // Does curl 8.21.0's real SETTINGS_INITIAL_WINDOW_SIZE (64 KiB) cost anything against the
+      // 10 MiB this package defaults to? 1.6.2 changed `profiles.curl` to the captured value and
+      // said the throughput consequence was NOT measured. This measures it.
+      //
+      // A smaller stream window is a ROUND-TRIP cost first: the peer stops after a window's worth
+      // and waits for a WINDOW_UPDATE. Workers bills CPU, not wall time, so the two can move in
+      // opposite directions — both are reported, and conflating them would answer the wrong
+      // question. No proxy: this is about h2 flow control, and a direct connection isolates it.
+      const win = Number(url.searchParams.get('h2window'));
+      const target = url.searchParams.get('target');
+      const reps = Number(url.searchParams.get('reps') ?? 1);
+      markPath('h2window', { win: String(win), target, reps: String(reps) });
+      const client = new Client({
+        connect, forceTunnel: true,
+        http2Settings: [[3, 100], [4, win], [2, 0]],
+        maxBodyBytes: Infinity,
+        timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 },
+      });
+      let bytes = 0, status = 0, proto = null;
+      const t0 = Date.now();
+      try {
+        for (let i = 0; i < reps; i++) {
+          const r = await client.fetch(`https://${target}?i=${i}`);
+          status = r.status;
+          proto = r.tunnelfetch?.httpVersion ?? null;
+          bytes += (await r.arrayBuffer()).byteLength;
+        }
+      } finally { await client.close(); }
+      return Response.json({ win, target, reps, status, proto, bytes, wallMs: Date.now() - t0 });
+    }
+
     const spec = request.headers.get('x-proxy');
     if (!spec) return new Response('need x-proxy: host:port:user:pass', { status: 400 });
     const [host, port, user, pass] = spec.split(':');

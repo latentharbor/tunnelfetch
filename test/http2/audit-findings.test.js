@@ -317,3 +317,49 @@ test('DATA on stream 0 is a connection error', async () => {
   await assert.rejects(reqP);
   await conn.close();
 });
+
+// The window a connection ADVERTISES and the window it ACCOUNTS FOR have to be the same number.
+//
+// They were two independent options. `settings` set what the peer was told; `initialWindowSize` set
+// what `_replenish` measured against, defaulting to 10 MiB. A profile advertising curl's real
+// 64 KiB therefore ran a replenish threshold of 5 MiB that a 64 KiB window can never reach: the
+// peer sends one window's worth, stops, and no WINDOW_UPDATE ever comes. Every response larger than
+// the advertised window hangs until the idle deadline.
+//
+// `profiles.curl` gained curl 8.21.0's 65536 in 1.6.2 and this is exactly what it did to real
+// downloads. The same shape as the dead `http2ConnectionWindow`: two places had to agree and
+// nothing checked that they did.
+test('a WINDOW_UPDATE actually goes out once half the advertised window is consumed', async () => {
+  // Asserting that the body arrives is NOT enough: this harness's server does not enforce flow
+  // control, so it keeps sending regardless and the body completes either way. That version of this
+  // test passed against the broken build — the exact "passes on both sides of the fix" trap this
+  // file's header warns about. What a real server waits for is the frame, so the frame is what this
+  // asserts.
+  const WINDOW = 16384;
+  const { conn, server } = connect({ client: { settings: [[3, 100], [4, WINDOW], [2, 0]] } });
+  const reqP = conn.request(GET);
+  await awaitRequest(server, 1);
+  await server.sendResponse(1, [{ name: ':status', value: '200' }]);
+  const res = await reqP;
+
+  const read = readBodyText(res.body);
+  const seen = server.waitForFrame((f) => f.type === FRAME.WINDOW_UPDATE && f.streamId === 1);
+  for (let i = 0; i < 4; i++) {
+    await server.sendData(1, enc.encode('x'.repeat(WINDOW)), i === 3);
+    await sleep(5);
+  }
+  // Against the broken build the threshold was half of 10 MiB, so this never arrives and the race
+  // resolves to the timeout.
+  const got = await Promise.race([seen.then(() => 'window-update'), sleep(300).then(() => 'nothing')]);
+  assert.equal(got, 'window-update', 'no stream WINDOW_UPDATE was sent; a real peer would stall');
+  assert.equal((await read).length, WINDOW * 4);
+  await conn.close();
+});
+
+test('the advertised window is the one the replenish threshold uses', async () => {
+  // The invariant behind the test above, asserted directly so a future refactor that reintroduces
+  // two sources cannot pass by accident.
+  const { conn } = connect({ client: { settings: [[3, 100], [4, 65536], [2, 0]] } });
+  assert.equal(conn._ourInitialWindow, 65536);
+  await conn.close();
+});
