@@ -250,6 +250,7 @@ export async function continueTls13(ctx) {
       // not permit a second hello to change its extension SET, and a retry that quietly dropped
       // them would present one fingerprint on the first flight and a different one on the second —
       // a difference that is itself a signal.
+      omitExtensions: options.omitExtensions ?? [],
       extraExtensions: [
         ...(options.extraExtensions ?? []),
         ...(cookie ? [cookieExtension(cookie)] : []),

@@ -122,9 +122,15 @@ function buildConnectRequest(proxy, target) {
   if (proxy.username) {
     lines.push(`Proxy-Authorization: Basic ${basicCredentials(proxy.username, proxy.password)}`);
   }
-  // Some proxies still key off the pre-standard hop header; sending it is harmless and avoids a
-  // class of proxy that closes the tunnel after one request without it.
-  lines.push('Proxy-Connection: keep-alive');
+  // `Proxy-Connection` is a pre-standard hop header that never made it into a spec, and clients
+  // disagree about it: some send `keep-alive`, some send `close`, some omit it. The proxy sees this
+  // even though the origin never does, so for anyone matching a client's behaviour AT THE PROXY it
+  // is part of the fingerprint. `keep-alive` stays the default — it avoids a class of proxy that
+  // closes the tunnel after one request — but it is no longer fixed.
+  //
+  // `null` omits the header entirely, which is not the same as sending `close`.
+  const pc = proxy.proxyConnection === undefined ? 'keep-alive' : proxy.proxyConnection;
+  if (pc !== null) lines.push(`Proxy-Connection: ${pc}`);
   return `${lines.join('\r\n')}\r\n\r\n`;
 }
 

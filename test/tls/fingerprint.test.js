@@ -303,3 +303,17 @@ test('the chrome profile is missing the extensions Chromium sends that this pack
     'the gap between this package and a real Chromium hello changed; update the README with it',
   );
 });
+
+// `omitExtensions` is the subtractive counterpart to `extraExtensions`. status_request is the one
+// extension this package sends that curl does not, so an identity matching a sample without it had
+// no way to drop it.
+test('omitExtensions removes status_request, which nothing else could', () => {
+  assert.ok(extensionTypes(hello()).includes(EXTENSION.status_request), 'baseline changed');
+  const types = extensionTypes(hello({ omitExtensions: [EXTENSION.status_request] }));
+  assert.ok(!types.includes(EXTENSION.status_request), 'the extension survived the omission');
+  // Nothing else moved: this removes one entry, it does not rebuild the list.
+  assert.deepEqual(
+    types,
+    extensionTypes(hello()).filter((t) => t !== EXTENSION.status_request),
+  );
+});

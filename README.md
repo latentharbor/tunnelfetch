@@ -470,6 +470,13 @@ extension **set** that is curl's. A test reads that gap straight out of the comm
 capture and fails if it changes, so it cannot drift quietly — but it is a real difference and a
 JA3/JA4 hash sees it.
 
+`tls.omitExtensions` is the subtractive counterpart, and `status_request` (5) is what it exists for:
+that is the one extension this package sends which curl does not, so an identity matching a sample
+without it had no way to drop it. Dropping it gives up OCSP stapling — the only revocation signal
+this package consumes — so pairing it with `trust.revocation: 'require-staple'` is refused at
+configuration time rather than left to fail every connection on a certificate that was never asked
+to carry a staple.
+
 `tls.extraExtensions` takes pre-encoded extensions and is the only way to close it. They are ordered
 like any other and reproduced on a HelloRetryRequest retry, because a second hello that changed its
 extension set would be both malformed (RFC 8446 §4.1.2) and a signal in itself. Encoding them
@@ -597,6 +604,20 @@ new Client({ connect, proxy, maxBodyBytes: Infinity });   // or any number you h
 
 The trade is deliberate: an unasked-for limit is discoverable the first time it bites, and names the
 option in its error. An unasked-for OOM is neither.
+
+#### The proxy sees a fingerprint too
+
+`Proxy-Connection` is a pre-standard hop header that never reached a spec. The origin never sees it;
+the proxy always does. Clients disagree — some send `keep-alive`, some `close`, some omit it — so for
+anyone matching a client's behaviour *at the proxy* it is part of the fingerprint, and it used to be
+hard-coded.
+
+```js
+new Client({ connect, proxy: { ...cfg, proxyConnection: 'close' } });  // or null to omit it
+```
+
+The default stays `keep-alive`, which avoids a class of proxy that closes the tunnel after one
+request. Omitting the header is not the same as sending `close`.
 
 ### Trust — the `verify=` knob
 

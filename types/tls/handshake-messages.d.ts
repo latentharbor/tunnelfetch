@@ -32,7 +32,7 @@ export function generateKeyShare(group: number, deps?: import("./connect.js").Tl
  * @returns {Promise<Uint8Array>} throws on any degenerate or malformed peer key
  */
 export function deriveSharedSecret(group: number, privateKey: CryptoKey | import("./hybrid.js").HybridPrivate, peerKey: Uint8Array, deps?: import("./connect.js").TlsDeps): Promise<Uint8Array>;
-export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, psk, grease, randomBytes, }: {
+export function buildClientHello({ hostname, keyShares, random, legacySessionId, ciphers, groups, sigSchemes, alpn, versions, extensionOrder, extraExtensions, omitExtensions, psk, grease, randomBytes, }: {
     hostname: any;
     keyShares: any;
     random: any;
@@ -44,6 +44,7 @@ export function buildClientHello({ hostname, keyShares, random, legacySessionId,
     versions?: number[] | undefined;
     extensionOrder?: readonly number[] | undefined;
     extraExtensions?: never[] | undefined;
+    omitExtensions?: never[] | undefined;
     psk?: null | undefined;
     grease?: boolean | undefined;
     randomBytes?: ((n: any) => Uint8Array<any>) | undefined;
@@ -305,6 +306,7 @@ export function checkAlpn(extensions: Map<number, Uint8Array>, offeredAlpn: stri
  * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
  * @property {number[]} [versions] default [TLS13, TLS12]
  * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
+ * @property {number[]} [omitExtensions] extension types to leave out of the hello
  * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
  *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
  *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
@@ -432,6 +434,10 @@ export type ClientHelloOptions = {
      * pre-encoded, sent verbatim (the HRR cookie)
      */
     extraExtensions?: Uint8Array<ArrayBufferLike>[] | undefined;
+    /**
+     * extension types to leave out of the hello
+     */
+    omitExtensions?: number[] | undefined;
     /**
      * offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
      * the real binder over `message.subarray(0, truncatedLength)` and patch it in at

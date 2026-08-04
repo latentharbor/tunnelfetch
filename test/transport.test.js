@@ -283,3 +283,18 @@ test('an out-of-range target port is refused', async () => {
   }
   assert.equal(net.calls.length, 0);
 });
+
+// Dropping status_request gives up OCSP stapling, and stapling is the only revocation signal this
+// package consumes. With 'require-staple' that is not a stricter policy, it is one that can never
+// be satisfied: every connection would fail on a certificate never asked to carry a staple.
+test('omitting status_request while requiring a staple is refused, not left to fail every connection', async () => {
+  await rejectsWithCode(
+    () => openConnection({
+      url: 'https://example.com/',
+      connect: () => { throw new Error('should never dial'); },
+      trust: { mode: 'system', revocation: 'require-staple' },
+      tls: { omitExtensions: [5] },
+    }),
+    'CONFIG_INVALID',
+  );
+});

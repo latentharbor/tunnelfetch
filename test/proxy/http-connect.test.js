@@ -334,3 +334,23 @@ test('CONNECT: connect() throwing synchronously -> PROXY_UNREACHABLE naming prox
   assert.match(err.message, /proxy\.example:3128/);
   assert.match(err.message, /no route to host/);
 });
+
+// `Proxy-Connection` is a pre-standard hop header the origin never sees and the proxy always does,
+// so it belongs to whatever fingerprint the proxy is reading. Clients disagree about it — some send
+// keep-alive, some close, some nothing — and it was hard-coded to keep-alive.
+test('Proxy-Connection defaults to keep-alive, and can be changed or omitted', async () => {
+  for (const [cfg, check] of [
+    [{}, (r) => r.includes('Proxy-Connection: keep-alive')],
+    [{ proxyConnection: 'close' }, (r) => r.includes('Proxy-Connection: close')],
+    // null omits the header, which is not the same as sending close.
+    [{ proxyConnection: null }, (r) => !/proxy-connection/i.test(r)],
+  ]) {
+    const { fake, captured } = proxyReplying(OK_REPLY);
+    await openHttpConnect({
+      proxy: { ...PROXY, ...cfg },
+      target: { hostname: 'example.com', port: 443 },
+      connect: fake.connect,
+    });
+    assert.ok(check(latin1(captured.request)), `unexpected request:\n${latin1(captured.request)}`);
+  }
+});

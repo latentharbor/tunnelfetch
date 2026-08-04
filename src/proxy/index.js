@@ -19,7 +19,13 @@ import { openSocks5 } from './socks5.js';
  * @typedef {(addr: {hostname: string, port: number},
  *            opts?: {secureTransport?: 'off'|'on'|'starttls', allowHalfOpen?: boolean}) => Duplex} ConnectFn
  * @typedef {{ protocol: 'http'|'https'|'socks5'|'socks5h', hostname: string, port: number,
- *             username?: string, password?: string }} ProxyConfig
+ *             username?: string, password?: string,
+ *             proxyConnection?: string | null }} ProxyConfig
+ *
+ * `proxyConnection` sets the pre-standard `Proxy-Connection` header on a CONNECT request, or
+ * omits it entirely when null. Default 'keep-alive'. The origin never sees this header; the
+ * proxy does, so it belongs to whatever fingerprint the proxy is reading. Clients disagree —
+ * some send keep-alive, some close, some nothing — and omitting is not the same as 'close'.
  */
 
 const DEFAULT_PORTS = { http: 8080, https: 443, socks5: 1080, socks5h: 1080 };
@@ -114,6 +120,10 @@ function normalise(cfg) {
     port,
     username: cfg.username || undefined,
     password: cfg.password || undefined,
+    // Listed explicitly because this function REBUILDS the config rather than copying it, so a
+    // field not named here is dropped without a word. That is how `http2ConnectionWindow` came to
+    // be declared in a profile and read by nothing.
+    proxyConnection: cfg.proxyConnection,
   });
 }
 

@@ -192,6 +192,7 @@ export async function deriveSharedSecret(group, privateKey, peerKey, deps = {}) 
  * @property {string[]} [alpn] default ['http/1.1']; empty array omits the extension
  * @property {number[]} [versions] default [TLS13, TLS12]
  * @property {Uint8Array[]} [extraExtensions] pre-encoded, sent verbatim (the HRR cookie)
+ * @property {number[]} [omitExtensions] extension types to leave out of the hello
  * @property {{ identity: Uint8Array, obfuscatedTicketAge: number, binderLen: number }} [psk]
  *   offer this resumption PSK. Encoded with a zeroed binder placeholder; the caller MUST derive
  *   the real binder over `message.subarray(0, truncatedLength)` and patch it in at
@@ -299,6 +300,7 @@ export function buildClientHello({
   versions = [TLS13, TLS12],
   extensionOrder = CURL_EXTENSION_ORDER,
   extraExtensions = [],
+  omitExtensions = [],
   psk = null,
   grease = false,
   randomBytes = defaultRandom,
@@ -341,11 +343,15 @@ export function buildClientHello({
       'a resumption PSK was supplied but TLS 1.3 is not among the offered versions');
   }
 
+  const omit = new Set(omitExtensions);
   const extensionParts = [
     encodeServerName(hostname),
-    // Always offered, for either version: without it a server may not staple (RFC 6066 s8), and
-    // a stapled OCSP response is the only revocation signal this package can consume.
-    encodeStatusRequest(),
+    // Offered by default for either version: without it a server may not staple (RFC 6066 s8), and
+    // a stapled OCSP response is the only revocation signal this package can consume. It is also
+    // the one extension this package sends that curl does not, so an identity matching a sample
+    // without it needs a way to drop it — `omitExtensions` is the subtractive counterpart to
+    // `extraExtensions`, and dropping this one gives up stapling.
+    omit.has(EXTENSION.status_request) ? null : encodeStatusRequest(),
     encodeSupportedGroups(g ? [g.take(), ...groups] : groups),
     encodeSignatureAlgorithms(sigSchemes),
     alpn.length ? encodeAlpn(alpn) : null,
