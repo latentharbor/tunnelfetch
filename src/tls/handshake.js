@@ -246,7 +246,14 @@ export async function continueTls13(ctx) {
       grease: options.grease ?? false,
       random: hello.clientRandom,
       legacySessionId: hello.legacySessionId,
-      extraExtensions: cookie ? [cookieExtension(cookie)] : [],
+      // The caller's extras must be reproduced too, for the same reason the order is: s4.1.2 does
+      // not permit a second hello to change its extension SET, and a retry that quietly dropped
+      // them would present one fingerprint on the first flight and a different one on the second —
+      // a difference that is itself a signal.
+      extraExtensions: [
+        ...(options.extraExtensions ?? []),
+        ...(cookie ? [cookieExtension(cookie)] : []),
+      ],
       psk: offeredPsk && {
         identity: offeredPsk.identity,
         obfuscatedTicketAge: offeredPsk.obfuscatedTicketAge(),

@@ -453,6 +453,36 @@ Until 1.6.2 the profile carried curl **8.7.1's** window while presenting curl **
 ClientHello: one named client, two source versions, and a split identity that only a capture could
 find, because each half was individually true of some curl.
 
+**`extensionOrder` arranges extensions; it cannot add them.** The builder filters to the extensions
+it actually generated and sorts those, so an identity needing one this package does not build is not
+reachable by ordering. Chromium sends five that it does not:
+
+| | |
+| --- | --- |
+| `signed_certificate_timestamp` | 18 |
+| `compress_certificate` | 27 |
+| `session_ticket` | 35 |
+| `application_settings` | 17613 |
+| `encrypted_client_hello` | 65037 |
+
+So `profiles.chrome` presents a Chromium cipher list, group list and GREASE placement over an
+extension **set** that is curl's. A test reads that gap straight out of the committed Chromium
+capture and fails if it changes, so it cannot drift quietly — but it is a real difference and a
+JA3/JA4 hash sees it.
+
+`tls.extraExtensions` takes pre-encoded extensions and is the only way to close it. They are ordered
+like any other and reproduced on a HelloRetryRequest retry, because a second hello that changed its
+extension set would be both malformed (RFC 8446 §4.1.2) and a signal in itself. Encoding them
+correctly is the caller's job; this package does not parse what it did not build.
+
+**Every offered cipher must be one this package can perform.** `tls.ciphers` used to be taken
+verbatim, so a list containing a CBC or RSA-key-exchange suite put a number on the wire that a
+server could select — after which the AEAD layer had nothing to build and the connection died
+mid-handshake. Such a list is now refused at configuration time. An explicit `TLS_CHACHA20_POLY1305_SHA256`
+without an injected implementation is refused too, rather than silently dropped: quietly presenting
+a different fingerprint from the one you asked for is the worst outcome available to a package like
+this one.
+
 Extension order matters because JA3 and JA4 hash the extension list **in wire order**, so it is most
 of what a fingerprinter reads. `pre_shared_key` is forced last whatever you ask for: RFC 8446
 §4.2.11 defines the binder transcript as the hello truncated just before the binders, which is a
