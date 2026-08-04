@@ -44,6 +44,7 @@ test('parseProxy: URL strings with default ports 8080/443/1080/1080', () => {
     port: 8080,
     username: undefined,
     password: undefined,
+    proxyConnection: undefined,
   });
   assert.equal(parseProxy('https://proxy.example').port, 443);
   assert.equal(parseProxy('socks5://proxy.example').port, 1080);
@@ -89,6 +90,7 @@ test('parseProxy: object form is normalised, defaulted and frozen', () => {
     port: 1080,
     username: undefined,
     password: undefined,
+    proxyConnection: undefined,
   });
   // Frozen matters beyond hygiene: openTunnel uses Object.isFrozen to tell an already-parsed
   // config from a raw caller object that still needs validation.

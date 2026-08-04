@@ -16,6 +16,12 @@
  * @property {number[]} [ciphers] cipher suites to offer, in preference order. By default every
  *   suite must be one this package can perform: an offer it cannot honour is a dead connection the
  *   moment a server selects it, so an unknown suite is refused here rather than on the wire.
+ * @property {number[]} [omitExtensions] extension types to leave out of the ClientHello, the
+ *   subtractive counterpart to `extraExtensions`. `status_request` (5) is the one extension this
+ *   package sends that curl does not, so an identity matching a sample without it needs this.
+ *   Dropping it gives up OCSP stapling, which is the only revocation signal this package can
+ *   consume — pairing it with `trust.revocation: 'require-staple'` is refused rather than left to
+ *   fail every connection.
  * @property {boolean} [allowUnperformableCiphers] offer suites this package cannot complete.
  *   For fingerprint fidelity only. Real clients offer far more than this package implements — curl
  *   8.21.0 offers thirty against seven performable here, Chromium fifteen against seven — so a
@@ -182,6 +188,15 @@ export type TlsOptions = {
      * moment a server selects it, so an unknown suite is refused here rather than on the wire.
      */
     ciphers?: number[] | undefined;
+    /**
+     * extension types to leave out of the ClientHello, the
+     * subtractive counterpart to `extraExtensions`. `status_request` (5) is the one extension this
+     * package sends that curl does not, so an identity matching a sample without it needs this.
+     * Dropping it gives up OCSP stapling, which is the only revocation signal this package can
+     * consume — pairing it with `trust.revocation: 'require-staple'` is refused rather than left to
+     * fail every connection.
+     */
+    omitExtensions?: number[] | undefined;
     /**
      * offer suites this package cannot complete.
      * For fingerprint fidelity only. Real clients offer far more than this package implements — curl

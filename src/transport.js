@@ -124,6 +124,20 @@ export async function openConnection({
 }) {
   const target = targetFromUrl(url);
   const proxyConfig = parseProxy(proxy);
+
+  // Dropping status_request gives up OCSP stapling, and stapling is the only revocation signal this
+  // package consumes. Combined with `require-staple` that is not a weakened check, it is a policy
+  // that can never be satisfied: every connection would fail with OCSP_REQUIRED, on a certificate
+  // that was never asked to carry a staple. Refused here, where both settings are visible.
+  if ((tls?.omitExtensions ?? []).includes(5) && trust?.revocation === 'require-staple') {
+    throw new ConfigError(
+      codes.CONFIG_INVALID,
+      "tls.omitExtensions drops status_request (5) while trust.revocation is 'require-staple'. " +
+        'Without status_request a server is not asked to staple, so no staple can arrive and every ' +
+        'connection would fail. Keep the extension, or relax the revocation policy — the two are ' +
+        'a contradiction rather than a stricter setting.',
+    );
+  }
   const owns = !deadlines;
   const dl = deadlines ?? new DeadlineController({}, { signal });
 

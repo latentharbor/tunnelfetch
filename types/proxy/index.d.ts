@@ -49,12 +49,19 @@ export type ConnectFn = (addr: {
     secureTransport?: "off" | "on" | "starttls";
     allowHalfOpen?: boolean;
 }) => Duplex;
+/**
+ * `proxyConnection` sets the pre-standard `Proxy-Connection` header on a CONNECT request, or
+ * omits it entirely when null. Default 'keep-alive'. The origin never sees this header; the
+ * proxy does, so it belongs to whatever fingerprint the proxy is reading. Clients disagree —
+ * some send keep-alive, some close, some nothing — and omitting is not the same as 'close'.
+ */
 export type ProxyConfig = {
     protocol: "http" | "https" | "socks5" | "socks5h";
     hostname: string;
     port: number;
     username?: string;
     password?: string;
+    proxyConnection?: string | null;
 };
 import { openDirect } from './direct.js';
 import { openHttpConnect } from './http-connect.js';
