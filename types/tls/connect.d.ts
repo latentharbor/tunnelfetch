@@ -13,7 +13,16 @@
  * @property {number[]} [groups] supported_groups, in preference order.
  * @property {number[]} [offerGroups] groups to send an actual key_share for. Default the first
  *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
- * @property {number[]} [ciphers] cipher suites to offer, in preference order.
+ * @property {number[]} [ciphers] cipher suites to offer, in preference order. Every suite must be
+ *   one this package can perform; an offer it cannot honour is a dead connection the moment a
+ *   server selects it, so an unknown suite is refused here rather than on the wire.
+ * @property {Uint8Array[]} [extraExtensions] pre-encoded ClientHello extensions, appended before
+ *   ordering. `extensionOrder` can only arrange extensions that were BUILT — it filters to what
+ *   exists and sorts that — so ordering alone cannot produce an extension this package does not
+ *   generate. Chromium sends several that it does not: `signed_certificate_timestamp` (18),
+ *   `compress_certificate` (27), `session_ticket` (35), `application_settings` (17613) and ECH
+ *   (65037). Supplying them here is the only way to close that gap, and it is the caller's job to
+ *   encode them correctly — this package does not parse what it did not build.
  * @property {number[]} [sigSchemes] signature_algorithms to offer, in preference order.
  * @property {boolean | number} [grease] send GREASE (RFC 8701) reserved values in the cipher list,
  *   the extension list (one at each end), supported_groups, supported_versions and key_share.
@@ -160,9 +169,21 @@ export type TlsOptions = {
      */
     offerGroups?: number[] | undefined;
     /**
-     * cipher suites to offer, in preference order.
+     * cipher suites to offer, in preference order. Every suite must be
+     * one this package can perform; an offer it cannot honour is a dead connection the moment a
+     * server selects it, so an unknown suite is refused here rather than on the wire.
      */
     ciphers?: number[] | undefined;
+    /**
+     * pre-encoded ClientHello extensions, appended before
+     * ordering. `extensionOrder` can only arrange extensions that were BUILT — it filters to what
+     * exists and sorts that — so ordering alone cannot produce an extension this package does not
+     * generate. Chromium sends several that it does not: `signed_certificate_timestamp` (18),
+     * `compress_certificate` (27), `session_ticket` (35), `application_settings` (17613) and ECH
+     * (65037). Supplying them here is the only way to close that gap, and it is the caller's job to
+     * encode them correctly — this package does not parse what it did not build.
+     */
+    extraExtensions?: Uint8Array<ArrayBufferLike>[] | undefined;
     /**
      * signature_algorithms to offer, in preference order.
      */

@@ -290,15 +290,37 @@ test('TLS_CHACHA20_POLY1305_SHA256 is NOT offered when no implementation is inje
 });
 
 test('an explicit cipher list cannot smuggle ChaCha20 without an implementation', async () => {
-  // profiles.chrome sets tls.ciphers with 0x1303 in it; a caller could too. Capability gating
-  // overrides the list — 0x1303 is filtered from the actual offer unless an implementation is
-  // injected — so the suite is impossible to advertise dishonestly by hand-writing the list.
-  const { state } = await connectPair({
-    identity: testIdentity('rsa-pss'),
-    clientOptions: { ciphers: [0x1302, 0x1303, 0x1301] },
-  });
-  assert.ok(!state.clientHellos[0].cipherSuites.includes(0x1303));
-  assert.deepEqual(state.clientHellos[0].cipherSuites, [0x1302, 0x1301]);
+  // The suite must not reach the wire without an implementation behind it. That much was always
+  // true; what changed is HOW. It used to be filtered out silently, which meant a caller who wrote
+  // `[0x1302, 0x1303, 0x1301]` to match a browser got `[0x1302, 0x1301]` and was never told their
+  // fingerprint was not the one they asked for. For a package whose entire purpose is presenting a
+  // chosen identity, silently presenting a different one is the worst available outcome — and this
+  // package's own rules say it never silently downgrades.
+  //
+  // profiles.chrome is unaffected: it lists 0x1303 and declares `requires: ['cipher:chacha20']`, so
+  // applyProfile refuses it before connect is reached unless an implementation was injected.
+  await assert.rejects(
+    () => connectPair({
+      identity: testIdentity('rsa-pss'),
+      clientOptions: { ciphers: [0x1302, 0x1303, 0x1301] },
+    }),
+    (e) => e.code === 'CONFIG_INVALID' && /ChaCha20/.test(e.message),
+    'an unbacked ChaCha20 offer was accepted instead of refused',
+  );
+});
+
+test('an explicit cipher list cannot offer suites this package cannot perform', async () => {
+  // 0x002f is TLS_RSA_WITH_AES_128_CBC_SHA — a real suite, and one with no implementation here.
+  // Offering it put a number on the wire that a server could select, after which the AEAD layer
+  // had nothing to build: the failure landed mid-handshake rather than at configuration.
+  await assert.rejects(
+    () => connectPair({
+      identity: testIdentity('rsa-pss'),
+      clientOptions: { ciphers: [0x1301, 0x002f] },
+    }),
+    (e) => e.code === 'CONFIG_INVALID' && /0x002f/.test(e.message),
+    'a suite with no implementation was offered instead of refused',
+  );
 });
 
 test('an explicit groups list cannot smuggle X25519MLKEM768 without an implementation', async () => {

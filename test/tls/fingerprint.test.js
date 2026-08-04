@@ -17,7 +17,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClientHello, CURL_EXTENSION_ORDER } from '../../src/tls/handshake-messages.js';
+import { buildClientHello, CURL_EXTENSION_ORDER, SHUFFLE_EXTENSIONS } from '../../src/tls/handshake-messages.js';
 import { EXTENSION, TLS13, TLS12 } from '../../src/tls/constants.js';
 
 /** Extension types in the order they appear on the wire — which is what JA3/JA4 hash. */
@@ -262,4 +262,44 @@ test('the chrome profile omits Chromium\'s ML-DSA signature schemes, and that is
   assert.deepEqual(theirs.slice(0, 3), MLDSA, 'Chromium no longer leads with ML-DSA');
   assert.deepEqual(theirs.slice(3), ours, 'past ML-DSA the two lists must agree exactly');
   assert.ok(ours.every((s) => !MLDSA.includes(s)), 'we now offer a scheme we cannot verify');
+});
+
+// `extensionOrder` can only ARRANGE extensions, never add them: orderExtensions filters to the
+// parts that were built and sorts those. So an identity needing an extension this package does not
+// generate cannot be reached by ordering, and until 1.9.0 could not be reached at all —
+// `extraExtensions` existed on buildClientHello but nothing threaded it from the public config,
+// its one caller being the HelloRetryRequest cookie.
+test('extraExtensions puts an extension on the wire that the builder does not generate', () => {
+  // 18 = signed_certificate_timestamp, which Chromium sends and this package never builds.
+  const sct = Uint8Array.of(0x00, 0x12, 0x00, 0x00);
+  const types = extensionTypes(hello({ extraExtensions: [sct] }));
+  assert.ok(types.includes(18), 'the supplied extension did not reach the hello');
+});
+
+test('a supplied extension is ordered like any other, and never after pre_shared_key', () => {
+  const sct = Uint8Array.of(0x00, 0x12, 0x00, 0x00);
+  const types = extensionTypes(hello({
+    extraExtensions: [sct],
+    extensionOrder: [18, ...CURL_EXTENSION_ORDER],
+    psk: { identity: new Uint8Array(8), obfuscatedTicketAge: 0, binderLen: 32 },
+  }));
+  assert.equal(types[0], 18, 'the order did not place the supplied extension');
+  assert.equal(types.at(-1), EXTENSION.pre_shared_key, 'psk stopped being last');
+});
+
+// What the chrome profile still cannot present. Read off the committed Chromium capture rather
+// than a list someone typed, so it stays true as that capture is refreshed.
+test('the chrome profile is missing the extensions Chromium sends that this package never builds', async () => {
+  const { CHROME_CAPTURED_EXTENSION_SAMPLE } = await import('./_captured-hellos.js');
+  const isGrease = (v) => (v & 0x0f0f) === 0x0a0a && v >>> 8 === (v & 0xff);
+  const theirs = CHROME_CAPTURED_EXTENSION_SAMPLE.filter((t) => !isGrease(t));
+  const ours = new Set(extensionTypes(hello({ extensionOrder: SHUFFLE_EXTENSIONS })));
+  const missing = theirs.filter((t) => !ours.has(t)).sort((a, b) => a - b);
+  // 18 signed_certificate_timestamp, 27 compress_certificate, 35 session_ticket,
+  // 17613 application_settings, 65037 encrypted_client_hello.
+  assert.deepEqual(
+    missing,
+    [18, 27, 35, 17613, 65037],
+    'the gap between this package and a real Chromium hello changed; update the README with it',
+  );
 });

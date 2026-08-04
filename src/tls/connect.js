@@ -137,7 +137,16 @@ function expectServerHello(msg, offers12) {
  * @property {number[]} [groups] supported_groups, in preference order.
  * @property {number[]} [offerGroups] groups to send an actual key_share for. Default the first
  *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
- * @property {number[]} [ciphers] cipher suites to offer, in preference order.
+ * @property {number[]} [ciphers] cipher suites to offer, in preference order. Every suite must be
+ *   one this package can perform; an offer it cannot honour is a dead connection the moment a
+ *   server selects it, so an unknown suite is refused here rather than on the wire.
+ * @property {Uint8Array[]} [extraExtensions] pre-encoded ClientHello extensions, appended before
+ *   ordering. `extensionOrder` can only arrange extensions that were BUILT — it filters to what
+ *   exists and sorts that — so ordering alone cannot produce an extension this package does not
+ *   generate. Chromium sends several that it does not: `signed_certificate_timestamp` (18),
+ *   `compress_certificate` (27), `session_ticket` (35), `application_settings` (17613) and ECH
+ *   (65037). Supplying them here is the only way to close that gap, and it is the caller's job to
+ *   encode them correctly — this package does not parse what it did not build.
  * @property {number[]} [sigSchemes] signature_algorithms to offer, in preference order.
  * @property {boolean | number} [grease] send GREASE (RFC 8701) reserved values in the cipher list,
  *   the extension list (one at each end), supported_groups, supported_versions and key_share.
@@ -328,6 +337,38 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
   ];
   if (!chacha) ciphers = ciphers.filter((c) => c !== CIPHER.TLS_CHACHA20_POLY1305_SHA256);
 
+  // A caller-supplied list was previously taken verbatim. That let a hello offer suites this
+  // package cannot perform — the CBC and RSA-key-exchange suites, most obviously — and the failure
+  // did not surface at configuration time. It surfaced after the ClientHello was on the wire, when
+  // a server took the offer up and the AEAD layer had nothing to build: a dead connection rather
+  // than a rejected config.
+  //
+  // profiles.js already states the principle for the profile system: "a fingerprint field this
+  // package cannot perform is an offer a server may take and then find unhonoured, which fails the
+  // connection rather than merely looking wrong". It applies just as much to `tls.ciphers`, and
+  // now does. CIPHER_PARAMS is the set this package knows how to key and seal.
+  if (options.ciphers) {
+    const unperformable = ciphers.filter((c) => !CIPHER_PARAMS[c]);
+    if (unperformable.length) {
+      throw new TlsError(
+        codes.CONFIG_INVALID,
+        `tls.ciphers offers ${unperformable.map((c) => `0x${c.toString(16).padStart(4, '0')}`).join(', ')}, ` +
+          'which this package cannot perform. Offering a suite it cannot complete trades a ' +
+          'fingerprint match for a dead connection the moment a server selects one — see the ' +
+          'chrome profile, which drops the CBC and RSA-key-exchange suites for exactly this reason.',
+        { unperformable },
+      );
+    }
+    if (!chacha && options.ciphers.includes(CIPHER.TLS_CHACHA20_POLY1305_SHA256)) {
+      throw new TlsError(
+        codes.CONFIG_INVALID,
+        'tls.ciphers offers TLS_CHACHA20_POLY1305_SHA256 but no ChaCha20 implementation was ' +
+          'supplied. Pass one through `ciphers: { chacha20 }`, or drop the suite from the list — ' +
+          'silently removing it would change the fingerprint you asked for without saying so.',
+      );
+    }
+  }
+
   // --- resumption offer ----------------------------------------------------------------------
   // Everything about the offered PSK that later steps need is derived once, up front: the Early
   // Secret and binder key here (they depend only on the PSK), the binder itself per hello (it
@@ -372,6 +413,7 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
     groups,
     alpn,
     ciphers,
+    extraExtensions: options.extraExtensions ?? [],
     versions,
     extensionOrder: options.extensionOrder,
     sigSchemes: options.sigSchemes,
