@@ -902,3 +902,37 @@ test('handshakeTls13 without verifyPeer refuses to start: there is no unverified
     codes.CONFIG_INVALID, /verifyPeer/,
   );
 });
+
+test('allowUnperformableCiphers puts the real curl list on the wire, unperformable suites included', async () => {
+  // The point of the escape hatch. curl 8.21.0 offers thirty suites and this package performs seven
+  // of them; a hello restricted to the seven has a cipher list shorter than any real client's,
+  // which is what a JA3 hash reads. 0x002f and 0xc013 are CBC — offered here, never implemented.
+  const real = [0x1302, 0x1303, 0x1301, 0xc02c, 0xc030, 0xc02b, 0xc02f, 0xc013, 0x002f];
+  const { state } = await connectPair({
+    identity: testIdentity('rsa-pss'),
+    clientOptions: { ciphers: real, allowUnperformableCiphers: true, ciphersImpl: undefined },
+  });
+  const offered = state.clientHellos[0].cipherSuites;
+  assert.ok(offered.includes(0x002f), 'the unperformable suite was dropped despite the opt-in');
+  assert.ok(offered.includes(0xc013), 'the unperformable suite was dropped despite the opt-in');
+});
+
+test('a server that takes an unperformable offer fails with a message naming the choice', async () => {
+  // The risk the opt-in accepts. Driven through negotiateCipher directly rather than the mock
+  // server, which picks its own suite from the TLS 1.3 list and so cannot be made to take the CBC
+  // bait — testing the function that produces the error is both more precise and less contrived.
+  //
+  // What matters is that the failure does not read as a bug in this package. It is the documented
+  // consequence of a choice the caller made, and the message has to say so or the next person to
+  // hit it goes looking for a defect that is not there.
+  const { negotiateCipher } = await import('../../src/tls/handshake-messages.js');
+  const { TLS12 } = await import('../../src/tls/constants.js');
+  assert.throws(
+    () => negotiateCipher(
+      { cipherSuite: 0x002f },
+      { offeredCiphers: [0x1301, 0x002f], version: TLS12 },
+    ),
+    (e) => e.code === 'TLS_CIPHER_UNSUPPORTED' && /allowUnperformableCiphers/.test(e.message),
+    'the failure did not name the option that caused it',
+  );
+});

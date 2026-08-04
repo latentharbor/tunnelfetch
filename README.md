@@ -475,13 +475,33 @@ like any other and reproduced on a HelloRetryRequest retry, because a second hel
 extension set would be both malformed (RFC 8446 §4.1.2) and a signal in itself. Encoding them
 correctly is the caller's job; this package does not parse what it did not build.
 
-**Every offered cipher must be one this package can perform.** `tls.ciphers` used to be taken
-verbatim, so a list containing a CBC or RSA-key-exchange suite put a number on the wire that a
-server could select — after which the AEAD layer had nothing to build and the connection died
-mid-handshake. Such a list is now refused at configuration time. An explicit `TLS_CHACHA20_POLY1305_SHA256`
-without an injected implementation is refused too, rather than silently dropped: quietly presenting
-a different fingerprint from the one you asked for is the worst outcome available to a package like
-this one.
+**Every offered cipher must be one this package can perform — unless you say otherwise.**
+`tls.ciphers` used to be taken verbatim, so a list containing a CBC or RSA-key-exchange suite put a
+number on the wire that a server could select, after which the AEAD layer had nothing to build and
+the connection died mid-handshake. Such a list is refused at configuration time by default, and an
+explicit `TLS_CHACHA20_POLY1305_SHA256` with no injected implementation is refused rather than
+silently dropped — quietly presenting a different fingerprint from the one you asked for is the
+worst outcome available to a package like this one.
+
+But refusing outright is the wrong default to have no escape from, because **the restriction is
+itself a fingerprint**:
+
+| | suites offered | performable here |
+| --- | --- | --- |
+| curl 8.21.0 | 30 | 7 |
+| Chromium | 15 | 7 |
+
+A hello restricted to what can be honoured carries a cipher list less than half the length of any
+real client's, and list length and contents are exactly what a JA3 hash reads. `tls.allowUnperformableCiphers`
+offers the accurate list. The trade is narrow: the first unperformable suite sits at index 5 of
+curl's list and 7 of Chromium's, behind the TLS 1.3 suites, so a server with 1.3 available never
+reaches one. If a server does select one the handshake fails, and the error names the option rather
+than reading like a defect here.
+
+Most of the gap is not a missing feature. Sixteen of curl's twenty-three are CBC — MAC-then-encrypt,
+which cannot be implemented without a Lucky13 padding oracle in JavaScript — and two more are RSA key
+exchange with no forward secrecy. Both are refusals this package intends to keep. The three that
+*are* implementable are the TLS 1.2 ChaCha20-Poly1305 suites, and they are not implemented yet.
 
 Extension order matters because JA3 and JA4 hash the extension list **in wire order**, so it is most
 of what a fingerprinter reads. `pre_shared_key` is forced last whatever you ask for: RFC 8446
