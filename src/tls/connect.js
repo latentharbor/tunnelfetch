@@ -137,9 +137,17 @@ function expectServerHello(msg, offers12) {
  * @property {number[]} [groups] supported_groups, in preference order.
  * @property {number[]} [offerGroups] groups to send an actual key_share for. Default the first
  *   supported group; a HelloRetryRequest recovers any other choice at the cost of a round trip.
- * @property {number[]} [ciphers] cipher suites to offer, in preference order. Every suite must be
- *   one this package can perform; an offer it cannot honour is a dead connection the moment a
- *   server selects it, so an unknown suite is refused here rather than on the wire.
+ * @property {number[]} [ciphers] cipher suites to offer, in preference order. By default every
+ *   suite must be one this package can perform: an offer it cannot honour is a dead connection the
+ *   moment a server selects it, so an unknown suite is refused here rather than on the wire.
+ * @property {boolean} [allowUnperformableCiphers] offer suites this package cannot complete.
+ *   For fingerprint fidelity only. Real clients offer far more than this package implements — curl
+ *   8.21.0 offers thirty against seven performable here, Chromium fifteen against seven — so a
+ *   hello restricted to what it can honour carries a cipher list shorter than any real client's,
+ *   which is exactly what a JA3 hash reads. With this set, a server that selects an unperformable
+ *   suite fails the handshake; the first such suite sits behind the TLS 1.3 ones in both real
+ *   lists, so a 1.3-capable server does not reach it. Knowingly trading a rare failure for an
+ *   accurate fingerprint is a legitimate choice; making it silently is not.
  * @property {Uint8Array[]} [extraExtensions] pre-encoded ClientHello extensions, appended before
  *   ordering. `extensionOrder` can only arrange extensions that were BUILT — it filters to what
  *   exists and sorts that — so ordering alone cannot produce an extension this package does not
@@ -347,7 +355,16 @@ async function drive({ record, hostname, verifyPeer, options, deps, versions }) 
   // package cannot perform is an offer a server may take and then find unhonoured, which fails the
   // connection rather than merely looking wrong". It applies just as much to `tls.ciphers`, and
   // now does. CIPHER_PARAMS is the set this package knows how to key and seal.
-  if (options.ciphers) {
+  //
+  // `allowUnperformableCiphers` opts out, and it exists because refusing outright was the wrong
+  // default to have no escape from. Every real client offers far more suites than this package
+  // implements — curl 8.21.0 offers thirty and seven are performable here; Chromium offers fifteen
+  // and seven are — so a hello restricted to what can be honoured has a cipher list shorter than
+  // any real client's, and that is itself what a JA3 hash reads. A caller matching a fingerprint
+  // may rationally prefer the accurate list: the first unperformable suite sits at index 5 of
+  // curl's and 7 of Chromium's, behind the TLS 1.3 suites, so a server with 1.3 available never
+  // reaches it. The risk is real but narrow, and it is the caller's to take knowingly.
+  if (options.ciphers && !options.allowUnperformableCiphers) {
     const unperformable = ciphers.filter((c) => !CIPHER_PARAMS[c]);
     if (unperformable.length) {
       throw new TlsError(

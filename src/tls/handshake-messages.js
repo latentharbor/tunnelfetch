@@ -589,7 +589,10 @@ export function negotiateCipher(serverHello, { offeredCiphers, version }) {
   if (!params) {
     throw new TlsUnsupportedError(
       codes.TLS_CIPHER_UNSUPPORTED,
-      `cipher suite ${hex16(suite)} has no parameters; this is a bug in the offer list`,
+      `cipher suite ${hex16(suite)} was offered but this package cannot perform it, so the ` +
+        'handshake cannot continue. Either the offer list has a bug, or `allowUnperformableCiphers` ' +
+        'was set to match a real client\'s cipher list and a server has selected one of the suites ' +
+        'that choice knowingly put on the wire.',
       { cipherSuite: suite },
     );
   }
