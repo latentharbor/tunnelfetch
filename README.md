@@ -1143,36 +1143,61 @@ over `http` and `https`, `Range` requests fixing the wire volume exactly, and no
 rungs differ by exactly one layer each.
 
 Per megabyte of **wire** (not of decompressed body), differenced between a 1 MB and a 4 MB range on
-a **single request**, so no per-request work is inside the division. Two independent sweeps:
+a **single request**, so no per-request work is inside the division. Three independent sweeps, run
+hours apart:
 
 | rung | ms per wire MB | added by this layer |
 |---|---|---|
 | raw socket, BYOB reads, no TLS | 2.0 – 3.0 | — |
-| + the TLS record layer | 4.7 – 6.0 | **+2.7 – 3.0** |
+| + the TLS record layer | 4.7 – 6.7 | +2.7 – 4.3 |
 | + HTTP/2 | 9.3 – 12.0 | **+4.7 – 6.0** |
-| + the `Client`, decoding off | 13.3 – 14.3 | +2.3 – 4.0 |
+| + the `Client`, decoding off | 13.3 – 16.0 | +2.3 – 4.0 |
 
 The origin serves `.gz` files with no `Content-Encoding`, so nothing decodes on any rung and the
 decode stage is not in this table — price it separately from the section above. The top rung runs
 `maxBodyBytes: Infinity`, which also keeps the body cap out of the number.
 
-The ranges are two sweeps run hours apart; the ordering was identical in both and is what the table
-is for. **HTTP/2 demultiplexing costs more per wire megabyte than the socket and the whole TLS
-record layer put together.** Everything else in this document points the other way — "42 ms of a
-106 ms 4 MB request is socket reads and record decryption" is the figure the `pullBytes` sweep left
-behind, and it is what sent the last two rounds of optimisation at the record layer. That figure is
-not wrong for the path it was taken on; it just never separated the socket from the parsing, and the
-separation is where the answer was.
+The absolute values move about 30% between sweeps, which is the run-to-run variance this document
+warns about everywhere else; what does not move is the ordering. **HTTP/2 demultiplexing was the
+largest single layer in all three sweeps** — on its own it costs about as much per wire megabyte as
+the socket and the entire TLS record layer beneath it cost together. (An earlier draft of this
+paragraph said "more than", on two sweeps. The third one does not support that, and the claim it
+does support is strong enough.)
 
-The record layer's share is now small enough to break down: of the 2.7–3.0 ms/MB it adds, WebCrypto
-AES-256-GCM over 16 KiB records is **1.67 ms/MB**, so the JavaScript record parsing itself is about
-**1.0–1.3 ms/MB**. That number closes a direction rather than opening one — see below.
+Everything else in this document points the other way — "42 ms of a 106 ms 4 MB request is socket
+reads and record decryption" is the figure the `pullBytes` sweep left behind, and it is what sent
+the last two rounds of optimisation at the record layer. That figure is not wrong for the path it
+was taken on; it just never separated the socket from the parsing, and the separation is where the
+answer was.
+
+The record layer's share is now small enough to break down: of the 2.7–4.3 ms/MB it adds, WebCrypto
+AES-256-GCM over 16 KiB records is **1.67 ms/MB**, so the JavaScript record parsing itself is
+somewhere around **1–3 ms/MB**. That number closes a direction rather than opening one — see below.
 
 The origin here sends 8 KiB DATA frames, so HTTP/2's share works out to roughly 35 µs per frame,
 which is the same order as the ~25–30 µs per stream-boundary crossing measured elsewhere in this
 document. It is not concentrated in any one call: coalescing queued DATA payloads into one enqueue
-was implemented and measured, and it is not the answer. See "Two optimisations that measured as
+was implemented and measured, and it is not the answer. See "Three optimisations that measured as
 nothing", below.
+
+**And now the open question this ladder raises, stated rather than buried.** The whole stack here —
+socket, TLS, HTTP/2, `Client` — comes to 13–16 ms per wire megabyte. The proxied figure for the
+**record layer alone** is 38.5 ms for a 4 MB body, and that body is about 1.45 MB on the wire, so
+roughly 27 ms per wire megabyte for one rung. Two to five times the whole direct-socket stack, for
+a fraction of it.
+
+Something in the proxied path costs several times what the same code costs on a direct socket, and
+the candidates have not been separated: the proxy adds a second TCP hop whose delivery pattern this
+package does not control, and the Cloudflare origin used there sizes its TLS records dynamically and
+chunks a gzip it generates on the fly. Both would raise the per-record and per-crossing counts
+without any code being slower.
+
+**Every dollar figure in this document is derived from the proxied path**, so none of them are
+invalidated by the ladder — they measure what a real request costs, which is what a bill is made of.
+But they should not be read as measuring *this package's code*, and until the proxied path is
+decomposed the same way, "where the cost is" has an answer only for the direct one. Running the
+`wire` ladder against a proxy is the missing experiment; it needs credentials the rig takes as an
+`x-proxy` header and nothing else.
 
 ### Moving TLS into WebAssembly: measured, and closed
 
@@ -1180,14 +1205,15 @@ The idea was to put record framing and buffer management in Wasm and leave the A
 where `crypto.subtle` reaches AES-NI. The ladder above closes it, and not by finding Wasm slow —
 **by bounding the prize**.
 
-Everything a Wasm record layer could replace is the JavaScript record parsing, and that is
-**1.0–1.3 ms per wire megabyte** out of a 13–14 ms/MB receive path: under 10%, and the smallest of
-the four rungs. The socket underneath it is not something Wasm can make faster. The AEAD would have
-to cross back to `crypto.subtle` regardless, because a software AES inside Wasm has no AES-NI to
-reach — and at 1.67 ms/MB the AEAD alone already costs more than the parsing being replaced. HTTP/2
-and the `Client`, which together cost five to eight times as much, are untouched by any of it.
+Everything a Wasm record layer could replace is the JavaScript record parsing, and that is roughly
+**1–3 ms per wire megabyte** out of a 13–16 ms/MB receive path — at best a fifth of it, and the
+smallest of the four rungs. The socket underneath is not something Wasm can make faster. The AEAD
+would have to cross back to `crypto.subtle` regardless, because a software AES inside Wasm has no
+AES-NI to reach, and at 1.67 ms/MB the AEAD is a large share of the rung being attacked. HTTP/2 and
+the `Client`, which together cost two to three times as much as the whole TLS rung, are untouched
+by any of it.
 
-So the ceiling on the whole exercise is about one millisecond per megabyte, in exchange for
+So the ceiling on the whole exercise is one to three milliseconds per megabyte, in exchange for
 reimplementing TLS record framing in another language and re-deriving in Rust every byte of the
 ClientHello-ordering and cipher-offer work this package exists for. Measured cost of the boundary
 does not even enter into it.
@@ -1231,10 +1257,11 @@ libsodium rather than toolchain. But `-sSTANDALONE_WASM --no-entry` over code th
 emits what LLVM would emit anyway. The shipped ChaCha20 stays on wasi-sdk; there is nothing here
 worth a build dependency.
 
-### Two optimisations that measured as nothing
+### Three optimisations that measured as nothing
 
-Recorded because each looked obviously right, and because the thing that killed both was a counter
-disagreeing with a stopwatch.
+Recorded because each looked obviously right, and because what killed two of them was a counter
+disagreeing with a stopwatch. All three were implemented, measured on the edge, and reverted; none
+of them is in `src/`.
 
 **Recycling the BYOB pull buffer.** `ByteReader` allocates a fresh view for every pull, so the
 `pullBytes` U-curve's right arm is allocation, not boundary crossings. Reusing one store and copying
@@ -1242,6 +1269,14 @@ the fill out removes that arm completely — at `pullBytes: 1 MiB`, 89 ms → 20
 **a wash at the 64 KiB default** (21 against 23) and *worse* below it, because the copy-out stops
 paying for itself. Since large views were already measured as pointless, making them cheap buys
 nothing, and the change was dropped.
+
+**A native `pipeTo` for the decode stage's input.** The output side of `decompressionStage` already
+avoids JavaScript entirely on the uncapped path; the input side is still a JS loop reading the source
+and writing each chunk into the decompressor. Handing the source to `pipeTo` once the 2-byte deflate
+sniff is done removes that loop — and measured identically at 64 KiB and 16 KiB input chunks, ~10%
+better only at 4 KiB. Not worth the change: it moves the source's cancellation from a reader that
+can be cancelled directly to a pipe that can only be aborted through a signal, which is a real
+teardown-semantics change on the body path in exchange for nothing.
 
 **Coalescing HTTP/2 DATA payloads.** One body-stream `pull()` hands over one DATA frame, so a body
 crosses the ReadableStream boundary once per frame — 128 times per MB at this origin. Merging queued

@@ -1887,10 +1887,20 @@ export default {
       const each = Number(url.searchParams.get('each') ?? 1048576);
       const pull = Number(url.searchParams.get('pull') ?? 0);
       const drain = url.searchParams.get('drain') ?? 'default';
+      // Optional here, unlike everywhere else in this rig. The ladder's whole point is that it can
+      // run WITHOUT a proxy, which is what makes a per-layer answer possible — but the numbers this
+      // repository quotes in dollars all come from the proxied path, and those two differ by more
+      // than the layers do. Same ladder, same origin, `x-proxy` present or absent, is the one
+      // experiment that would say how much of the gap is the proxy.
+      const wireSpec = request.headers.get('x-proxy');
+      const wireProxy = wireSpec
+        ? (([h, pt, u, pw]) => ({ protocol: url.searchParams.get('socks') ? 'socks5' : 'http',
+            hostname: h, port: Number(pt), username: u, password: pw }))(wireSpec.split(':'))
+        : null;
       // Every knob here changes the answer, so every knob has to reach the tail event or two
       // variants land in one cpuTime bucket. That mistake has been made in this rig before.
       markPath('wire', { scheme, target, reps: String(reps), each: String(each),
-                         pull: String(pull), drain });
+                         pull: String(pull), drain, proxied: wireProxy ? '1' : '0' });
       let bytes = 0;
       let pulls = 0;
       let pulled = 0;
@@ -1900,6 +1910,7 @@ export default {
           // the wire volume identical to the rungs below it, so the differences are layers and
           // not payloads.
           const client = new Client({ connect, forceTunnel: true, decompress: false,
+            ...(wireProxy ? { proxy: wireProxy } : {}),
             maxBodyBytes: Infinity,
             timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 } });
           try {
@@ -1913,7 +1924,7 @@ export default {
         }
         const conn2 = await openConnection({
           url: `${scheme === 'h2' ? 'https' : scheme}://${target}${path}`,
-          connect, proxy: null, alpn: scheme === 'h2' ? ['h2'] : ['http/1.1'],
+          connect, proxy: wireProxy, alpn: scheme === 'h2' ? ['h2'] : ['http/1.1'],
           tls: pull > 0 ? { pullBytes: pull } : {},
         });
         if (scheme === 'h2') {
@@ -1974,7 +1985,8 @@ export default {
         return Response.json({ wire: scheme, error: String(e?.stack ?? e?.message ?? e).slice(0, 400) },
           { status: 500 });
       }
-      return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes,
+      return Response.json({ wire: scheme, target, reps, each, pull, drain,
+                             proxied: Boolean(wireProxy), bytes,
                              pulls, avgFill: pulls ? Math.round(pulled / pulls) : 0 });
     }
 
