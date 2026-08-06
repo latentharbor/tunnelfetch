@@ -16,6 +16,12 @@ import { decodeChunked } from '../../src/http1/chunked.js';
 import { ByteReader } from '../../src/util/bytes.js';
 import { parseCertificate } from '../../src/trust/x509.js';
 import { decodeBody } from '../../src/client/decode.js';
+// Bundled at build time, not compiled at runtime: workerd refuses WebAssembly.instantiate() on
+// bytes with "Wasm code generation disallowed by embedder". Any Wasm TLS would face the same
+// rule — it must ship inside the script, and therefore counts against the Worker's size limit.
+import WASMBYTES from './wasmbytes.wasm';
+import EMCCBYTES from './emccbytes.wasm';
+import CLANGBYTES from './clangbytes.wasm';
 import { Http2Connection } from '../../src/http2/connection.js';
 import { settingsFrame, headersFrame, dataFrame, windowUpdateFrame } from '../../src/http2/frames.js';
 import { encodeHeaderBlock } from '../../src/http2/hpack.js';
@@ -32,6 +38,7 @@ import { gunzipSync } from 'fflate';
 // now imports those: one less copy, and the rig measures the decoder that actually ships.
 import { zstd as zstdFree } from '../../src/profile/vendor/zstd-dec.js';
 import { chacha20poly1305 as chachaWasm } from '../../src/profile/vendor/chacha20poly1305.js';
+import { emccChacha } from './emcc-chacha.js';
 import { br as brotliFree } from '../../src/profile/vendor/brotli-dec.js';
 import brotliJs from 'brotli/decompress.js';
 import { ungzip as pakoUngzip } from 'pako';
@@ -331,6 +338,7 @@ const SIGKEYS = new Map();
  * and markPath records `fixed` so a contaminated first measurement is visible, not inferred.
  */
 const BODYFIX = new Map();
+let WASM_MOD = null;
 
 async function bodyFixture(mb, src = 'real') {
   const cacheKey = `${src}:${mb}`;
@@ -1039,6 +1047,94 @@ async function cryptoBench(op, n, params = null) {
     return { op, n, variant, sink };
   }
 
+
+  if (op === 'wasm-boundary') {
+    // What does a megabyte cost to cross into Wasm and be touched there, against the code in the
+    // record layer it would replace? Moving TLS into Wasm removes the JS record parsing but ADDS
+    // this boundary, and a native layer only wins when it REPLACES a JavaScript one. If the
+    // boundary alone costs more than what it would replace, the idea is dead before anything is
+    // compiled — which is where the `wire` ladder below left it: the TLS record layer adds
+    // 2.7-3.0 ms per wire MB over the raw socket, of which WebCrypto AES-GCM is 1.67, so the
+    // JavaScript record parsing is about 1.0-1.3 ms/MB and `frames` here costs more than that.
+    //
+    //   variant=fill    build the fixture and stop; every other variant contains this
+    //   variant=js      fill, then traverse in JavaScript
+    //   variant=copy    fill, then allocate in linear memory and copy the bytes in; no traversal
+    //   variant=wasm    fill, copy in, then traverse inside Wasm
+    //   variant=frames  fill, copy in, then walk TLS-record-shaped headers inside Wasm
+    //
+    // `tool` picks which toolchain compiled the module under test. Cloudflare's Kitesurf post
+    // argues against Emscripten — "its many layers of mocked dependencies, the compiled binary can
+    // get bulky and slow" — and that is a claim about a toolchain, cheap to check rather than
+    // repeat. All three modules implement byte-identical `alloc`/`sum`/`frame_walk`:
+    //
+    //   tool=rust    Rust, wasm32-unknown-unknown, no_std             632 bytes
+    //   tool=emcc    C, Emscripten -O3 -sSTANDALONE_WASM               460 bytes
+    //   tool=clang   C, clang --target=wasm32 -nostdlib + rust-lld     647 bytes
+    //
+    // Built by live/wasm/build.sh from live/wasm/bench.{c,rs}. All three fix a 16 MiB arena, so
+    // `mb` above 16 would run off the end of linear memory in every one of them.
+    const tool = params?.get?.('tool') ?? 'rust';
+    const mod = tool === 'emcc' ? EMCCBYTES : tool === 'clang' ? CLANGBYTES : WASMBYTES;
+    WASM_MOD ??= {};
+    WASM_MOD[tool] ??= new WebAssembly.Instance(mod, {});
+    const ex = WASM_MOD[tool].exports;
+    const bytes = Math.round(mb * 1048576);
+    if (bytes > (16 << 20)) throw new Error(`wasm-boundary mb=${mb} exceeds the 16 MiB arena`);
+    const variant = params?.get?.('variant') ?? 'wasm';
+    const src2 = new Uint8Array(bytes);
+    // Every byte, and pseudo-random: a buffer of zeroes makes the traversal's arithmetic collapse
+    // (acc*31+0 stays 0 forever) and lets a compiler on either side skip work a real record layer
+    // cannot skip. The first attempt wrote `i & 0xff` every 4096 bytes, which is zero at every
+    // multiple of 4096 — the buffer stayed entirely zero and the sum came back 0.
+    for (let i = 0; i < bytes; i++) src2[i] = (i * 2654435761) >>> 24;
+
+    // Building the fixture is a per-byte JS loop and it is inside EVERY variant, including this
+    // one. Quoting `js` or `frames` without subtracting it prices the fixture as if it were the
+    // thing under test — so `variant=fill` returns having done nothing else, and every other
+    // reading is only meaningful net of it.
+    if (variant === 'fill') return { op, mb, variant, tool: 'none', first: src2[0] };
+
+    if (variant === 'js') {
+      let acc = 0;
+      for (let i = 0; i < bytes; i++) acc = (Math.imul(acc, 31) + src2[i]) >>> 0;
+      return { op, mb, variant, tool: 'js', acc };
+    }
+    // `n` splits the transfer into that many crossings. One big copy is not the shape a TLS record
+    // layer has: a 1.45 MB body is ~93 records of 16 KiB, and the AEAD almost certainly has to stay
+    // in JavaScript because crypto.subtle reaches AES-NI and a software AES inside Wasm does not.
+    // So the real question is not what one crossing costs, it is what NINETY-THREE cost.
+    const n = Math.max(1, Number(params?.get?.('n') ?? 1));
+    if (n > 1) {
+      // One allocation for the whole transfer, then a view per crossing. Calling alloc() inside the
+      // loop was the earlier shape and it is not comparable across toolchains: the Rust module's
+      // alloc replaces a Vec (a real allocation every crossing) while the C modules hand back a
+      // fixed arena, so the loop would have been timing allocator policy, not the boundary.
+      const base = ex.alloc(bytes);
+      const per = Math.ceil(bytes / n);
+      let acc = 0;
+      for (let i = 0; i < n; i++) {
+        const len = Math.min(per, bytes - i * per);
+        if (len <= 0) break;
+        const p2 = base + i * per;
+        new Uint8Array(ex.memory.buffer, p2, len).set(src2.subarray(i * per, i * per + len));
+        if (variant !== 'copy') acc = (acc + ex.frame_walk(p2, len)) >>> 0;
+        // Read the result back out, as a record layer must to hand plaintext onward.
+        if (variant === 'roundtrip') {
+          const out = new Uint8Array(len);
+          out.set(new Uint8Array(ex.memory.buffer, p2, len));
+          acc = (acc + out[0]) >>> 0;
+        }
+      }
+      return { op, mb, variant, tool, n, acc };
+    }
+    const ptr = ex.alloc(bytes);
+    new Uint8Array(ex.memory.buffer, ptr, bytes).set(src2);
+    if (variant === 'copy') return { op, mb, variant, tool, ptr };
+    if (variant === 'frames') return { op, mb, variant, tool, records: ex.frame_walk(ptr, bytes) };
+    return { op, mb, variant, tool, acc: ex.sum(ptr, bytes) >>> 0 };
+  }
+
   if (op === 'gz-fixture') {
     // Build (or confirm) the fixture so its cost never lands inside a measured op.
     const fix = await bodyFixture(mb, src);
@@ -1375,6 +1471,9 @@ async function cryptoBench(op, n, params = null) {
     const ick = Number(params?.get?.('ick') ?? 65536);
     const capRaw = Number(params?.get?.('cap') ?? 0);
     const maxBytes = capRaw > 0 ? capRaw : Infinity;
+    // `cap` is the whole point of this op now: a finite cap is what the shipped default sets, and a
+    // finite cap is what disqualifies the native IdentityTransformStream relay in decode.js. The
+    // two readings differ by more than anything else measured in the body path.
     const out = decodeBody(fixedSource(fix.gz, ick), 'gzip', null, maxBytes);
     if (op === 'gz-stage-js-text') {
       const s = await new Response(out).text();
@@ -1547,7 +1646,12 @@ async function cryptoBench(op, n, params = null) {
     const iv = new Uint8Array(12);
     if (op === 'aead-wasm-chacha') {
       const aad = new Uint8Array(5);
-      for (let i = 0; i < records; i++) { iv[11] = i & 0xff; sink += chachaWasm.seal(key, iv, plain, aad).length; }
+      // `tool=emcc` runs the SAME C, compiled by Emscripten instead of wasi-sdk clang. The two
+      // modules are byte-identical in behaviour and neither imports anything, so this is a
+      // toolchain comparison on a real crypto primitive rather than on a toy loop — the shape
+      // where Emscripten's "layers of mocked dependencies" would show if they were there.
+      const impl = params?.get?.('tool') === 'emcc' ? emccChacha : chachaWasm;
+      for (let i = 0; i < records; i++) { iv[11] = i & 0xff; sink += impl.seal(key, iv, plain, aad).length; }
     } else {
       const k = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
       for (let i = 0; i < records; i++) {
@@ -1697,6 +1801,10 @@ export default {
         alg: url.searchParams.get('alg') ?? null,
         ick: url.searchParams.get('ick') ?? null,
         cap: url.searchParams.get('cap') ?? null,
+        // Which toolchain compiled the module under test. Without this, a Rust reading and an
+        // Emscripten reading of the same variant land in one cpuTime bucket and the comparison
+        // silently measures their average.
+        tool: url.searchParams.get('tool') ?? null,
       });
       return Response.json(await cryptoBench(op, n, url.searchParams));
     }
@@ -1738,6 +1846,136 @@ export default {
         }
       } finally { await client.close(); }
       return Response.json({ win, target, reps, status, proto, bytes, wallMs: Date.now() - t0 });
+    }
+
+    if (url.searchParams.get('wire')) {
+      // What does a megabyte off a real socket cost, and how much of that is the record layer?
+      //
+      // Every reading in this repository so far has priced the record layer as one number — 42 ms
+      // per 4 MB body, "of which the AEAD is under 2 ms" — without ever separating the socket from
+      // the parsing on top of it. Those are different bills with different fixes, and the whole
+      // Wasm question turns on which one is bigger: Wasm can replace the parsing, and cannot make
+      // the runtime hand bytes over any faster.
+      //
+      //   wire=http    same origin, no TLS. The socket and nothing else: the floor.
+      //   wire=https   the same bytes through the TLS record layer.
+      //   wire=h2      the same bytes through Http2Connection on top of that record layer.
+      //   wire=client  the same bytes through the real Client (decompress off).
+      //
+      // Four rungs on one origin with no proxy in the way. The existing `depth` ladder measures
+      // the same four, but only through a proxy and against a Cloudflare origin, so it has never
+      // been able to say which of those two the cost belongs to.
+      //
+      // Same host, same file, same byte count, chosen because it serves both schemes off one
+      // nginx. Range requests fix the wire volume exactly, so ms/MB needs no estimate of what the
+      // origin decided to send. No proxy: a proxy adds a second socket and answers no question
+      // being asked here.
+      //
+      //   pull=        the record layer's BYOB view size (tls.pullBytes), swept here rather than
+      //                against a proxy so the U-curve can be attributed
+      //   drain=byob   read the raw socket with BYOB views instead of a default reader, which is
+      //                what the http rung needs to be a like-for-like floor for the TLS rung
+      //
+      // Difference two BYTE COUNTS at ONE request (each=1M against each=4M, reps=1), never two
+      // request counts: a second request carries a second lot of per-request work — H2 stream
+      // setup, HPACK, a HEADERS round trip — and differencing reps folds all of that into what
+      // then gets divided by megabytes and called a per-byte cost.
+      const scheme = url.searchParams.get('wire');
+      const target = url.searchParams.get('target') ?? 'mirror.leaseweb.com';
+      const path = url.searchParams.get('path') ?? '/debian/ls-lR.gz';
+      const reps = Number(url.searchParams.get('reps') ?? 1);
+      const each = Number(url.searchParams.get('each') ?? 1048576);
+      const pull = Number(url.searchParams.get('pull') ?? 0);
+      const drain = url.searchParams.get('drain') ?? 'default';
+      // Every knob here changes the answer, so every knob has to reach the tail event or two
+      // variants land in one cpuTime bucket. That mistake has been made in this rig before.
+      markPath('wire', { scheme, target, reps: String(reps), each: String(each),
+                         pull: String(pull), drain });
+      let bytes = 0;
+      let pulls = 0;
+      let pulled = 0;
+      try {
+        if (scheme === 'client') {
+          // The whole shipped stack, same origin, same byte count, no proxy. Ranged requests keep
+          // the wire volume identical to the rungs below it, so the differences are layers and
+          // not payloads.
+          const client = new Client({ connect, forceTunnel: true, decompress: false,
+            maxBodyBytes: Infinity,
+            timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 } });
+          try {
+            for (let i = 0; i < reps; i++) {
+              const r = await client.fetch(`https://${target}${path}`,
+                { headers: { range: `bytes=${i * each}-${(i + 1) * each - 1}` } });
+              bytes += (await r.arrayBuffer()).byteLength;
+            }
+          } finally { await client.close(); }
+          return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes });
+        }
+        const conn2 = await openConnection({
+          url: `${scheme === 'h2' ? 'https' : scheme}://${target}${path}`,
+          connect, proxy: null, alpn: scheme === 'h2' ? ['h2'] : ['http/1.1'],
+          tls: pull > 0 ? { pullBytes: pull } : {},
+        });
+        if (scheme === 'h2') {
+          try {
+            const h2 = new Http2Connection(conn2, {});
+            for (let i = 0; i < reps; i++) {
+              const r = await h2.request({ method: 'GET', scheme: 'https', authority: target,
+                path, headers: [['range', `bytes=${i * each}-${(i + 1) * each - 1}`]] });
+              const rd = r.body.getReader();
+              for (;;) {
+                const { done, value } = await rd.read();
+                if (done) break;
+                bytes += value.byteLength;
+                pulls++;
+                pulled += value.byteLength;
+              }
+            }
+            await h2.close().catch(() => {});
+          } finally { await conn2.close?.(); }
+          return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes,
+                                 pulls, avgFill: pulls ? Math.round(pulled / pulls) : 0 });
+        }
+        try {
+          let req = '';
+          for (let i = 0; i < reps; i++) {
+            req += `GET ${path} HTTP/1.1\r\nHost: ${target}\r\n` +
+              `Range: bytes=${i * each}-${(i + 1) * each - 1}\r\n` +
+              `Connection: ${i === reps - 1 ? 'close' : 'keep-alive'}\r\n\r\n`;
+          }
+          const w = conn2.writable.getWriter();
+          await w.write(enc.encode(req));
+          w.releaseLock();
+          if (drain === 'byob') {
+            // BYOB straight off the socket, so `avgFill` reports how much the runtime actually
+            // hands over per crossing — the number the record layer's view-size sweep turns on.
+            const rd = conn2.readable.getReader({ mode: 'byob' });
+            const size = pull > 0 ? pull : 65536;
+            for (;;) {
+              const { done, value } = await rd.read(new Uint8Array(size));
+              if (done) break;
+              if (!value.byteLength) continue;
+              bytes += value.byteLength;
+              pulls++;
+              pulled += value.byteLength;
+            }
+          } else {
+            const rd = conn2.readable.getReader();
+            for (;;) {
+              const { done, value } = await rd.read();
+              if (done) break;
+              bytes += value.byteLength;
+              pulls++;
+              pulled += value.byteLength;
+            }
+          }
+        } finally { await conn2.close?.(); }
+      } catch (e) {
+        return Response.json({ wire: scheme, error: String(e?.stack ?? e?.message ?? e).slice(0, 400) },
+          { status: 500 });
+      }
+      return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes,
+                             pulls, avgFill: pulls ? Math.round(pulled / pulls) : 0 });
     }
 
     const spec = request.headers.get('x-proxy');

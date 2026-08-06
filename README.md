@@ -1075,7 +1075,8 @@ billed native floor.
 The remaining ~30× is the JS-orchestrated record layer, HTTP/2 demultiplexing and stream pipeline —
 roughly **80% of the per-request cost at 4 MB, against 20% for decode**. An earlier version of this
 section put the emphasis on decoding; that was wrong, and it sent optimisation effort at the smaller
-of the two.
+of the two. For which of those three layers the 80% belongs to, see "Which layer the receive path
+actually spends its megabyte on" below — the answer is not the record layer.
 
 What would close it is a primitive that does not exist: a `startTls` that verifies the **origin**
 hostname rather than the `connect()` peer, which would let the platform's own `fetch` run inside the
@@ -1110,13 +1111,146 @@ believed. Correcting it cut the stage **31%**, 18.0 → 12.3 ms/MB, A/B-ed in on
 
 What remains is **not** close to floor, and an earlier version of this section wrongly said it was.
 Native inflate of the same content costs 4.3 ms/MB against the stage's 12.3, so roughly **8 ms/MB
-is this package's own plumbing** — the JS input pump and the output wrapper. Closing that needs a
-redesign rather than a constant, and it is the largest single item left in the body path.
+is this package's own plumbing** — the JS input pump and the output wrapper.
+
+Most of that has since been closed by the native `IdentityTransformStream` relay, **but only for
+`maxBodyBytes: Infinity`**, and the default is 32 MiB. Re-measured on the edge, same op, same
+fixture, same isolate, differenced between a 1 MB and a 4 MB body:
+
+| `maxBodyBytes` | decode stage, ms per decoded MB |
+|---|---|
+| `Infinity` — native relay, no JS in the byte path | **4.3** |
+| 32 MiB (the default) — pull-driven JS wrapper | **7.7** |
+
+So the bomb guard costs **3.3 ms per decoded megabyte**, about 13 ms on a 4 MB body, and it is the
+largest remaining item in the body path. That is not a bug — the cap is enforced by counting bytes
+and counting requires seeing them in JS — but the size of it was not known before and it is worth
+saying out loud rather than leaving inside a comment. The counting itself is free (7.00 with it,
+7.33 without); it is the wrapper the counting forces that costs. If you are relaying bodies you
+already bound some other way, `maxBodyBytes: Infinity` is worth 43% of this stage.
 
 Importing the package is free. The 121 bundled anchors are base64 strings indexed by a hash of the
 subject DN, and only the one anchor a chain lands on is ever decoded, so startup stays at ~2 ms for
 the 380 KB bundle (133 KB gzipped) and a request that imports but does not use the package costs
 0 ms.
+
+### Which layer the receive path actually spends its megabyte on
+
+Every figure above is measured **through a proxy, against a Cloudflare origin**, which is the shape
+this package exists for and also the shape that makes a per-layer answer impossible: two variables
+move at once. The `wire` ladder in `live/` removes both — one nginx origin that serves the same file
+over `http` and `https`, `Range` requests fixing the wire volume exactly, and no proxy — so the
+rungs differ by exactly one layer each.
+
+Per megabyte of **wire** (not of decompressed body), differenced between a 1 MB and a 4 MB range on
+a **single request**, so no per-request work is inside the division. Two independent sweeps:
+
+| rung | ms per wire MB | added by this layer |
+|---|---|---|
+| raw socket, BYOB reads, no TLS | 2.0 – 3.0 | — |
+| + the TLS record layer | 4.7 – 6.0 | **+2.7 – 3.0** |
+| + HTTP/2 | 9.3 – 12.0 | **+4.7 – 6.0** |
+| + the `Client`, decoding off | 13.3 – 14.3 | +2.3 – 4.0 |
+
+The origin serves `.gz` files with no `Content-Encoding`, so nothing decodes on any rung and the
+decode stage is not in this table — price it separately from the section above. The top rung runs
+`maxBodyBytes: Infinity`, which also keeps the body cap out of the number.
+
+The ranges are two sweeps run hours apart; the ordering was identical in both and is what the table
+is for. **HTTP/2 demultiplexing costs more per wire megabyte than the socket and the whole TLS
+record layer put together.** Everything else in this document points the other way — "42 ms of a
+106 ms 4 MB request is socket reads and record decryption" is the figure the `pullBytes` sweep left
+behind, and it is what sent the last two rounds of optimisation at the record layer. That figure is
+not wrong for the path it was taken on; it just never separated the socket from the parsing, and the
+separation is where the answer was.
+
+The record layer's share is now small enough to break down: of the 2.7–3.0 ms/MB it adds, WebCrypto
+AES-256-GCM over 16 KiB records is **1.67 ms/MB**, so the JavaScript record parsing itself is about
+**1.0–1.3 ms/MB**. That number closes a direction rather than opening one — see below.
+
+The origin here sends 8 KiB DATA frames, so HTTP/2's share works out to roughly 35 µs per frame,
+which is the same order as the ~25–30 µs per stream-boundary crossing measured elsewhere in this
+document. It is not concentrated in any one call: coalescing queued DATA payloads into one enqueue
+was implemented and measured, and it is not the answer. See "Two optimisations that measured as
+nothing", below.
+
+### Moving TLS into WebAssembly: measured, and closed
+
+The idea was to put record framing and buffer management in Wasm and leave the AEAD in JavaScript,
+where `crypto.subtle` reaches AES-NI. The ladder above closes it, and not by finding Wasm slow —
+**by bounding the prize**.
+
+Everything a Wasm record layer could replace is the JavaScript record parsing, and that is
+**1.0–1.3 ms per wire megabyte** out of a 13–14 ms/MB receive path: under 10%, and the smallest of
+the four rungs. The socket underneath it is not something Wasm can make faster. The AEAD would have
+to cross back to `crypto.subtle` regardless, because a software AES inside Wasm has no AES-NI to
+reach — and at 1.67 ms/MB the AEAD alone already costs more than the parsing being replaced. HTTP/2
+and the `Client`, which together cost five to eight times as much, are untouched by any of it.
+
+So the ceiling on the whole exercise is about one millisecond per megabyte, in exchange for
+reimplementing TLS record framing in another language and re-deriving in Rust every byte of the
+ClientHello-ordering and cipher-offer work this package exists for. Measured cost of the boundary
+does not even enter into it.
+
+Two things the measurements *do* settle, neither of which changes that:
+
+- The per-crossing cost does not scale with crossings at TLS granularity: splitting the same
+  transfer into 256 crossings of 16 KiB measured identically to one crossing of 4 MB. Whatever a
+  Wasm design cost, it would not be the number of times it crossed.
+- Getting a megabyte into linear memory and walking record-shaped headers over it is **cheap** — so
+  cheap that the loop building the test fixture dominates the same measurement, which is why no
+  single number for it is quoted here. Wasm is not the problem. There is just nothing on this path
+  for it to win.
+
+### Emscripten is not the problem people say it is
+
+Cloudflare's Kitesurf post warns that with "Emscripten (for example) and its many layers of mocked
+dependencies, the compiled binary can get bulky and slow", which is a claim about a toolchain and
+cheap to check. `live/wasm/build.sh` builds the same three functions three ways — all `no_std` /
+freestanding, all importing nothing, all producing bit-identical output on the same input — and then
+runs the same comparison on a **real** primitive: the exact C this package already ships as its
+ChaCha20-Poly1305, recompiled by Emscripten.
+
+| | module | record walk, 4 MB | ChaCha20-Poly1305 seal |
+|---|---|---|---|
+| C, `emcc -O3 -sSTANDALONE_WASM` | **460 B** | 8 ms | **5.00 ms/MB** |
+| Rust, `wasm32-unknown-unknown`, `no_std` | 632 B | 8 ms | — |
+| C, `clang --target=wasm32 -nostdlib` + `rust-lld` | 647 B | 8 ms | — |
+| C, wasi-sdk 25 `-nostdlib` — what ships | 8839 B | — | 5.67 ms/MB |
+| WebCrypto AES-256-GCM, for scale | — | — | 1.67 ms/MB |
+
+Emscripten produced the **smallest** module of the three, and the record walk came back at the same
+millisecond for all three — that column is not a tie broken by rounding, it is three readings that
+never separated across eight interleaved rounds. On the cipher Emscripten came out slightly ahead of
+the wasi-sdk build this package ships, which is inside the noise and not a reason to add a second
+toolchain to the build.
+
+The warning is about what you compile, not what compiles it: drag in a libc, a filesystem shim or a
+`main()` and Emscripten will emulate all of it, and the 8839-byte wasi-sdk row above is itself mostly
+libsodium rather than toolchain. But `-sSTANDALONE_WASM --no-entry` over code that calls nothing
+emits what LLVM would emit anyway. The shipped ChaCha20 stays on wasi-sdk; there is nothing here
+worth a build dependency.
+
+### Two optimisations that measured as nothing
+
+Recorded because each looked obviously right, and because the thing that killed both was a counter
+disagreeing with a stopwatch.
+
+**Recycling the BYOB pull buffer.** `ByteReader` allocates a fresh view for every pull, so the
+`pullBytes` U-curve's right arm is allocation, not boundary crossings. Reusing one store and copying
+the fill out removes that arm completely — at `pullBytes: 1 MiB`, 89 ms → 20 ms for 4 MB. It is also
+**a wash at the 64 KiB default** (21 against 23) and *worse* below it, because the copy-out stops
+paying for itself. Since large views were already measured as pointless, making them cheap buys
+nothing, and the change was dropped.
+
+**Coalescing HTTP/2 DATA payloads.** One body-stream `pull()` hands over one DATA frame, so a body
+crosses the ReadableStream boundary once per frame — 128 times per MB at this origin. Merging queued
+payloads up to 64 KiB looked like a 40% cut to the HTTP/2 rung across one sweep. It is not: the chunk
+counters came back **identical** with and without it — 512 chunks of 8192 either way — because a
+consumer that keeps up finds exactly one payload queued at every pull, so the merge never runs. Held
+open with an artificial delay so the queue could build, 8x fewer enqueues bought 0.3–1.0 ms/MB of the
+4.7–6.0 that HTTP/2 costs. The apparent win was the minimum of nine integer-millisecond samples
+moving while the median did not.
 
 ### Streaming APIs, and what they cost
 
