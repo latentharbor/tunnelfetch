@@ -921,7 +921,7 @@ does not fall out of that table is a bug in this README.
 
 **The `max(0, ...)` is new.** The previous version of this table billed every request and every
 CPU millisecond, ignoring the allowance the sentence above it describes — so it overstated the
-10M/mo column by up to 70% ($8.70 where the bill is $5.00) while being within 0.2% at 1B, where
+10M/mo column by up to 74% ($8.70 where the bill is $5.00) while being within 0.2% at 1B, where
 the allowance is a rounding error. The overstatement was against this package, not for it, which
 is presumably why it survived several readings.
 
