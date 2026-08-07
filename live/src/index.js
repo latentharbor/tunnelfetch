@@ -1904,12 +1904,17 @@ export default {
       let bytes = 0;
       let pulls = 0;
       let pulled = 0;
+      let byobAvailable = true;
       try {
         if (scheme === 'client') {
           // The whole shipped stack, same origin, same byte count. Ranged requests keep the wire
           // volume identical to the rungs below it, so the differences are layers and not payloads.
           const client = new Client({ connect, forceTunnel: true, decompress: false,
             ...(wireProxy ? { proxy: wireProxy } : {}),
+            // Without this the `pull` knob silently did not reach this rung, and an A/B of two
+            // view sizes compared the default against itself — which showed up as two columns
+            // agreeing to the millisecond, the one shape that is never a real result.
+            ...(pull > 0 ? { tls: { pullBytes: pull } } : {}),
             maxBodyBytes: Infinity,
             timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 25000, idleMs: 25000 } });
           try {
@@ -1961,10 +1966,24 @@ export default {
           if (drain === 'byob') {
             // BYOB straight off the socket, so `avgFill` reports how much the runtime actually
             // hands over per crossing — the number the record layer's view-size sweep turns on.
-            const rd = conn2.readable.getReader({ mode: 'byob' });
+            //
+            // Through a proxy there is no BYOB to be had: openTunnel wraps the socket in a plain
+            // ReadableStream so the bytes that arrived alongside the CONNECT reply are delivered
+            // first, and a plain ReadableStream is not a byte stream. Falling back rather than
+            // failing, and SAYING which one ran, is the point — that difference is a finding, not
+            // an inconvenience.
+            let rd;
+            try {
+              rd = conn2.readable.getReader({ mode: 'byob' });
+            } catch {
+              rd = conn2.readable.getReader();
+              byobAvailable = false;
+            }
             const size = pull > 0 ? pull : 65536;
             for (;;) {
-              const { done, value } = await rd.read(new Uint8Array(size));
+              const { done, value } = byobAvailable
+                ? await rd.read(new Uint8Array(size))
+                : await rd.read();
               if (done) break;
               if (!value.byteLength) continue;
               bytes += value.byteLength;
@@ -1987,7 +2006,7 @@ export default {
           { status: 500 });
       }
       return Response.json({ wire: scheme, target, reps, each, pull, drain,
-                             proxied: Boolean(wireProxy), bytes,
+                             proxied: Boolean(wireProxy), byobAvailable, bytes,
                              pulls, avgFill: pulls ? Math.round(pulled / pulls) : 0 });
     }
 

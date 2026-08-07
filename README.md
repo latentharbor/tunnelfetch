@@ -1088,9 +1088,12 @@ The runtime's `DecompressionStream` emits 4096-byte chunks and its sockets deliv
 most 4096 bytes, and every chunk that crosses between the runtime and JS costs tens of
 microseconds regardless of size — measured here at about **17 µs per crossing**, from a ladder
 that collects the same 1 MB in 4 KiB chunks (6.0 ms/MB) through 256 KiB chunks (1.67 ms/MB).
-Both hot paths therefore drain their sources with BYOB reads, which hand over everything already
-buffered in one crossing and resolve partially filled the moment any byte exists, so streaming
-latency is unchanged.
+Both hot paths therefore drain their sources with BYOB reads, which collect several of those
+chunks into one crossing and resolve partially filled the moment any byte exists, so streaming
+latency is unchanged. How many they collect is the transport's decision and not the view's — a
+BYOB read never waits to fill — so a view sized far above what the transport actually hands over
+buys nothing and costs the allocation. Measured over a 4 MB body: **37 KB average fill on a direct
+socket, 8 KB through a proxy**.
 
 The view they read into is **16 KiB, and the size was swept rather than assumed**. It matters more
 than it looks. The input is pumped by a JS task on the same event loop as the puller, so the
@@ -1169,6 +1172,55 @@ reads and record decryption" is the figure the `pullBytes` sweep left behind, an
 the last two rounds of optimisation at the record layer. That figure is not wrong for the path it
 was taken on; it just never separated the socket from the parsing, and the separation is where the
 answer was.
+
+### A knob that was never connected on the path this package exists for
+
+Running the same ladder **with** a proxy turned up the reason those earlier figures were so much
+larger, and it was not the network.
+
+`openTunnel` finishes a CONNECT (or SOCKS5) handshake holding a buffered reader, because the peer
+may have sent tunnel payload in the same chunk as the reply, and it handed that onward wrapped in
+`new ReadableStream({ pull })`. Correct, and a **plain** stream rather than a byte stream. The TLS
+record layer asks for a BYOB reader and quietly falls back to a default one when it cannot have it,
+so *every proxied connection* lost BYOB reads — and with them `tls.pullBytes`, whose only job is to
+size them.
+
+Same origin, 1 MB through the record layer, n=15 in one isolate, before the fix:
+
+| | `pullBytes: 16 KiB` | `pullBytes: 1 MiB` |
+|---|---|---|
+| direct | min 25, p50 31 | min 73, p50 90 |
+| **proxied** | min 95, p50 111 | min 101, p50 121 |
+
+**2.9× on a direct socket and 6% through a proxy** — the knob was not being read. Which also means
+the sweep that chose the old 64 KiB default, captioned "against a real proxied socket", was four
+samples of one configuration; the clean U it reported was run-to-run noise.
+
+`src/proxy/tunnel.js` makes the tunnel a byte stream and, once the handshake's leftovers are
+drained, hands the caller's own view straight to the socket — so a read through a tunnel costs what
+a read without one costs. With the knob reaching the code, the sweep is worth having:
+
+| ms, 1 MB at the record layer, p50 | 8 KiB | **16 KiB** | 32 KiB | 64 KiB | 256 KiB |
+|---|---|---|---|---|---|
+| direct | 21 | 20 | 18 | 22 | 40 |
+| proxy A | 51 | 61 | 61 | 89 | 152 |
+| proxy B | 68 | 74 | — | 102 | — |
+
+Monotonic on both proxies, shallow on the direct path, and the mechanism is the average-fill figure
+above: too *large* is what costs, because the view is a ceiling that a BYOB read never waits to
+reach. The default is now **16 KiB**, which is within ~20% of the best column on all three paths
+where 64 KiB was up to 45% off, and allocates a quarter as much.
+
+End to end through the real `Client` and a proxy, n=13, 16 KiB against the old 64 KiB: **63 against
+78 ms** for 1 MB and **145 against 164 ms** for 4 MB on the median, and within noise on the minimum
+at 4 MB. Smaller than the record-layer sweep alone suggests, because HTTP/2 and the client plumbing
+above it do not scale with the view — but nothing measured anywhere favours the old value.
+
+This is also a caution about the instrument rather than only about the code. The first attempt at
+the end-to-end A/B reported the two view sizes agreeing to the millisecond, which read as "the
+change does nothing"; the rig was not threading `pullBytes` into the `Client` rung at all, so both
+columns were the same configuration. Two columns agreeing *exactly* is not a null result, it is a
+wiring bug.
 
 The record layer's share is now small enough to break down: of the 2.7–4.3 ms/MB it adds, WebCrypto
 AES-256-GCM over 16 KiB records is **1.67 ms/MB**, so the JavaScript record parsing itself is
@@ -1266,9 +1318,9 @@ of them is in `src/`.
 **Recycling the BYOB pull buffer.** `ByteReader` allocates a fresh view for every pull, so the
 `pullBytes` U-curve's right arm is allocation, not boundary crossings. Reusing one store and copying
 the fill out removes that arm completely — at `pullBytes: 1 MiB`, 89 ms → 20 ms for 4 MB. It is also
-**a wash at the 64 KiB default** (21 against 23) and *worse* below it, because the copy-out stops
-paying for itself. Since large views were already measured as pointless, making them cheap buys
-nothing, and the change was dropped.
+**a wash at the then-default 64 KiB** (21 against 23) and *worse* below it, because the copy-out
+stops paying for itself. Since the right answer turned out to be a *smaller* view rather than a
+cheaper large one (see below), making large views cheap buys nothing, and the change was dropped.
 
 **A native `pipeTo` for the decode stage's input.** The output side of `decompressionStage` already
 avoids JavaScript entirely on the uncapped path; the input side is still a JS loop reading the source

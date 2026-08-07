@@ -15,16 +15,29 @@ const EMPTY = new Uint8Array(0);
  * so a large view never delays delivery; it only lets bytes the transport has already buffered
  * arrive in one crossing instead of many.
  */
-// Swept on the edge against a real proxied socket, ms of CPU per 4 MB body at the record layer:
+// Swept on the edge, ms of CPU for a 1 MB body at the record layer, p50 of n>=7 in one isolate,
+// each column an independent path against the same origin:
 //
-//     16 KiB  42.0     64 KiB  38.5     256 KiB  46.5     1 MiB  57.0
+//                    8 KiB   16 KiB   32 KiB   64 KiB   256 KiB
+//     direct           21      20       18       22        40
+//     proxy A          51      61       61       89       152
+//     proxy B          68      74        -      102         -
 //
-// A U with its floor on the current value, and going LARGER is worse — 1 MiB costs 48% more than
-// the default, because allocating the view outgrows the boundary crossings it saves. Recorded so
-// the next person to reach for this knob does not have to re-run the sweep to find there is nothing
-// in it: the 42 ms this layer costs on a 4 MB body is the price of moving bytes off a real socket,
-// of which the AEAD is under 2 ms. It is not a tuning problem.
-const BYOB_PULL_BYTES = 65536;
+// Monotonic on both proxies, and shallow on the direct path: too LARGE is what costs, because a
+// BYOB read resolves the instant any byte exists and never waits to fill, so a view bigger than
+// what the transport hands over per read is allocation that is never used. Average fill measured
+// over a 4 MB body: 37 KB direct, 8 KB through a proxy — which is why the two paths want different
+// numbers and why the proxied one wants a small one.
+//
+// 16 KiB is within ~20% of the best figure on all three paths; the 64 KiB that used to sit here is
+// up to 45% off. It is also exactly one TLS record, which is the unit the caller above asks for.
+//
+// The previous value came from a sweep captioned "against a real proxied socket" that reported a
+// clean U with its floor at 64 KiB. That sweep measured nothing: openTunnel wrapped the socket in a
+// plain ReadableStream, so the record layer could not take a BYOB reader on any proxied connection
+// and this constant was never read on that path. The four numbers were four samples of one
+// configuration. See proxy/tunnel.js, which is where that was fixed.
+const BYOB_PULL_BYTES = 16384;
 
 /** Raised when the peer stops sending in the middle of a structure we must read whole. */
 export class UnexpectedEofError extends TunnelFetchError {
@@ -50,21 +63,25 @@ export class UnexpectedEofError extends TunnelFetchError {
  * be retained beyond the caller's immediate use if memory matters.
  *
  * When the source is a byte stream — on the target runtime, a socket's readable is one — the
- * reader pulls with BYOB reads into large fresh views instead of taking the source's own
- * chunking. This is measured, not stylistic: the runtime delivers socket data in chunks of at
- * most 4096 bytes, ~1200 of them for a 4 MB body, and every chunk is a runtime/JS boundary
- * crossing; a BYOB read hands over everything the transport has buffered (up to the view size)
- * in one crossing, and resolves with a partial fill the instant anything at all is available,
- * so delivery latency is unchanged. Sources that are not byte streams (every in-process
+ * reader pulls with BYOB reads instead of taking the source's own chunking. This is measured, not
+ * stylistic: the runtime delivers socket data in chunks of at most 4096 bytes, ~1200 of them for a
+ * 4 MB body, and every chunk is a runtime/JS boundary crossing; a BYOB read collects several of
+ * them into one.
+ *
+ * How MANY it collects is the transport's decision, not the view's. A BYOB read resolves the
+ * instant any byte is available and never waits to fill, so the view is a ceiling that is normally
+ * not reached: measured over a 4 MB body, 37 KB average fill on a direct socket and 8 KB through a
+ * proxy, whatever the view size. Sizing the view far above that buys nothing and costs the
+ * allocation — see BYOB_PULL_BYTES. Sources that are not byte streams (every in-process
  * ReadableStream in this package and its tests) take the default-reader path unchanged.
  */
 export class ByteReader {
   /**
    * @param {ReadableStream<Uint8Array>} readable
-   * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because it
-   *   decides how many times a body crosses the runtime boundary on the way in, and that turned out
-   *   to be the largest single cost in a large response — 42 ms of a 106 ms 4 MB request is socket
-   *   reads and record decryption, of which the AEAD itself is under 2 ms.
+   * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because the
+   *   right value depends on how much the transport hands over per read, and that differs by a
+   *   factor of four between a direct socket and a proxied one — see BYOB_PULL_BYTES for the sweep.
+   *   Ignored on sources that are not byte streams, which take the default-reader path.
    */
   constructor(readable, pullBytes = BYOB_PULL_BYTES) {
     this._pullBytes = pullBytes > 0 ? pullBytes : BYOB_PULL_BYTES;
