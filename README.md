@@ -1149,6 +1149,12 @@ fixture, same isolate, differenced between a 1 MB and a 4 MB body:
 | `Infinity` — native relay, no JS in the byte path | **4.3** |
 | 32 MiB (the default) — pull-driven JS wrapper | **7.7** |
 
+Both of those come from an isolated bench, and this document is mostly a record of isolated benches
+being wrong. This one is not: subtracting `depth=passthru` from `depth=full` on a real proxied
+request for a 4 MB body — the `Infinity` path — puts decoding at **18–29 ms**, against the 17 ms the
+4.3 figure predicts, and at 16–25% of the whole request, which is the "20% for decode" claimed
+further up. Two instruments, one answer.
+
 So the bomb guard costs **3.3 ms per decoded megabyte**, about 13 ms on a 4 MB body, and it is the
 largest remaining item in the body path. That is not a bug — the cap is enforced by counting bytes
 and counting requires seeing them in JS — but the size of it was not known before and it is worth
