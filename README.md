@@ -914,6 +914,11 @@ the measurements above, with the charge split out so it is clear what is yours t
 | New connection per request, 1 MB | 59 ms | $16.20 | $1,481.40 |
 | Pooled connection, 4 MB pages | 102 ms | $24.80 | $2,341.40 |
 | New connection per request, 4 MB | 135 ms | $31.40 | $3,001.40 |
+| Pooled 4 MB, `maxBodyBytes: Infinity` | 70 ms | $18.40 | $1,701.40 |
+
+The last row is the same workload with the decompression-bomb guard off, measured in its own sweep;
+it is the largest configuration-level saving in this document and it is the caller taking
+responsibility for bounding the body themselves. See "Passing the body through" below.
 
 `$5 + max(0, requests - 10M) x $0.30/M + max(0, cpu_ms - 30M) x $0.02/M`, and nothing else. The
 CPU column is the warm-page and fresh-connection columns of the table above; any figure here that
@@ -1155,8 +1160,18 @@ request for a 4 MB body — the `Infinity` path — puts decoding at **18–29 m
 4.3 figure predicts, and at 16–25% of the whole request, which is the "20% for decode" claimed
 further up. Two instruments, one answer.
 
-So the bomb guard costs **3.3 ms per decoded megabyte**, about 13 ms on a 4 MB body, and it is the
-largest remaining item in the body path. That is not a bug — the cap is enforced by counting bytes
+Priced again on a **real proxied 4 MB request** rather than on a fixture, one isolate, n=11, warm
+page as `(reuse=4 - reuse=1)/3`:
+
+| `maxBodyBytes` | warm 4 MB page | first request on a new connection |
+|---|---|---|
+| 16 MiB — the default | min 87, p50 97 ms | 147 ms |
+| `Infinity` | **min 68, p50 70 ms** | 130 ms |
+
+So the bomb guard costs **20-27 ms on a 4 MB body**, 5-7 ms per decoded megabyte — half again what
+the fixture predicted, and the largest single item left in the body path. At a billion 4 MB requests
+a month that is about **$540**. It is the one lever in this document that is available by
+configuration rather than by a release. That is not a bug — the cap is enforced by counting bytes
 and counting requires seeing them in JS — but the size of it was not known before and it is worth
 saying out loud rather than leaving inside a comment. The counting itself is free (7.00 with it,
 7.33 without); it is the wrapper the counting forces that costs. If you are relaying bodies you

@@ -2020,6 +2020,7 @@ export default {
     markPath('run', { sizes: url.searchParams.get('sizes') ?? null,
                       reuse: url.searchParams.get('reuse') ?? null,
                       pull: url.searchParams.get('pull') ?? null,
+                      cap: url.searchParams.get('cap') ?? null,
                       // dc/ae/h1/sockshape all change the end-to-end cpuTime; they MUST reach the
                       // mark or a decode-on and decode-off run land in one bucket.
                       dc: url.searchParams.get('dc') ?? null,
@@ -2072,7 +2073,12 @@ export default {
       const connectFn = sockshape ? shapeConnect(connect, sockshape, sockStats) : connect;
       results.push(await attempt(`sizes ${spec}`, async () => {
         const client = new Client({
-          connect: connectFn, proxy, forceTunnel: true, maxBodyBytes: 16 << 20, decompress: dc,
+          connect: connectFn, proxy, forceTunnel: true, decompress: dc,
+          // The cost table has always been taken at a FINITE cap, which is the default and the
+          // shape most callers run. That is also the shape that forces the decode stage through a
+          // JS wrapper instead of the native relay, so `cap=inf` prices what the bomb guard costs
+          // on a real proxied request rather than on a fixture.
+          maxBodyBytes: url.searchParams.get('cap') === 'inf' ? Infinity : 16 << 20,
           http2: h2,
           // Present so the cost table can be re-taken at the OLD socket view size in the same
           // isolate as the new one. Without it the only way to compare the two is across sweeps,
