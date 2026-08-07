@@ -1218,6 +1218,42 @@ the last two rounds of optimisation at the record layer. That figure is not wron
 was taken on; it just never separated the socket from the parsing, and the separation is where the
 answer was.
 
+### What the proxy costs, and what the origin costs
+
+The ladder above runs without a proxy, which is what makes it a per-layer answer and also what
+makes it unlike the shape this package is for. Run the same rungs three ways — the same nginx origin
+direct and proxied, then a Cloudflare-fronted origin through the same proxy — and the two variables
+separate. Per megabyte of wire, differenced between a 1 MB and a 4 MB body at a single request,
+p50 of n=7-8, all twelve cells in one sweep:
+
+| | socket | + the TLS record layer | total |
+|---|---|---|---|
+| nginx origin, direct | 2.3 | +7.7 | 10.0 |
+| nginx origin, **proxied** | **17.3** | +6.3 | 23.7 |
+| Cloudflare origin, **proxied** | **16.0** | +7.7 | 23.7 |
+
+**The whole proxied-versus-direct gap is the socket rung, and the origin contributes nothing.** The
+two proxied rows agree to within noise, which kills the standing hypothesis that a Cloudflare
+origin's dynamic TLS record sizing was inflating these figures — it is not the origin. And the
+record layer costs the same 6-8 ms per wire megabyte on all three paths: it does not care what is
+in front of it.
+
+The socket rung's 7x is two effects multiplying. Measured over a 4 MB body on the same build:
+
+| | reads | average fill | ms per read |
+|---|---|---|---|
+| direct | 110 | 38 KB | 85 µs |
+| proxied | 494 | 8.5 KB | 140 µs |
+
+**4.5x as many reads, each 1.6x dearer.** The fill is the proxy's relay pacing, not a view-size
+choice — `pullBytes` is already at the measured optimum for it, and raising the view does not raise
+the fill because a BYOB read never waits. There is nothing in this package to change here.
+
+This is also the number that settles the Wasm question below. A Wasm record layer can only replace
+the `+6.3 to 7.7` column, minus the 1.67 ms/MB of AEAD that stays in WebCrypto — and it cannot touch
+the 16-17 ms socket rung at all, because a socket cannot write into linear memory (see below). The
+dominant term on the real path is the one Wasm has no access to.
+
 ### A knob that was never connected on the path this package exists for
 
 Running the same ladder **with** a proxy turned up the reason those earlier figures were so much
@@ -1299,21 +1335,37 @@ decomposed the same way, "where the cost is" has an answer only for the direct o
 ### Moving TLS into WebAssembly: measured, and closed
 
 The idea was to put record framing and buffer management in Wasm and leave the AEAD in JavaScript,
-where `crypto.subtle` reaches AES-NI. The ladder above closes it, and not by finding Wasm slow —
-**by bounding the prize**.
+where `crypto.subtle` reaches AES-NI. The ladders above bound it, and not by finding Wasm slow —
+Wasm is fast. They bound **the prize**, and separately they make **the cost mandatory**.
 
-Everything a Wasm record layer could replace is the JavaScript record parsing, and that is roughly
-**1–3 ms per wire megabyte** out of a 13–16 ms/MB receive path — at best a fifth of it, and the
-smallest of the four rungs. The socket underneath is not something Wasm can make faster. The AEAD
-would have to cross back to `crypto.subtle` regardless, because a software AES inside Wasm has no
-AES-NI to reach, and at 1.67 ms/MB the AEAD is a large share of the rung being attacked. HTTP/2 and
-the `Client`, which together cost two to three times as much as the whole TLS rung, are untouched
-by any of it.
+**The prize.** Everything a Wasm record layer could replace is the JavaScript record parsing: the
+TLS rung minus its AEAD, since a software AES inside Wasm has no AES-NI to reach and would have to
+cross back to `crypto.subtle` anyway. The TLS rung measured +2.7 to 4.3 ms per wire MB in one sweep
+and +6.3 to 7.7 in another; the AEAD is 1.67. So the prize is somewhere in **1–6 ms per wire
+megabyte**, and the spread between sweeps is wider than most of it.
 
-So the ceiling on the whole exercise is one to three milliseconds per megabyte, in exchange for
-reimplementing TLS record framing in another language and re-deriving in Rust every byte of the
-ClientHello-ordering and cipher-offer work this package exists for. Measured cost of the boundary
-does not even enter into it.
+**The cost is not optional.** A socket cannot write into linear memory: a BYOB read detaches the
+view's buffer and a `WebAssembly.Memory` buffer is non-detachable, so the read is refused —
+*"Unable to use non-detachable ArrayBuffer"*, measured on the edge on both the direct and the
+proxied path. Bytes must land in a JavaScript buffer and be copied in. That copy measured
+**2.67–4.67 ms per megabyte**.
+
+Those two ranges overlap. The exercise is somewhere between a wash and a modest win on one rung —
+in exchange for reimplementing TLS record framing in another language and re-deriving in Rust every
+byte of the ClientHello-ordering and cipher-offer work this package exists for.
+
+And it aims at the wrong rung. On the proxied path the socket alone is **16–17 ms per wire MB**,
+two to three times the entire TLS rung, and it is precisely the part the non-detachable buffer puts
+out of reach.
+
+**An earlier version of this analysis reached the opposite conclusion, and the error is worth
+naming.** It put the prize at 24–28 ms per wire MB — a sixfold win against a 4.67 ms boundary — from
+the "42 ms per 4 MB body at the record layer" figure that used to sit in `util/bytes.js`. That
+figure never separated the socket from the parsing on top of it, and it was taken on a proxied path
+where BYOB was silently disabled. Both errors inflated the denominator. The rule that killed the
+idea in the end — *a native layer wins when it replaces a JavaScript one and loses when it is added
+to one* — was stated correctly at the time; the layer being replaced was simply measured at ten
+times its size.
 
 Two things the measurements *do* settle, neither of which changes that:
 

@@ -1963,6 +1963,29 @@ export default {
           const w = conn2.writable.getWriter();
           await w.write(enc.encode(req));
           w.releaseLock();
+          if (drain === 'wasm') {
+            // The one variant of the Wasm-TLS idea that was never closed: can the socket write
+            // STRAIGHT into linear memory, skipping the copy that the boundary measurement priced?
+            // A BYOB read detaches the view's buffer, and a WebAssembly.Memory buffer is
+            // non-detachable, so the spec says no — but "the spec says no" is not a measurement,
+            // and if it worked the arithmetic for a Wasm record layer would change.
+            WASM_MOD ??= {};
+            WASM_MOD.rust ??= new WebAssembly.Instance(WASMBYTES, {});
+            const ex = WASM_MOD.rust.exports;
+            const ptr = ex.alloc(65536);
+            const rd = conn2.readable.getReader({ mode: 'byob' });
+            let verdict = 'ok';
+            try {
+              const view = new Uint8Array(ex.memory.buffer, ptr, 65536);
+              const { done, value } = await rd.read(view);
+              if (!done && value) { bytes += value.byteLength; pulls++; pulled += value.byteLength; }
+            } catch (e) {
+              verdict = String(e?.message ?? e).slice(0, 160);
+            }
+            await rd.cancel().catch(() => {});
+            return Response.json({ wire: scheme, target, drain, proxied: Boolean(wireProxy),
+                                   zeroCopyIntoWasm: verdict, bytes, pulls });
+          }
           if (drain === 'byob') {
             // BYOB straight off the socket, so `avgFill` reports how much the runtime actually
             // hands over per crossing — the number the record layer's view-size sweep turns on.
