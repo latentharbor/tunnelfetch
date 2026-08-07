@@ -1,0 +1,7 @@
+name = "tunnelfetch-sizeorigin"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+workers_dev = true
+
+# An origin, not a rig: it runs no part of the package. Its only job is to return exactly N bytes
+# of realistically-compressible content so the cost table has a fixed denominator.

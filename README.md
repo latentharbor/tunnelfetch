@@ -783,29 +783,41 @@ the network, which is not billed.
 
 ### What a request costs
 
-Fetching a size-controlled origin through a proxy, warm, medians over seven-plus rounds on one
-isolate, gzip on the wire. The last column is the same numbers as a rate, which is the form worth
-carrying around:
+Fetching `sizeorigin/` through a proxy, gzip on the wire, medians of n>=5 with every size in one
+sweep and one isolate. The method is stated because the last version of this table did not state
+one precisely enough to reproduce: **a warm page is `(reuse=4 - reuse=1) / 3`**, the cost of pages
+two through four down a connection that is already open, and the last column is the fresh-connection
+number the same sweep produced.
 
-| Body | Per request, reusing a connection | Per decompressed MB |
-| --- | --- | --- |
-| 1 KB | **0.5 ms** | — |
-| 16 KB | **3.5 ms** | 224 ms/MB |
-| 64 KB | **7.5 ms** | 120 ms/MB |
-| 256 KB | **20.5 ms** | 82 ms/MB |
-| 1 MB | **51.5 ms** | 51 ms/MB |
-| 4 MB | **104 ms** | 26 ms/MB |
+| Body | Warm page | Per decompressed MB | First request on a new connection |
+| --- | --- | --- | --- |
+| 1 KB | **1.3 ms** | — | 8 ms |
+| 16 KB | **2.3 ms** | 149 ms/MB | 9 ms |
+| 64 KB | **6.0 ms** | 96 ms/MB | 13 ms |
+| 256 KB | **14.3 ms** | 57 ms/MB | 28 ms |
+| 1 MB | **36.3 ms** | 36 ms/MB | 59 ms |
+| 4 MB | **102 ms** | 26 ms/MB | 135 ms |
 
-Opening a connection adds **7–12 ms** on top, once, however many requests follow it.
+The last column is not "warm page plus a handshake". At 4 MB it is 33 ms above the warm page while a
+handshake costs single digits, because the *first* body through a connection also runs the decode
+loop before V8 has tiered it up. Budget a new origin at that column, not at the first one.
 
-**Read the per-MB column before doing any arithmetic with this table.** It falls 8.6x from end to
-end, so there is no such thing as a per-MB rate for this package. A least-squares line through these
-points is `9.17 + 24.86 x MB`, which predicts 9.17 ms for a 1 KB body against a measured 0.5 — wrong
-by 18x. Any budget built on a single per-MB figure will be badly wrong at one end or the other.
+**Re-measured August 2026, and the mid-sizes moved.** The 4 MB row reproduced almost exactly
+(102 against a previously published 104); 64 KB through 1 MB came in 20-30% lower than the figures
+this table used to carry. That is not the socket-view change two sections below — A/B-ing the old
+and new view size in one isolate moved a warm 1 MB page by about 1 ms — so it is either day-to-day
+variance beyond what a single sweep can see, or a difference in how the superseded table was taken.
+The old numbers are not recoverable to check, which is the argument for stating the method here.
+
+**Read the per-MB column before doing any arithmetic with this table.** It falls 5.7x from end to
+end, so there is no such thing as a per-MB rate for this package. A least-squares line through the
+16 KB and larger points is `6.30 + 24.30 x MB`, which predicts 6.33 ms for a 1 KB body against a
+measured 1.3 — wrong by 4.9x. Any budget built on a single per-MB figure will be wrong at one end
+or the other.
 
 The reason is that V8 tiers up **inside a single request**. A 1 MB body runs the decode loop
-interpreted the whole way; a 4 MB body pays that for its first megabyte and runs the rest optimised.
-`51.5 + 3 x 17.5 = 104` fits, so the steady-state cost is about **17.5 ms/MB with a ~51 ms entry fee
+interpreted for much of its length; a 4 MB body pays that once and runs the rest optimised.
+`36.3 + 3 x 21.9 = 102` fits, so the steady-state cost is about **22 ms/MB with a ~36 ms entry fee
 per request**. For a size not in the table, interpolate within it rather than extrapolating from a
 rate.
 
@@ -824,11 +836,6 @@ of excess the *whole* ramp contains. These were measured on a small body; a cold
 4 MB request has never been measured and is certainly worse, since far more of the decode loop runs
 interpreted.
 
-Measured through a proxy against a size-controlled origin, eight rounds per size, HTTP/2, gzip on
-the wire. Connection and per-request terms were separated by varying the reuse count rather than
-assumed — two pages against ten gives **9.8 ms to open a connection** and **2.25 ms per further
-request**, and the body cost is what is left.
-
 **These figures replace ones that were measured wrong, and the mistake is worth describing.** The
 origin they came from tiled a 150-byte HTML fragment, which gzip compressed **220:1** — so a "1 MB
 body" was four kilobytes on the wire, and every measurement taken against it priced decompression
@@ -840,19 +847,21 @@ The correction is large. Body-heavy rows are **two to three times** what this ta
 1.4.0, and no amount of care about medians or minimums would have caught it, because the numbers
 were internally consistent — they were answers to the wrong question.
 
-**Read the two right-hand columns as derived, because they are.** Only the pooled column is measured
-per size; "new connection" is the pooled figure plus a flat 7.5 ms and "averaged over 5 pages" is
-the pooled figure plus 1.5 ms, which is why the deltas are identical to one decimal across a 4000×
-range in body size. That 7.5 ms also does not agree with the 9.8 ms quoted just above it, and the
-2.25 ms per further request is larger than the entire 1.7 ms a pooled 1 KB request costs, which
-would make a 1 KB body cost negative. The two came from different sweeps, and combining them is the
-cross-sweep comparison this document tells you never to make. **Treat the connection term as
-somewhere in 7–10 ms and do not do arithmetic with it.**
+That correction is the reason the table above now measures its fresh-connection column instead of
+deriving one. Through 1.11.0 that column was the warm figure plus a flat 7.5 ms and a third column
+was the warm figure plus 1.5 ms, which is why their deltas were identical to one decimal across a
+4000x range in body size — a derived column cannot disagree with its source, so it cannot check it
+either. Both are gone.
 
-An independent check was quoted here as agreement and is not: a real 3.6 MB file from a CDN cost
-142 ms against the ~120 ms this table predicts for 4 MB. That is the model under-predicting by
-roughly 20%, in the same direction as the error it had just replaced. It belongs here as a caution,
-not as corroboration.
+The connection term that falls out of the current sweep is **6–7 ms** (1 KB fresh 8 ms against a
+1.3 ms warm page), consistent with the 7–10 ms this section used to advise treating it as, and still
+not something to do arithmetic with: at 4 MB the gap between fresh and warm is 33 ms, and most of
+that is V8 tiering rather than the handshake.
+
+An independent check was once quoted here as agreement and is not: a real 3.6 MB file from a CDN
+cost 142 ms where the model predicts about 94 ms. It was taken in a different sweep against a
+different origin, so it does not refute the table either — it belongs here as a reminder that a
+single cross-sweep reading cannot confirm or deny anything in this document.
 
 Two further cautions. The 2.76:1 content is slightly *less* compressible than a typical page, so
 these are mildly conservative rather than optimistic. And CPU on this platform varies by up to ~1.5×
@@ -875,6 +884,11 @@ the edge the same way as the rest — differencing two work counts, minimum of s
 | `decoders: { zstd }` | **+2.8 ms/MB** (5.5 against 2.75) | per byte, whenever an origin serves zstd |
 | `profile: chrome` via `tunnelfetch/profile/chrome` | **+3 ms once per isolate** for four WASM modules, then the per-byte rows above as origins use them | |
 
+**The socket read view moved in 1.12.0**, from 64 KiB to 16 KiB, alongside the proxy tunnel becoming
+a byte stream. No API changed and `tls.pullBytes` still overrides it — but on a proxied connection
+that override did nothing before 1.12.0, so anyone who had tuned it was tuning a value nothing read.
+Both are covered below.
+
 Two defaults moved in 1.4.0 and neither is visible in the table above them: matching curl's cipher
 order means AES-256-GCM is negotiated where AES-128-GCM used to be, measured at **+4%** per MB
 (1.50 against 1.45 ms/MB — hardware AES makes the extra rounds cheap), and the ordered header list
@@ -892,19 +906,24 @@ the measurements above, with the charge split out so it is clear what is yours t
 
 | Workload | CPU/request | 10M/mo | 1B/mo |
 | --- | --- | --- | --- |
-| Platform `fetch`, 16 KB — reference; it cannot use a proxy | 0.3 ms | $8.06 | $311.00 |
-| Platform `fetch`, 4 MB — same reference, measured | 3.2 ms | $8.64 | $369.00 |
-| Pooled connection, 16 KB pages | 3.5 ms | $8.70 | $375.00 |
-| New connection per request, 16 KB | 13.5 ms | $10.70 | $575.00 |
-| Pooled connection, 1 MB pages | 51.5 ms | $18.30 | $1,335.00 |
-| New connection per request, 1 MB | 61.5 ms | $20.30 | $1,535.00 |
-| Pooled connection, 4 MB pages | 104 ms | $28.80 | $2,385.00 |
-| New connection per request, 4 MB | 114 ms | $30.80 | $2,585.00 |
+| Platform `fetch`, 16 KB — reference; it cannot use a proxy | 0.3 ms | $5.00 | $307.40 |
+| Platform `fetch`, 4 MB — same reference, measured | 3.2 ms | $5.04 | $365.40 |
+| Pooled connection, 16 KB pages | 2.3 ms | $5.00 | $347.40 |
+| New connection per request, 16 KB | 9 ms | $6.20 | $481.40 |
+| Pooled connection, 1 MB pages | 36.3 ms | $11.66 | $1,027.40 |
+| New connection per request, 1 MB | 59 ms | $16.20 | $1,481.40 |
+| Pooled connection, 4 MB pages | 102 ms | $24.80 | $2,341.40 |
+| New connection per request, 4 MB | 135 ms | $31.40 | $3,001.40 |
 
-These follow the CPU table above and nothing else. An earlier version of this section was computed
-from a superseded set of measurements and was left behind when that table was replaced, so the
-document quoted 118.3 ms and 104 ms for the same row in two places. Any figure here that does not
-fall out of the table above is a bug in this README.
+`$5 + max(0, requests - 10M) x $0.30/M + max(0, cpu_ms - 30M) x $0.02/M`, and nothing else. The
+CPU column is the warm-page and fresh-connection columns of the table above; any figure here that
+does not fall out of that table is a bug in this README.
+
+**The `max(0, ...)` is new.** The previous version of this table billed every request and every
+CPU millisecond, ignoring the allowance the sentence above it describes — so it overstated the
+10M/mo column by up to 70% ($8.70 where the bill is $5.00) while being within 0.2% at 1B, where
+the allowance is a rounding error. The overstatement was against this package, not for it, which
+is presumably why it survived several readings.
 
 The reference row is given at two sizes because the platform's own `fetch` is **not flat** — it
 scales at about 0.82 ms per decompressed MB, measured on a size ladder from one CDN so that only the
@@ -929,12 +948,17 @@ pooled 1 MB workload at a billion requests a month, warmed:
 
 | Change from the baseline | CPU/request | 1B/mo | Δ | Paid when |
 | --- | --- | --- | --- | --- |
-| baseline — gzip, AES-256-GCM, x25519 | 51.5 ms | $1,335 | — | always |
-| origin serves `br` instead of gzip | 55.8 ms | $1,421 | **+$86** | the origin chooses `br` |
-| server selects ChaCha20-Poly1305 | 54.5 ms | $1,395 | **+$60** | the server picks it over AES |
-| origin serves `zstd` instead of gzip | 54.3 ms | $1,391 | **+$56** | the origin chooses `zstd` |
-| X25519MLKEM768, 1 request per connection | 59.2 ms | $1,489 | **+$154** | every handshake |
-| X25519MLKEM768, 20 requests per connection | 51.5 ms | $1,335 | **+$0.15** | the same handshake, amortised |
+| baseline — gzip, AES-256-GCM, x25519, warm | 36.3 ms | $1,027 | — | always |
+| origin serves `br` instead of gzip | 40.5 ms | $1,111 | **+$84** | the origin chooses `br` |
+| server selects ChaCha20-Poly1305 | 39.3 ms | $1,086 | **+$59** | the server picks it over AES |
+| origin serves `zstd` instead of gzip | 39.1 ms | $1,083 | **+$56** | the origin chooses `zstd` |
+| X25519MLKEM768, 1 request per connection | 59.2 ms | $1,484 | **+$3** | every handshake |
+| X25519MLKEM768, 20 requests per connection | 36.3 ms | $1,028 | **+$0.15** | the same handshake, amortised |
+
+The ML-KEM rows are measured against the **fresh-connection** 1 MB baseline of 59 ms ($1,481), not
+against the warm one at the top; the Δ column reflects that, which is why it is $3 rather than the
+$154 an earlier version showed. That $154 was the cost of not pooling, attributed to post-quantum
+key exchange.
 
 The last two rows are the same 0.15 ms of ML-KEM, and the difference between them is entirely
 connection reuse — which is the point worth taking from this table. Post-quantum key exchange is
@@ -1020,7 +1044,7 @@ below roughly the size where a single wire read covers the whole body.
 roughly a tenth of the CPU. This package exists because a V8 isolate cannot do that; it is not a
 better way to do it.
 
-The arithmetic is worth being blunt about. A billion 4 MB requests a month costs about **$2,385** of
+The arithmetic is worth being blunt about. A billion 4 MB requests a month costs about **$2,341** of
 Workers CPU. That workload is roughly 386 requests a second and 4.5 Gbps sustained — **three
 dedicated boxes** at Hetzner-class pricing carry it for around **$600**. So for large bodies, buying
 servers is about **four times cheaper**, and the gap widens with body size.
@@ -1457,7 +1481,9 @@ CI runs a fixed seed on every commit, as a gate; the scheduled workflow runs thr
 iterations with the run id as the seed, which is the half that searches new ground.
 
 `probe/` holds a reproducible capability probe that emits machine-readable JSON, and
-`probe/results/` the measurements this design rests on. `live/` is the edge interop rig.
+`probe/results/` the measurements this design rests on. `live/` is the edge interop rig, and
+`sizeorigin/` is the size-controlled origin the cost table is taken against — it lived outside the
+repository until August 2026, was deleted, and took the table's reproducibility with it.
 
 Credentials are read from the environment only. The live suite fails loudly when it is not
 configured rather than skipping: a green tick that means "we did not check" is worse than a red one.

@@ -2019,6 +2019,7 @@ export default {
     // every body size lands in one undifferentiated bucket.
     markPath('run', { sizes: url.searchParams.get('sizes') ?? null,
                       reuse: url.searchParams.get('reuse') ?? null,
+                      pull: url.searchParams.get('pull') ?? null,
                       // dc/ae/h1/sockshape all change the end-to-end cpuTime; they MUST reach the
                       // mark or a decode-on and decode-off run land in one bucket.
                       dc: url.searchParams.get('dc') ?? null,
@@ -2073,6 +2074,11 @@ export default {
         const client = new Client({
           connect: connectFn, proxy, forceTunnel: true, maxBodyBytes: 16 << 20, decompress: dc,
           http2: h2,
+          // Present so the cost table can be re-taken at the OLD socket view size in the same
+          // isolate as the new one. Without it the only way to compare the two is across sweeps,
+          // where run-to-run variance is larger than the effect.
+          ...(Number(url.searchParams.get('pull') ?? 0) > 0
+            ? { tls: { pullBytes: Number(url.searchParams.get('pull')) } } : {}),
           timeouts: { connectMs: 15000, handshakeMs: 20000, headersMs: 20000, idleMs: 20000 },
         });
         try {
