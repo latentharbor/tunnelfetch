@@ -1906,9 +1906,8 @@ export default {
       let pulled = 0;
       try {
         if (scheme === 'client') {
-          // The whole shipped stack, same origin, same byte count, no proxy. Ranged requests keep
-          // the wire volume identical to the rungs below it, so the differences are layers and
-          // not payloads.
+          // The whole shipped stack, same origin, same byte count. Ranged requests keep the wire
+          // volume identical to the rungs below it, so the differences are layers and not payloads.
           const client = new Client({ connect, forceTunnel: true, decompress: false,
             ...(wireProxy ? { proxy: wireProxy } : {}),
             maxBodyBytes: Infinity,
@@ -1920,7 +1919,8 @@ export default {
               bytes += (await r.arrayBuffer()).byteLength;
             }
           } finally { await client.close(); }
-          return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes });
+          return Response.json({ wire: scheme, target, reps, each, pull, drain,
+                                 proxied: Boolean(wireProxy), bytes });
         }
         const conn2 = await openConnection({
           url: `${scheme === 'h2' ? 'https' : scheme}://${target}${path}`,
@@ -1944,7 +1944,8 @@ export default {
             }
             await h2.close().catch(() => {});
           } finally { await conn2.close?.(); }
-          return Response.json({ wire: scheme, target, reps, each, pull, drain, bytes,
+          return Response.json({ wire: scheme, target, reps, each, pull, drain,
+                                 proxied: Boolean(wireProxy), bytes,
                                  pulls, avgFill: pulls ? Math.round(pulled / pulls) : 0 });
         }
         try {
