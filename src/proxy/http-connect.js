@@ -13,6 +13,7 @@
 
 import { ProxyError, LimitError, codes } from '../errors.js';
 import { ByteReader, ByteWriter, latin1, utf8 } from '../util/bytes.js';
+import { tunnelReadable } from './tunnel.js';
 
 const CRLFCRLF = utf8('\r\n\r\n');
 const MAX_REPLY_HEADER = 32 * 1024;
@@ -194,16 +195,7 @@ function replyError(reply, proxy, target, where) {
  */
 function tunnelFrom(socket, reader) {
   return {
-    readable: new ReadableStream({
-      async pull(controller) {
-        const chunk = await reader.readSome();
-        if (chunk === null) controller.close();
-        else controller.enqueue(chunk);
-      },
-      cancel(reason) {
-        return reader.cancel(reason);
-      },
-    }),
+    readable: tunnelReadable(socket, reader),
     writable: socket.writable,
     opened: socket.opened,
     close: () => socket.close?.(),

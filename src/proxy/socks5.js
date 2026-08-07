@@ -14,6 +14,7 @@
 
 import { ProxyError, ConfigError, codes, hex8 } from '../errors.js';
 import { ByteReader, ByteWriter, concat, utf8 } from '../util/bytes.js';
+import { tunnelReadable } from './tunnel.js';
 
 const VERSION = 0x05;
 const AUTH_VERSION = 0x01;
@@ -326,16 +327,7 @@ async function readExactly(reader, n, what, where) {
 /** Bytes that arrived alongside the reply are tunnel payload; the buffered reader carries them. */
 function tunnelFrom(socket, reader) {
   return {
-    readable: new ReadableStream({
-      async pull(controller) {
-        const chunk = await reader.readSome();
-        if (chunk === null) controller.close();
-        else controller.enqueue(chunk);
-      },
-      cancel(reason) {
-        return reader.cancel(reason);
-      },
-    }),
+    readable: tunnelReadable(socket, reader),
     writable: socket.writable,
     opened: socket.opened,
     close: () => socket.close?.(),

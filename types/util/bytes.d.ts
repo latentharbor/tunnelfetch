@@ -74,21 +74,25 @@ export class UnexpectedEofError extends TunnelFetchError {
  * be retained beyond the caller's immediate use if memory matters.
  *
  * When the source is a byte stream — on the target runtime, a socket's readable is one — the
- * reader pulls with BYOB reads into large fresh views instead of taking the source's own
- * chunking. This is measured, not stylistic: the runtime delivers socket data in chunks of at
- * most 4096 bytes, ~1200 of them for a 4 MB body, and every chunk is a runtime/JS boundary
- * crossing; a BYOB read hands over everything the transport has buffered (up to the view size)
- * in one crossing, and resolves with a partial fill the instant anything at all is available,
- * so delivery latency is unchanged. Sources that are not byte streams (every in-process
+ * reader pulls with BYOB reads instead of taking the source's own chunking. This is measured, not
+ * stylistic: the runtime delivers socket data in chunks of at most 4096 bytes, ~1200 of them for a
+ * 4 MB body, and every chunk is a runtime/JS boundary crossing; a BYOB read collects several of
+ * them into one.
+ *
+ * How MANY it collects is the transport's decision, not the view's. A BYOB read resolves the
+ * instant any byte is available and never waits to fill, so the view is a ceiling that is normally
+ * not reached: measured over a 4 MB body, 37 KB average fill on a direct socket and 8 KB through a
+ * proxy, whatever the view size. Sizing the view far above that buys nothing and costs the
+ * allocation — see BYOB_PULL_BYTES. Sources that are not byte streams (every in-process
  * ReadableStream in this package and its tests) take the default-reader path unchanged.
  */
 export class ByteReader {
     /**
      * @param {ReadableStream<Uint8Array>} readable
-     * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because it
-     *   decides how many times a body crosses the runtime boundary on the way in, and that turned out
-     *   to be the largest single cost in a large response — 42 ms of a 106 ms 4 MB request is socket
-     *   reads and record decryption, of which the AEAD itself is under 2 ms.
+     * @param {number} [pullBytes] size of each BYOB view pulled from the source. Tunable because the
+     *   right value depends on how much the transport hands over per read, and that differs by a
+     *   factor of four between a direct socket and a proxied one — see BYOB_PULL_BYTES for the sweep.
+     *   Ignored on sources that are not byte streams, which take the default-reader path.
      */
     constructor(readable: ReadableStream<Uint8Array>, pullBytes?: number);
     _pullBytes: number;
