@@ -16,6 +16,7 @@ export { warmup } from './warmup.js';
 export { ConnectionPool, poolKey } from './pool.js';
 export { openConnection, targetFromUrl, nativeFetchCanServe } from './transport.js';
 export { openTunnel, parseProxy } from './proxy/index.js';
+export { resolveConnect, isConnectFn, normaliseSocket, normalisingConnect } from './connect.js';
 export { CookieJar } from './client/cookies.js';
 export { verifyChain, rootStoreProvenance } from './trust/index.js';
 
