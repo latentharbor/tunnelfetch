@@ -117,6 +117,38 @@ await client.close();          // 必须调用：释放池中的 socket
 （第 16 步），所以一个普通名字的 `Secure` cookie 即便是在 https 上设置的，仍可能被 http 覆盖;以及名字加值
 4096 字节的上限（第 4 步）。
 
+### 获取 socket 工厂
+
+`connect` 是参数而不是 import，这是刻意的：它是这个包唯一无法自带的部分，由调用方提供也正是上面每一层都能在
+内存管道上做字节级测试的原因。稳妥地获取一个：
+
+```js
+import { resolveConnect } from 'tunnelfetch';
+
+const connect = await resolveConnect({
+  specifiers: ['cloudflare:sockets'],
+});
+const client = new Client({ connect, proxy: env.PROXY_URL });
+```
+
+第一个能导出可调用函数的 specifier 胜出；全部失败时报错会列出试过的每一个 specifier 及其失败原因——错误在
+启动时就现身，而不是以 "connect is not a function" 的样子从 TLS 层深处冒出来。过程中关掉了两个坑：
+
+1. 导入是动态的，失败会被捕获。某个只在一个运行时上能解析的 specifier，一旦被静态导入，就会让整个包在其它
+   所有平台上无法加载；列着多个运行时的可移植列表则是安全的。
+2. 打包器看不穿变量形式的 specifier。打包部署时直接把 `connect` 传进来，或者给 `resolveConnect` 传一个闭包了
+   字面量的 `importModule`，让打包器看得到：
+
+   ```js
+   const connect = await resolveConnect({
+     importModule: () => import('cloudflare:sockets'),
+   });
+   ```
+
+`normaliseSocket` 把一个运行时 socket 拍平成普通双工对象，`normalisingConnect` 包一层工厂，让每个返回的 socket
+都被拍平。它们的存在是因为 edge 运行时上 socket 的 `readable` 和 `writable` 是原型上的访问器，`{ ...socket }`
+两个都拷不到，第一次读取就会在 TLS 层深处报 `getReader` 的错误。
+
 ### 替换全局 fetch
 
 有的库只会直接调用全局 `fetch`，为它们准备的是：

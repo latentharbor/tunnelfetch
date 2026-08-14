@@ -149,6 +149,42 @@ Two related rules of §5.7 are **not** implemented, and are worth knowing if you
 security: "Leave Secure Cookies Alone" (step 16), so a plain-named `Secure` cookie set over https
 can still be overwritten from http, and the 4096-octet name-plus-value cap (step 4).
 
+### Obtaining the socket factory
+
+`connect` is an argument rather than an import on purpose: it is the one piece this package cannot
+supply itself, and taking it from the caller is what keeps every layer above it testable over an
+in-memory pipe. Resolve one robustly:
+
+```js
+import { resolveConnect } from 'tunnelfetch';
+
+const connect = await resolveConnect({
+  specifiers: ['cloudflare:sockets'],
+});
+const client = new Client({ connect, proxy: env.PROXY_URL });
+```
+
+The first specifier that yields a callable export wins, and a total failure names every specifier
+tried and why it failed — the mistake surfaces at startup, not as "connect is not a function" from
+inside the TLS layer. Two traps are closed on the way:
+
+1. The import is dynamic and its failure is caught. A specifier that only resolves on one runtime,
+   imported statically, makes the whole package unloadable everywhere else; a portable list naming
+   several runtimes is safe.
+2. Bundlers cannot see through a variable specifier. On a bundled deploy pass `connect` straight
+   in, or hand `resolveConnect` an `importModule` that closes over a literal the bundler can see:
+
+   ```js
+   const connect = await resolveConnect({
+     importModule: () => import('cloudflare:sockets'),
+   });
+   ```
+
+`normaliseSocket` flattens one runtime socket into a plain duplex, and `normalisingConnect` wraps a
+factory so every socket it returns is flattened. They exist because on the edge runtime a socket's
+`readable` and `writable` are prototype accessors, so `{ ...socket }` copies neither and the first
+read fails far away, inside the TLS layer, with a complaint about `getReader`.
+
 ### Replacing the global
 
 For libraries that only ever call the bare global:
