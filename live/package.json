@@ -8,6 +8,6 @@
     "brotli-dec-wasm": "^2.3.2",
     "fflate": "^0.8.3",
     "pako": "^3.0.1",
-    "wrangler": "^4.115.0"
+    "wrangler": "^4.123.0"
   }
 }

@@ -30,3 +30,12 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 3
+
+  # The edge capability probe, the rig's sibling. Same reasoning as /live — same wrangler supply
+  # chain, deployed with an API token. It was missing here, which is exactly why its wrangler
+  # drifted far enough to carry the undici advisories this repo's alert list was showing.
+  - package-ecosystem: npm
+    directory: /probe
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
