@@ -6,6 +6,6 @@
   "devDependencies": {
     "@noble/ciphers": "^2.4.0",
     "@noble/post-quantum": "^0.7.1",
-    "wrangler": "^4.123.0"
+    "wrangler": "^4.154.0"
   }
 }
