@@ -266,22 +266,33 @@ test('withIdleDeadline keeps a slow but steady stream alive past the idle window
   const d = new DeadlineController({ idleMs: 100 }, env);
   d.beginIdle();
 
-  let n = 0;
+  let source;
   const drip = new ReadableStream({
-    pull(c) {
-      if (n >= 5) {
-        c.close();
-        return;
-      }
-      n++;
-      // Each chunk arrives 90ms after the previous one; total 450ms, well past idleMs.
-      return env.advance(90).then(() => c.enqueue(utf8('x')));
+    start(c) {
+      source = c;
     },
   });
 
-  const out = await collect(withIdleDeadline(drip, d));
-  assert.equal(latin1(out), 'xxxxx');
+  const reader = withIdleDeadline(drip, d).getReader();
+  let out = '';
+  for (let n = 0; n < 5; n++) {
+    const pending = reader.read();
+    // Drive arrivals from the test, not pull(): a runtime may prefetch the next chunk before
+    // the wrapper has observed this one. Advancing virtual time from that prefetch can fire
+    // the idle timer before the pending promise continuation has had a chance to touch it.
+    // Each observed chunk arrives 90ms after the previous one; total 450ms, past idleMs.
+    await env.advance(90);
+    source.enqueue(utf8('x'));
+    const chunk = await pending;
+    assert.equal(chunk.done, false);
+    out += latin1(chunk.value);
+    assert.equal(d.aborted, false, `still active after ${(n + 1) * 90}ms of steady traffic`);
+  }
+  source.close();
+  assert.equal((await reader.read()).done, true);
+  assert.equal(out, 'xxxxx');
   assert.equal(d.aborted, false);
+  assert.equal(env.pending, 0, 'EOF must release the idle timer');
 });
 
 test('cancelling the wrapped stream disposes the deadlines', async () => {
