@@ -219,7 +219,11 @@ export class Http2Connection {
     this._ourConnWindow = opts.connectionWindow ?? CLIENT_CONNECTION_WINDOW;
     this._ourMaxConcurrent = opts.maxConcurrentStreams ?? CLIENT_MAX_CONCURRENT_STREAMS;
     // The decoder must allow the table size advertised by the fingerprint's SETTINGS flight.
-    const advertisedHeaderTableSize = (opts.settings ?? []).find(([id]) => id === SETTINGS.HEADER_TABLE_SIZE)?.[1];
+    // Repeated settings are processed in order: the final value wins (RFC 9113 section 6.5).
+    let advertisedHeaderTableSize;
+    for (const [id, value] of opts.settings ?? []) {
+      if (id === SETTINGS.HEADER_TABLE_SIZE) advertisedHeaderTableSize = value;
+    }
     this._ourHeaderTableSize = opts.maxHeaderTableSize ?? advertisedHeaderTableSize ?? DEFAULT_HEADER_TABLE_SIZE;
 
     // Peer settings, at their protocol defaults until the server's SETTINGS arrives.
