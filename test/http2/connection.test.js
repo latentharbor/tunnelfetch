@@ -12,6 +12,7 @@ import { FRAME, FLAG, H2_ERROR, SETTINGS } from '../../src/http2/constants.js';
 import { serializeFrame } from '../../src/http2/frames.js';
 import { encodeHeaderBlock } from '../../src/http2/hpack.js';
 import { ByteReader } from '../../src/util/bytes.js';
+import { chrome } from '../../src/profiles.js';
 
 const enc = new TextEncoder();
 
@@ -242,6 +243,51 @@ test('the client ACKs the server SETTINGS', async () => {
   const ack = await server.waitForFrame((f) => f.type === FRAME.SETTINGS && f.flags & FLAG.ACK);
   assert.equal(ack.payload.length, 0);
   await conn.close();
+});
+
+test('the HPACK decoder honors the advertised header table size', async (t) => {
+  for (const { name, client, size, accepted, advertised } of [
+    { name: 'Chrome accepts a 12288-byte update', client: { settings: chrome.http2Settings }, size: 12288, accepted: true, advertised: 65536 },
+    { name: 'Chrome accepts its 65536-byte limit', client: { settings: chrome.http2Settings }, size: 65536, accepted: true, advertised: 65536 },
+    { name: 'Chrome rejects an update above its limit', client: { settings: chrome.http2Settings }, size: 65537, accepted: false, advertised: 65536 },
+    { name: 'the default accepts 4096 bytes', client: {}, size: 4096, accepted: true },
+    { name: 'the default rejects 4097 bytes', client: {}, size: 4097, accepted: false },
+    { name: 'an advertised zero is not replaced by the default', client: { settings: [[SETTINGS.HEADER_TABLE_SIZE, 0]] }, size: 1, accepted: false, advertised: 0 },
+    { name: 'an explicit decoder limit retains precedence', client: { settings: chrome.http2Settings, maxHeaderTableSize: 4096 }, size: 12288, accepted: false, advertised: 65536 },
+  ]) {
+    await t.test(name, async () => {
+      const { conn, server } = connect({ client });
+      try {
+        const reqP = conn.request({ method: 'GET', scheme: 'https', authority: 'h', path: '/', headers: [] });
+        await awaitRequest(server, 1);
+        if (advertised !== undefined) {
+          assert.equal(server.clientSettings.find(([id]) => id === SETTINGS.HEADER_TABLE_SIZE)?.[1], advertised);
+        }
+        // RFC 7541 section 6.3: a size update with a 5-bit integer prefix, followed by
+        // indexed :status = 200 (static table entry 8).
+        const block = [0x20 | Math.min(size, 31)];
+        if (size >= 31) {
+          let remaining = size - 31;
+          while (remaining >= 128) {
+            block.push((remaining % 128) | 128);
+            remaining = Math.floor(remaining / 128);
+          }
+          block.push(remaining);
+        }
+        block.push(0x88);
+        await server.sendRaw(serializeFrame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, 1, Uint8Array.from(block)));
+        if (accepted) {
+          const res = await reqP;
+          assert.equal(res.status, 200);
+          assert.equal(await readBodyText(res.body), '');
+        } else {
+          await rejectsWithCode(async () => reqP, 'HTTP2_COMPRESSION', /exceeds the advertised limit/);
+        }
+      } finally {
+        await conn.close();
+      }
+    });
+  }
 });
 
 test('a PUSH_PROMISE fails the connection closed (we advertised ENABLE_PUSH = 0)', async () => {
