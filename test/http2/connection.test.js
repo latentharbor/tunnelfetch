@@ -253,6 +253,9 @@ test('the HPACK decoder honors the advertised header table size', async (t) => {
     { name: 'the default accepts 4096 bytes', client: {}, size: 4096, accepted: true },
     { name: 'the default rejects 4097 bytes', client: {}, size: 4097, accepted: false },
     { name: 'an advertised zero is not replaced by the default', client: { settings: [[SETTINGS.HEADER_TABLE_SIZE, 0]] }, size: 1, accepted: false, advertised: 0 },
+    { name: 'a repeated setting uses the final larger limit', client: { settings: [[SETTINGS.HEADER_TABLE_SIZE, 4096], [SETTINGS.HEADER_TABLE_SIZE, 65536]] }, size: 12288, accepted: true, advertised: 65536 },
+    { name: 'a repeated setting uses the final smaller limit', client: { settings: [[SETTINGS.HEADER_TABLE_SIZE, 65536], [SETTINGS.HEADER_TABLE_SIZE, 4096]] }, size: 12288, accepted: false, advertised: 4096 },
+    { name: 'a repeated setting respects a final zero', client: { settings: [[SETTINGS.HEADER_TABLE_SIZE, 65536], [SETTINGS.HEADER_TABLE_SIZE, 0]] }, size: 1, accepted: false, advertised: 0 },
     { name: 'an explicit decoder limit retains precedence', client: { settings: chrome.http2Settings, maxHeaderTableSize: 4096 }, size: 12288, accepted: false, advertised: 65536 },
   ]) {
     await t.test(name, async () => {
@@ -261,7 +264,7 @@ test('the HPACK decoder honors the advertised header table size', async (t) => {
         const reqP = conn.request({ method: 'GET', scheme: 'https', authority: 'h', path: '/', headers: [] });
         await awaitRequest(server, 1);
         if (advertised !== undefined) {
-          assert.equal(server.clientSettings.find(([id]) => id === SETTINGS.HEADER_TABLE_SIZE)?.[1], advertised);
+          assert.equal(server.clientSettings.findLast(([id]) => id === SETTINGS.HEADER_TABLE_SIZE)?.[1], advertised);
         }
         // RFC 7541 section 6.3: a size update with a 5-bit integer prefix, followed by
         // indexed :status = 200 (static table entry 8).
